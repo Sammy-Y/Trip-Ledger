@@ -1,0 +1,42 @@
+{
+  "name": "trip-ledger",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.23.0",
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt build",
+    "deploy": "nuxt build && wrangler deploy",
+    "db:init": "wrangler d1 execute trip-ledger --local --file=./schema.sql",
+    "db:init:remote": "wrangler d1 execute trip-ledger --remote --file=./schema.sql",
+    "test": "node --experimental-strip-types test/settle.test.ts && node --experimental-strip-types test/money.test.ts && node --experimental-strip-types test/sql-safety.test.ts && node --experimental-strip-types test/schema-types.test.ts && node --experimental-strip-types test/cron-config.test.ts && node test/vue-compile.test.mjs && node --experimental-strip-types test/settle.fuzz.ts",
+    "typecheck": "nuxt typecheck",
+    "test:api": "node --experimental-strip-types test/api.test.ts",
+    "preview": "nuxt build && wrangler dev"
+  },
+  "dependencies": {
+    "nuxt": "^4.5.2",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260907.1",
+    "@nuxt/icon": "2.5.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@vite-pwa/nuxt": "^1.1.1",
+    "@vueuse/nuxt": "14.4.0",
+    "nitro-cloudflare-dev": "^0.2.2",
+    "tailwindcss": "4.3.3",
+    "vue-tsc": "^3.3.11",
+    "workbox-precaching": "^7.4.1",
+    "wrangler": "^4.129.0",
+    "@vue/compiler-sfc": "^3.5.42"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd",
+      "@parcel/watcher",
+      "better-sqlite3"
+    ]
+  }
+}

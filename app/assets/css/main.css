@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+/**
+ * 設計系統。所有畫面共用這裡定義的 token，不要各自硬寫顏色 ——
+ * 這樣平行開發的畫面才會長得像同一個產品。
+ *
+ * 定位：手機優先。這是旅行中站在店門口單手操作的工具，
+ * 所以 tap target 至少 44px、主要動作放在拇指可及的下緣。
+ */
+@theme {
+  --font-sans: "Inter var", ui-sans-serif, system-ui, -apple-system,
+               "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  --radius-card: 1rem;
+}
+
+@layer base {
+  :root {
+    /* 語意色票。淺色為預設，深色在下面覆蓋。 */
+    --bg:          oklch(0.99 0.002 250);
+    --bg-elevated: oklch(1 0 0);
+    --bg-sunken:   oklch(0.96 0.004 250);
+    --border:      oklch(0.90 0.006 250);
+    --text:        oklch(0.22 0.012 260);
+    --text-muted:  oklch(0.52 0.012 260);
+    --brand:       oklch(0.55 0.16 250);
+    --brand-text:  oklch(0.99 0 0);
+    /* 應收 = 綠、應付 = 紅。分帳 App 的核心語意。 */
+    --credit:      oklch(0.58 0.14 155);
+    --debit:       oklch(0.58 0.18 25);
+    --warn:        oklch(0.70 0.15 75);
+    --safe-b:      env(safe-area-inset-bottom, 0px);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:          oklch(0.17 0.010 260);
+      --bg-elevated: oklch(0.22 0.012 260);
+      --bg-sunken:   oklch(0.14 0.008 260);
+      --border:      oklch(0.32 0.012 260);
+      --text:        oklch(0.96 0.004 250);
+      --text-muted:  oklch(0.68 0.010 260);
+      --brand:       oklch(0.68 0.15 250);
+      --brand-text:  oklch(0.16 0.01 260);
+      --credit:      oklch(0.72 0.15 155);
+      --debit:       oklch(0.70 0.17 25);
+    }
+  }
+
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    /* iOS 上鍵盤/工具列會擠壓視窗，用 dvh 而非 vh */
+    min-height: 100dvh;
+  }
+  /* 數字一律等寬對齊，金額欄才不會跳動 */
+  .tnum { font-variant-numeric: tabular-nums; }
+  button, a { -webkit-tap-highlight-color: transparent; }
+}
+
+@layer components {
+  .card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4
+           font-medium transition active:scale-[0.98] disabled:opacity-40
+           disabled:pointer-events-none;
+    min-height: 44px;   /* 手機 tap target 下限 */
+  }
+  .btn-primary { background: var(--brand); color: var(--brand-text); }
+  .btn-ghost   { background: var(--bg-sunken); color: var(--text); }
+  .field {
+    @apply w-full rounded-xl px-3 outline-none transition;
+    min-height: 44px;
+    background: var(--bg-sunken);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .field:focus { border-color: var(--brand); }
+  .label { @apply block text-sm font-medium mb-1.5; color: var(--text-muted); }
+}

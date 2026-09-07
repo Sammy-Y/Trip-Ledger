@@ -1,0 +1,36 @@
+{
+  "name": "trip-ledger",
+  "compatibility_date": "2026-09-07",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "main": ".output/server/index.mjs",
+  "assets": { "directory": ".output/public" },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "trip-ledger",
+      // 本機 miniflare 不驗證這個值。要部署前先跑 `wrangler d1 create trip-ledger`,
+      // 把回傳的真實 id 換進來。
+      "database_id": "local-dev-placeholder"
+    }
+  ],
+
+  // ⚠️ 這裡必須手動維護,不能省略。
+  //
+  // Nitro 文件說 cloudflare_module preset 會依 nuxt.config.ts 的 scheduledTasks
+  // 在 build 時自動生成 Cron Triggers —— **實測沒有**。跑完 `pnpm build` 後
+  // .output 底下找不到任何含 crons 的 wrangler 設定(對應已知 issue
+  // nuxt-hub/core#648、nitro#3214)。少了這段,部署上去兩個排程都不會執行,
+  // 而且不會有任何錯誤訊息,只是靜靜地不動。
+  //
+  // 時間一律 UTC:
+  //   0 1 * * *    = 台灣 09:00 抓匯率(來源每日 00:0x UTC 更新)
+  //   */5 * * * *  = 每 5 分鐘掃預約提醒
+  // 這兩個排程字串必須和 nuxt.config.ts 的 scheduledTasks 完全一致,
+  // 因為 Nitro 是用 cron 字串去對應要跑哪個 task。
+  // test/cron-config.test.ts 會擋住兩邊不同步。
+  "triggers": {
+    "crons": ["0 1 * * *", "*/5 * * * *"]
+  }
+}

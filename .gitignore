@@ -1,0 +1,27 @@
+# 依賴
+node_modules/
+.pnpm-store/
+
+# build 產物
+.nuxt/
+.output/
+dist/
+*.tsbuildinfo
+
+# Cloudflare 本機狀態（含 miniflare 的 D1 資料庫）
+.wrangler/
+
+# 環境變數與密鑰
+.env
+.env.*
+.dev.vars
+!.env.example
+
+# 編輯器 / 系統
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 本機測試資料（見 README：真實行程資料不進版控）
+scripts/import-*.local.mjs
