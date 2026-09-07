@@ -299,7 +299,16 @@ const createdText = computed(() => {
         <span class="tnum">#{{ expense.id.slice(0, 8) }}</span>
       </p>
 
-      <button type="button" class="del-btn" @click="$emit('delete')">
+      <!--
+        已列入結算回合的支出不能刪(server 會回 409)。
+        按鈕直接停用並說明原因 —— 讓人按下去、確認完、才在對話框裡看到
+        「不能刪除」是很差的體驗,而且會讓人以為是系統壞了。
+      -->
+      <span v-if="expense.settlement_round_id" class="settled-note">
+        <Icon name="lucide:lock" size="13" class="shrink-0" />
+        <span>已列入結算,不能刪除。要刪請先到結算頁撤銷那次結算。</span>
+      </span>
+      <button v-else type="button" class="del-btn" @click="$emit('delete')">
         <Icon name="lucide:trash-2" size="15" />
         <span>刪除這筆</span>
       </button>
@@ -309,6 +318,16 @@ const createdText = computed(() => {
 
 <style scoped>
 /* 顏色全部走 main.css 的 CSS 變數,深色模式自動跟著換。 */
+
+.settled-note {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 0.3rem;
+  max-width: 22rem;
+  font-size: 0.6875rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
 
 .sect-title {
   display: flex;

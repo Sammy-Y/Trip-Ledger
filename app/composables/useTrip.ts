@@ -17,10 +17,20 @@ import type { Member, Trip } from '~~/shared/types';
  *   const { trip, members, memberName, pending, error, refresh } = useTrip(() => route.params.trip as string)
  */
 
+/** 換匯加成的預設值(%)。來源是 server 的 runtimeConfig,前端不另外複製一份。 */
+export interface FxDefaults {
+  cash_spread_pct: number;
+  card_fee_pct: number;
+}
+
 export interface TripPayload {
   trip: Trip;
   members: Member[];
+  fx_defaults?: FxDefaults;
 }
+
+/** server 還沒回來之前先用這組,畫面不會閃一下空白 */
+const FX_FALLBACK: FxDefaults = { cash_spread_pct: 1.5, card_fee_pct: 1.5 };
 
 /** memberName 查不到時的預設顯示字串。 */
 const UNKNOWN_MEMBER = '未知成員';
@@ -59,6 +69,13 @@ export function useTrip(tripId: MaybeRefOrGetter<string>) {
   const trip = computed<Trip | null>(() => state.data.value?.trip ?? null);
   const members = computed<Member[]>(() => state.data.value?.members ?? []);
 
+  /** 公費(is_pot = 1)。沒設定的話是 null。一趟最多一個,由資料庫的 unique index 保證。 */
+  const pot = computed<Member | null>(() => members.value.find(m => m.is_pot) ?? null);
+  /** 真正的「人」—— 分攤名單要用這個,公費不該是受益人。 */
+  const people = computed<Member[]>(() => members.value.filter(m => !m.is_pot));
+
+  const fxDefaults = computed<FxDefaults>(() => state.data.value?.fx_defaults ?? FX_FALLBACK);
+
   /** id -> name 的查表。members 變了才重算。 */
   const memberMap = computed<Map<string, string>>(
     () => new Map(members.value.map(m => [m.id, m.name])),
@@ -83,8 +100,14 @@ export function useTrip(tripId: MaybeRefOrGetter<string>) {
   return {
     /** 旅程本身。載入中或失敗時是 null。 */
     trip,
-    /** 成員名單,已按名字排序(server 端 ORDER BY name)。載入中是 []。 */
+    /** 成員名單,公費排在最後(server 端 ORDER BY is_pot, name)。載入中是 []。 */
     members,
+    /** 公費成員本身;這趟沒設公費時是 null。 */
+    pot,
+    /** 扣掉公費之後真正的人。分攤名單一律用這個。 */
+    people,
+    /** 換匯加成的預設值(%),來自 server 設定。 */
+    fxDefaults,
     /** member_id -> 名字。查不到回 '未知成員'(可用第二個參數換 fallback)。 */
     memberName,
     /** member_id -> 名字的第一個字,畫頭像用。 */

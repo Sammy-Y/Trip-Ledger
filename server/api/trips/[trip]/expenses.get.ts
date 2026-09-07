@@ -32,7 +32,8 @@ export default defineEventHandler(async (event) => {
     dbh.prepare(
       `SELECT e.id, e.kind, e.description, e.category, e.currency, e.amount_minor,
               e.payment_method, e.fx_rate, e.fx_rate_date, e.fx_rate_source,
-              e.fx_rate_override, e.fx_markup_pct, e.spent_at, e.note, e.created_at
+              e.fx_rate_override, e.fx_markup_pct, e.spent_at, e.settlement_round_id,
+              e.note, e.created_at
        FROM expenses e
        WHERE e.trip_id = ?1 AND (?2 IS NULL OR e.kind = ?2)
        ORDER BY e.spent_at DESC, e.created_at DESC`,

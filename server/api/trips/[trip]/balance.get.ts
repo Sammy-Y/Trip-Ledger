@@ -2,7 +2,76 @@ import { db } from '../../../utils/cf';
 import { requireTrip } from '../../../utils/trip';
 import { rateOn } from '../../../utils/fx';
 import { convertToBase } from '../../../utils/money';
-import { netBalances, minCashFlow, type Net, type Transfer } from '../../../utils/settle';
+import { tripLedger } from '../../../utils/ledger';
+import type { Net, Transfer } from '../../../utils/settle';
+import type { PotCurrency, PotSummary } from '../../../../shared/types';
+
+/**
+ * 公費的收支明細,逐幣別分開。
+ *
+ * 剩餘 = 投入 − 公費付掉的 − 已退還。
+ * 這個數字恆等於「公費成員淨額的相反數」——
+ * 公費淨額 = 付出去的 + 退還的 − 收進來的,所以取負號就是手上還有多少現金。
+ * 兩條路徑算出同一個數字,是這裡的正確性檢查。
+ */
+async function potSummary(dbh: D1Database, tripId: string): Promise<PotSummary | null> {
+  const pot = await dbh.prepare(
+    `SELECT id, name FROM members WHERE trip_id = ? AND is_pot = 1`,
+  ).bind(tripId).first<{ id: string; name: string }>();
+  if (!pot) return null;
+
+  const [inflow, outflow, spent] = await Promise.all([
+    // 誰投入了公費:settlements 裡「流向公費」的那些
+    dbh.prepare(
+      `SELECT currency, from_member AS member_id, SUM(amount_minor) AS amt
+       FROM settlements WHERE trip_id = ? AND to_member = ?
+       GROUP BY currency, from_member`,
+    ).bind(tripId, pot.id).all<{ currency: string; member_id: string; amt: number }>(),
+    // 公費退還給誰:反方向
+    dbh.prepare(
+      `SELECT currency, to_member AS member_id, SUM(amount_minor) AS amt
+       FROM settlements WHERE trip_id = ? AND from_member = ?
+       GROUP BY currency, to_member`,
+    ).bind(tripId, pot.id).all<{ currency: string; member_id: string; amt: number }>(),
+    // 公費付掉的支出
+    dbh.prepare(
+      `SELECT e.currency, SUM(p.amount_minor) AS amt
+       FROM expense_payers p JOIN expenses e ON e.id = p.expense_id
+       WHERE e.trip_id = ? AND p.member_id = ?
+       GROUP BY e.currency`,
+    ).bind(tripId, pot.id).all<{ currency: string; amt: number }>(),
+  ]);
+
+  const inRows = inflow.results ?? [], outRows = outflow.results ?? [], spentRows = spent.results ?? [];
+  const currencies = [...new Set([
+    ...inRows.map((r) => r.currency),
+    ...outRows.map((r) => r.currency),
+    ...spentRows.map((r) => r.currency),
+  ])].sort();
+
+  const byCurrency: PotCurrency[] = currencies.map((cur) => {
+    const contributions = inRows.filter((r) => r.currency === cur)
+      .map((r) => ({ memberId: r.member_id, amountMinor: r.amt }))
+      .sort((a, b) => b.amountMinor - a.amountMinor);
+    const refunds = outRows.filter((r) => r.currency === cur)
+      .map((r) => ({ memberId: r.member_id, amountMinor: r.amt }))
+      .sort((a, b) => b.amountMinor - a.amountMinor);
+    const contributedMinor = contributions.reduce((s, c) => s + c.amountMinor, 0);
+    const refundedMinor = refunds.reduce((s, c) => s + c.amountMinor, 0);
+    const spentMinor = spentRows.filter((r) => r.currency === cur).reduce((s, r) => s + r.amt, 0);
+    return {
+      currency: cur,
+      contributedMinor,
+      spentMinor,
+      refundedMinor,
+      remainingMinor: contributedMinor - spentMinor - refundedMinor,
+      contributions,
+      refunds,
+    };
+  });
+
+  return { memberId: pot.id, name: pot.name, by_currency: byCurrency };
+}
 
 /**
  * 結算 —— 這支就是「誰要給誰多少錢」。
@@ -15,23 +84,12 @@ export default defineEventHandler(async (event) => {
   const dbh = db(event);
   const trip = await requireTrip(event, dbh);
 
-  const [paid, owed, settled, shareRows] = await Promise.all([
-    dbh.prepare(
-      `SELECT e.currency, p.member_id, SUM(p.amount_minor) AS amt
-       FROM expense_payers p JOIN expenses e ON e.id = p.expense_id
-       WHERE e.trip_id = ? AND e.kind = 'shared' GROUP BY e.currency, p.member_id`,
-    ).bind(trip.id).all<{ currency: string; member_id: string; amt: number }>(),
-    dbh.prepare(
-      `SELECT e.currency, s.member_id, SUM(s.amount_minor) AS amt
-       FROM expense_shares s JOIN expenses e ON e.id = s.expense_id
-       WHERE e.trip_id = ? AND e.kind = 'shared' GROUP BY e.currency, s.member_id`,
-    ).bind(trip.id).all<{ currency: string; member_id: string; amt: number }>(),
-    dbh.prepare(
-      `SELECT currency, from_member, to_member, SUM(amount_minor) AS amt
-       FROM settlements WHERE trip_id = ? GROUP BY currency, from_member, to_member`,
-    ).bind(trip.id).all<{ currency: string; from_member: string; to_member: string; amt: number }>(),
+  // 淨額與轉帳建議一律走 utils/ledger.ts —— 結算回合用的是同一份程式碼,
+  // 兩邊絕不會漂移。也是那裡修掉「只有結算、沒有共同支出的幣別會整個消失」的問題。
+  const [ledger, shareRows] = await Promise.all([
+    tripLedger(dbh, trip.id),
     // per_member 的本位幣統計要用「每筆支出自己 snapshot 的匯率」,
-    // 所以這兩個查詢不做 GROUP BY —— 逐筆帶出 fx 欄位再各自換算。
+    // 所以這個查詢不做 GROUP BY —— 逐筆帶出 fx 欄位再各自換算。
     dbh.prepare(
       `SELECT s.member_id, e.kind, e.currency, s.amount_minor AS amt,
               e.fx_rate, e.fx_rate_override, e.fx_markup_pct
@@ -43,20 +101,18 @@ export default defineEventHandler(async (event) => {
     }>(),
   ]);
 
-  const paidR = paid.results ?? [], owedR = owed.results ?? [];
-  const settledR = settled.results ?? [], rows = shareRows.results ?? [];
+  const rows = shareRows.results ?? [];
 
-  const currencies = [...new Set([...paidR, ...owedR].map((r) => r.currency))];
-
-  const byCurrency: Record<string, { nets: Net[]; transfers: Transfer[] }> = {};
-  for (const cur of currencies) {
-    const nets = netBalances({
-      paid: paidR.filter((r) => r.currency === cur).map((r) => ({ memberId: r.member_id, amountMinor: r.amt })),
-      owed: owedR.filter((r) => r.currency === cur).map((r) => ({ memberId: r.member_id, amountMinor: r.amt })),
-      settled: settledR.filter((r) => r.currency === cur)
-        .map((r) => ({ from: r.from_member, to: r.to_member, amountMinor: r.amt })),
-    });
-    byCurrency[cur] = { nets, transfers: minCashFlow(nets) };
+  // 對外的形狀保持不變(nets / transfers),recorded / deferred 額外附上 ——
+  // 結算頁要能把「公費的腿」標成唯讀,不要讓人以為那筆現在就該轉。
+  const byCurrency: Record<string, {
+    nets: Net[]; transfers: Transfer[]; recorded: Transfer[]; deferred: Transfer[];
+  }> = {};
+  for (const cur of ledger.currencies) {
+    const b = ledger.byCurrency[cur]!;
+    byCurrency[cur] = {
+      nets: b.nets, transfers: b.transfers, recorded: b.recorded, deferred: b.deferred,
+    };
   }
 
   // 每人的個人視角:共同分攤 + 個人花費 = 我這趟總共花了多少(換算本位幣)。
@@ -100,6 +156,7 @@ export default defineEventHandler(async (event) => {
     base_currency: trip.base_currency,
     by_currency: byCurrency,
     per_member: perMember,
+    pot: await potSummary(dbh, trip.id),
     disclaimer: '本位幣金額為估算值(中價加計價差/手續費假設)。刷卡以店家請款日匯率計價,實際金額以銀行帳單為準。',
     rate_attribution: 'Rates By Exchange Rate API (open.er-api.com)',
   };

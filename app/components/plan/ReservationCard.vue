@@ -5,8 +5,14 @@ import type { Reservation } from '~~/shared/types';
  * 一筆預約。自動註冊名稱是 <PlanReservationCard>(元件放在 components/plan/ 底下,
  * Nuxt 會加路徑前綴)。
  *
- * 只負責顯示 —— 目前沒有「改狀態」的 API(只有 POST /reservations),
- * 所以卡片上不放 已訂到 / 取消 的按鈕,免得做出按了沒反應的假按鈕。
+ * 卡片上顯示**兩個不同的時間**,這是最容易看錯的地方:
+ *   開放時間(opens_at_utc)    什麼時候可以開始搶 → 倒數與提醒看這個
+ *   訂位時間(booked_for_utc)  訂到的是哪一餐     → 行程看這個
+ * 兩者可能差好幾個月(「10/1 開放搶隔年 1/1 的位子」),所以一定要分開標示,
+ * 絕不能共用一個「時間」欄位。
+ *
+ * 狀態改變不在這裡做,交給父層(plan.vue)——
+ * 它才有 API client 和清單重抓的能力。
  *
  * 時間全部由外面的 now(epoch ms)驅動:清單上十幾張卡片共用一個計時器,
  * 不要每張卡片各自 setInterval。
@@ -22,10 +28,24 @@ const props = withDefaults(defineProps<{
   /** 次要對照時區(小字)。不給就不顯示。 */
   altZoneLabel?: string;
   altZoneOffsetMin?: number;
+  /** 這張卡正在送出中(父層在打 PATCH) */
+  busy?: boolean;
 }>(), {
   altZoneLabel: undefined,
   altZoneOffsetMin: undefined,
+  busy: false,
 });
+
+const emit = defineEmits<{
+  /** 打勾「我訂到了」—— 父層會打開填訂位時間的面板 */
+  book: [];
+  /** 編輯(改訂位時間 / 名字 / 人數) */
+  edit: [];
+  /** 標成已取消 */
+  cancel: [];
+  /** 改回待訂 */
+  reopen: [];
+}>();
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'] as const;
 
@@ -147,6 +167,40 @@ const altTime = computed(() => {
   return `${props.altZoneLabel} ${sameDay ? alt.time : `${alt.date} ${alt.time}`}`;
 });
 
+// ── 訂位時間(和開放時間是兩件事)────────────────────────────
+const bookedMs = computed(() => parseUtc(props.reservation.booked_for_utc));
+
+/** 訂到的那一餐。跨年份時印年份 —— 「10 月訂隔年 1 月」是常態,不印年份會看錯。 */
+const bookedTime = computed(() => {
+  if (bookedMs.value === null) return null;
+  const p = partsInZone(bookedMs.value, props.zoneOffsetMin);
+  const thisYear = partsInZone(props.now, props.zoneOffsetMin).year;
+  const datePart = p.year === thisYear ? p.date : `${p.year}/${p.date}`;
+  return `${datePart} (${p.weekday}) ${p.time}`;
+});
+
+/** 訂位時間也要有對照時區 —— 日本 00:30 在台灣是前一天,看錯就搭錯車 */
+const bookedAltTime = computed(() => {
+  if (bookedMs.value === null || props.altZoneOffsetMin === undefined || !props.altZoneLabel) return null;
+  const main = partsInZone(bookedMs.value, props.zoneOffsetMin);
+  const alt = partsInZone(bookedMs.value, props.altZoneOffsetMin);
+  const sameDay = main.date === alt.date && main.year === alt.year;
+  return `${props.altZoneLabel} ${sameDay ? alt.time : `${alt.date} ${alt.time}`}`;
+});
+
+/** 已訂到但沒填是哪一餐 —— 這筆資料等於沒用,要提示補上 */
+const bookedMissingTime = computed(() =>
+  props.reservation.status === 'booked' && bookedMs.value === null);
+
+/** 訂位時間已經過了(飯已經吃完了) */
+const bookedPast = computed(() =>
+  bookedMs.value !== null && bookedMs.value < props.now);
+
+const partyText = computed(() => {
+  const n = props.reservation.party_size;
+  return n && n > 0 ? `${n} 位` : null;
+});
+
 const remindText = computed(() => {
   const min = props.reservation.remind_before_min;
   if (opensMs.value === null) return '設好開放時間才能提醒';
@@ -193,12 +247,40 @@ const dimmed = computed(() => props.reservation.status === 'cancelled');
           {{ reservation.name }}
         </h3>
 
-        <p v-if="primaryTime" class="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm">
-          <span class="tnum font-medium text-[var(--text)]">{{ primaryTime }}</span>
+        <!-- 訂位資訊:訂到之後,「訂到哪一餐」比「什麼時候開放」重要,所以排前面 -->
+        <p v-if="bookedTime" class="mt-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm">
+          <span class="shrink-0 text-xs font-semibold" style="color: var(--credit)">訂位</span>
+          <span class="tnum font-semibold text-[var(--text)]">{{ bookedTime }}</span>
           <span class="text-xs text-[var(--text-muted)]">{{ zoneLabel }}</span>
-          <span v-if="altTime" class="tnum text-xs text-[var(--text-muted)]">· {{ altTime }}</span>
+          <span v-if="bookedAltTime" class="tnum text-xs text-[var(--text-muted)]">· {{ bookedAltTime }}</span>
         </p>
-        <p v-else class="mt-1 text-sm text-[var(--text-muted)]">
+
+        <p
+          v-if="reservation.booking_name || partyText"
+          class="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-[var(--text-muted)]"
+        >
+          <span v-if="reservation.booking_name" class="inline-flex items-center gap-1">
+            <Icon name="lucide:user" size="12" class="shrink-0" />
+            {{ reservation.booking_name }}
+          </span>
+          <span v-if="partyText" class="inline-flex items-center gap-1">
+            <Icon name="lucide:users" size="12" class="shrink-0" />
+            {{ partyText }}
+          </span>
+        </p>
+
+        <!-- 開放時間。已訂到之後就退成小字,它的任務已經完成了 -->
+        <p
+          v-if="primaryTime"
+          class="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5"
+          :class="bookedTime ? 'text-xs' : 'text-sm'"
+        >
+          <span class="shrink-0 text-xs text-[var(--text-muted)]">開放</span>
+          <span class="tnum text-[var(--text)]" :class="bookedTime ? '' : 'font-medium'">{{ primaryTime }}</span>
+          <span v-if="!bookedTime" class="text-xs text-[var(--text-muted)]">{{ zoneLabel }}</span>
+          <span v-if="altTime && !bookedTime" class="tnum text-xs text-[var(--text-muted)]">· {{ altTime }}</span>
+        </p>
+        <p v-else-if="!bookedTime" class="mt-1 text-sm text-[var(--text-muted)]">
           還沒填開放時間
         </p>
       </div>
@@ -219,6 +301,23 @@ const dimmed = computed(() => props.reservation.status === 'cancelled');
     >
       <Icon name="lucide:triangle-alert" size="13" class="mt-0.5 shrink-0" />
       <span>開放時間已經過了,狀態還是「待訂」。訂到了或放棄了,記得回來確認一下。</span>
+    </p>
+
+    <p
+      v-if="bookedMissingTime"
+      class="mt-2 flex items-start gap-1.5 text-xs leading-relaxed"
+      style="color: var(--warn)"
+    >
+      <Icon name="lucide:calendar-off" size="13" class="mt-0.5 shrink-0" />
+      <span>標成已訂到,但沒填訂到哪一餐。按「改訂位」補上時間。</span>
+    </p>
+
+    <p
+      v-else-if="bookedPast"
+      class="mt-2 flex items-start gap-1.5 text-xs leading-relaxed text-[var(--text-muted)]"
+    >
+      <Icon name="lucide:check" size="13" class="mt-0.5 shrink-0" />
+      <span>這一餐已經過了。</span>
     </p>
 
     <p v-if="reservation.note" class="mt-2 text-xs leading-relaxed text-[var(--text-muted)]">
@@ -248,5 +347,103 @@ const dimmed = computed(() => props.reservation.status === 'cancelled');
         {{ remindedAt }}
       </span>
     </div>
+
+    <!-- ── 動作 ── -->
+    <div class="mt-2.5 flex flex-wrap gap-1.5 border-t pt-2.5" style="border-color: var(--border)">
+      <button
+        v-if="reservation.status !== 'booked'"
+        type="button" class="act act-primary" :disabled="busy"
+        @click="emit('book')"
+      >
+        <Icon name="lucide:circle-check" size="14" class="shrink-0" />
+        我訂到了
+      </button>
+
+      <button
+        v-if="reservation.status === 'booked'"
+        type="button" class="act" :disabled="busy"
+        @click="emit('edit')"
+      >
+        <Icon name="lucide:calendar-cog" size="14" class="shrink-0" />
+        改訂位
+      </button>
+
+      <button
+        v-if="reservation.status === 'pending'"
+        type="button" class="act" :disabled="busy"
+        @click="emit('edit')"
+      >
+        <Icon name="lucide:pencil" size="14" class="shrink-0" />
+        編輯
+      </button>
+
+      <span class="flex-1" />
+
+      <button
+        v-if="reservation.status !== 'cancelled'"
+        type="button" class="act act-muted" :disabled="busy"
+        @click="emit('cancel')"
+      >
+        <Icon name="lucide:ban" size="14" class="shrink-0" />
+        取消
+      </button>
+
+      <button
+        v-else
+        type="button" class="act" :disabled="busy"
+        @click="emit('reopen')"
+      >
+        <Icon name="lucide:rotate-ccw" size="14" class="shrink-0" />
+        改回待訂
+      </button>
+    </div>
   </article>
 </template>
+
+<style scoped>
+/* 顏色一律走 main.css 的變數,深色模式自動跟著換。 */
+.act {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 36px;
+  padding-inline: 0.625rem;
+  border-radius: 0.625rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text);
+  transition: background-color 0.15s ease, color 0.15s ease, transform 0.12s ease;
+}
+.act:active {
+  transform: scale(0.97);
+}
+.act:disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.act-primary {
+  border-color: transparent;
+  background: color-mix(in oklab, var(--credit) 15%, transparent);
+  color: var(--credit);
+}
+.act-muted {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+}
+@media (hover: hover) {
+  .act-muted:hover {
+    color: var(--debit);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .act {
+    transition: none;
+  }
+  .act:active {
+    transform: none;
+  }
+}
+</style>

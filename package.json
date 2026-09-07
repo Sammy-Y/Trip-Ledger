@@ -9,9 +9,13 @@
     "deploy": "nuxt build && wrangler deploy",
     "db:init": "wrangler d1 execute trip-ledger --local --file=./schema.sql",
     "db:init:remote": "wrangler d1 execute trip-ledger --remote --file=./schema.sql",
-    "test": "node --experimental-strip-types test/settle.test.ts && node --experimental-strip-types test/money.test.ts && node --experimental-strip-types test/sql-safety.test.ts && node --experimental-strip-types test/schema-types.test.ts && node --experimental-strip-types test/cron-config.test.ts && node test/vue-compile.test.mjs && node --experimental-strip-types test/settle.fuzz.ts",
+    "db:migrate": "node scripts/migrate.mjs --local",
+    "db:migrate:remote": "node scripts/migrate.mjs --remote",
+    "test": "node scripts/test-all.mjs",
     "typecheck": "nuxt typecheck",
-    "test:api": "node --experimental-strip-types test/api.test.ts",
+    "test:api": "node --experimental-strip-types test/api.test.ts && node --experimental-strip-types test/api.features.test.ts && node --experimental-strip-types test/api.rounds.test.ts",
+    "test:features": "node --experimental-strip-types test/api.features.test.ts",
+    "test:rounds": "node --experimental-strip-types test/api.rounds.test.ts",
     "preview": "nuxt build && wrangler dev"
   },
   "dependencies": {

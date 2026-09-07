@@ -16,15 +16,9 @@ import type { SplitMode } from '~~/shared/types';
  * 每人分到多少(preview)、合計、差額都由 ExpenseForm 算好傳進來:
  * 送出按鈕的啟用條件必須和畫面上顯示的數字是同一份計算,不能各算一次。
  */
-export interface SplitDraft {
-  mode: SplitMode;
-  /** 均分:參與的成員 id */
-  members: string[];
-  /** 按份數:成員 id -> 份數。null = 沒填(等同 0 份、不參與) */
-  shares: Record<string, number | null>;
-  /** 指定金額:成員 id -> 人類單位金額。null = 沒填(不列入這筆分攤) */
-  amounts: Record<string, number | null>;
-}
+// 型別本體在 shared/split.ts —— 和 previewShares() 放一起,
+// 才不會出現「draft 的形狀改了但算分攤的那份沒跟著改」。
+export type { SplitDraft } from '~~/shared/split';
 </script>
 
 <script setup lang="ts">

@@ -16,18 +16,24 @@
  */
 import type { Kind, PaymentMethod, Member } from '~~/shared/types';
 import { toMinor, EXPONENT, CURRENCY_LABEL } from '~~/shared/money';
-import { splitEqually, splitByShares } from '~~/shared/split';
+import { previewShares } from '~~/shared/split';
 import type { PayerDraft } from './PayerEditor.vue';
 import type { SplitDraft } from './SplitEditor.vue';
 
 const props = defineProps<{
   members: Member[];
   baseCurrency: string;
+  /** 換匯加成的預設值(%),來自 server 設定 */
+  fxDefaults?: { cash_spread_pct: number; card_fee_pct: number };
   submitting?: boolean;
   errorMessage?: string | null;
 }>();
 
 const emit = defineEmits<{ submit: [payload: Record<string, unknown>] }>();
+
+/** 公費不是人。它可以付錢,但永遠不該出現在分攤名單裡。 */
+const pot = computed<Member | null>(() => props.members.find((m) => m.is_pot) ?? null);
+const people = computed<Member[]>(() => props.members.filter((m) => !m.is_pot));
 
 const CURRENCIES = ['JPY', 'TWD'];
 
@@ -52,23 +58,41 @@ const showAdvanced = ref(false);
 const payers = ref<PayerDraft[]>([]);
 const split = ref<SplitDraft>({ mode: 'equal', members: [], shares: {}, amounts: {} });
 
-/** 成員載入後給預設值:第一個人付錢、全員均分。 */
-watch(() => props.members, (ms) => {
+/**
+ * 成員載入後給預設值:第一個「人」付錢、全員均分。
+ * 均分名單刻意排除公費 —— 公費是出錢的一方,不是受益人,
+ * 把它勾進去會讓它替自己分攤一份,結算就錯了。
+ */
+watch(people, (ms) => {
   if (!ms.length) return;
   if (!payers.value.length) payers.value = [{ member_id: ms[0]!.id, amount: null }];
   if (!split.value.members.length) split.value = { ...split.value, members: ms.map((m) => m.id) };
 }, { immediate: true });
 
-/** 個人花費:分攤就是付款人自己,不需要使用者再選一次。 */
-watch([kind, payers], () => {
-  if (kind.value !== 'personal') return;
-  const owner = payers.value[0]?.member_id;
-  if (owner) split.value = { mode: 'exact', members: [owner], shares: {}, amounts: { [owner]: null } };
-}, { deep: true });
-
 const amountMinor = computed(() =>
   amountInput.value == null || Number.isNaN(amountInput.value)
     ? 0 : toMinor(amountInput.value, currency.value));
+
+// ── 公費 ────────────────────────────────────────────────────
+/**
+ * 「這筆是公費付的」。打開之後付款人固定是公費、分攤固定是全體成員均分 ——
+ * 這就是公費的定義:大家先把錢拿出來,之後從那筆錢付,誰都不用再各付各的。
+ * 所以這裡直接把付款人與分攤鎖住,不讓使用者手動改到自相矛盾的組合。
+ */
+const fromPot = ref(false);
+
+/** 切到個人花費、或這趟根本沒設公費時,這個開關要自動關掉 */
+watch([kind, pot], () => {
+  if (kind.value !== 'shared' || !pot.value) fromPot.value = false;
+});
+
+watch([fromPot, pot, people, kind], () => {
+  if (!fromPot.value || kind.value !== 'shared') return;
+  const potId = pot.value?.id;
+  if (!potId) return;
+  payers.value = [{ member_id: potId, amount: null }];
+  split.value = { ...split.value, mode: 'equal', members: people.value.map((m) => m.id) };
+});
 
 // ── 付款試算 ──
 const payerSummary = computed(() => {
@@ -79,22 +103,20 @@ const payerSummary = computed(() => {
   return { filledMinor, diffMinor: amountMinor.value - filledMinor, treatedAsFull: single };
 });
 
-// ── 分攤試算(和 server 同一份演算法)──
-const splitPreview = computed<Record<string, number>>(() => {
-  const d = split.value;
-  if (!amountMinor.value) return {};
-  if (d.mode === 'equal') {
-    return d.members.length ? Object.fromEntries(splitEqually(amountMinor.value, d.members)) : {};
-  }
-  if (d.mode === 'shares') {
-    const s: Record<string, number> = {};
-    for (const [k, v] of Object.entries(d.shares)) if (v && v > 0) s[k] = v;
-    return Object.keys(s).length ? Object.fromEntries(splitByShares(amountMinor.value, s)) : {};
-  }
-  const out: Record<string, number> = {};
-  for (const [k, v] of Object.entries(d.amounts)) if (v != null && v !== 0) out[k] = toMinor(v, currency.value);
-  return out;
-});
+/** 個人花費的「分攤」對象:就是付款人自己 */
+const personalOwner = computed(() => payers.value[0]?.member_id ?? '');
+
+// ── 分攤試算(和 server 同一份演算法,而且和測試同一份程式碼)──
+// 規則本體在 shared/split.ts 的 previewShares() —— 抽出去才測得到。
+// 個人花費「全額算給付款人」這條規則原本埋在這裡,結果送出鈕被永久鎖住
+// 而 56 個 API 測試全綠,因為沒有任何測試碰得到 .vue 裡的 computed。
+const splitPreview = computed<Record<string, number>>(() => previewShares({
+  kind: kind.value,
+  amountMinor: amountMinor.value,
+  draft: split.value,
+  ownerId: personalOwner.value,
+  toMinorFn: (v) => toMinor(v, currency.value),
+}));
 
 const splitSumMinor = computed(() => Object.values(splitPreview.value).reduce((a, b) => a + b, 0));
 const splitDiffMinor = computed(() => amountMinor.value - splitSumMinor.value);
@@ -106,8 +128,11 @@ const problems = computed(() => {
   if (!amountMinor.value) out.push('請填寫金額');
   if (!payers.value.length || payers.value.some((p) => !p.member_id)) out.push('請選擇付款人');
   else if (payerSummary.value.diffMinor !== 0) out.push('付款金額合計與支出金額不符');
-  if (!Object.keys(splitPreview.value).length) out.push('請選擇分攤的人');
-  else if (splitDiffMinor.value !== 0) out.push('分攤金額合計與支出金額不符');
+  // 個人花費的分攤是自動推出來的,不會、也不該有「請選擇分攤的人」這種問題
+  if (kind.value === 'shared') {
+    if (!Object.keys(splitPreview.value).length) out.push('請選擇分攤的人');
+    else if (splitDiffMinor.value !== 0) out.push('分攤金額合計與支出金額不符');
+  }
   return out;
 });
 const canSubmit = computed(() => problems.value.length === 0 && !props.submitting);
@@ -115,7 +140,12 @@ const canSubmit = computed(() => problems.value.length === 0 && !props.submittin
 function buildPayload() {
   const d = split.value;
   let splitPayload: Record<string, unknown>;
-  if (d.mode === 'equal') splitPayload = { mode: 'equal', members: d.members };
+  // 個人花費:全額算給付款人自己。用 exact 而不是 equal,
+  // 因為 equal 會在未來多人時被誤解成「均分給這些人」。
+  if (kind.value === 'personal') {
+    splitPayload = { mode: 'exact', amounts: { [personalOwner.value]: amountInput.value } };
+  }
+  else if (d.mode === 'equal') splitPayload = { mode: 'equal', members: d.members };
   else if (d.mode === 'shares') {
     const s: Record<string, number> = {};
     for (const [k, v] of Object.entries(d.shares)) if (v && v > 0) s[k] = v;
@@ -136,6 +166,8 @@ function buildPayload() {
     spent_at: spentAt.value,
     note: note.value.trim() || undefined,
     fx_rate_override: fxOverride.value ?? undefined,
+    // 本位幣不需要換匯,送 undefined 讓 server 自己歸零
+    fx_markup_pct: isForeign.value ? markupPct.value : undefined,
     payers: payers.value.map((p) => (p.amount == null ? { member_id: p.member_id } : { member_id: p.member_id, amount: p.amount })),
     split: splitPayload,
   };
@@ -148,6 +180,54 @@ function onSubmit() {
 
 const isForeign = computed(() => currency.value !== props.baseCurrency);
 const amountStep = computed(() => (EXPONENT[currency.value] === 0 ? '1' : '0.01'));
+
+// ── 換匯加成:刷卡的國外交易手續費 / 現金的換匯價差 ──────────────
+/**
+ * 台灣發卡行的「國外交易手續費」= 國際組織費 + 發卡行加收,
+ * 實務上 Visa / Mastercard / JCB 多為合計 **1.5%**(AmEx 約 2%)。
+ * 所以預設值放 1.5%,但各家卡真的不一樣 —— 使用者自己最清楚,要能改。
+ *
+ * 預設值的唯一來源是 server 的 runtimeConfig(cardFeePct / cashSpreadPct),
+ * 經 GET /api/trips/:trip 的 fx_defaults 帶進來,前端不自己寫死一份。
+ */
+const DEFAULT_MARKUP = { cash: 1.5, card: 1.5 };
+
+const markupDefault = computed(() => {
+  if (!isForeign.value) return 0;
+  const d = props.fxDefaults;
+  return paymentMethod.value === 'card'
+    ? (d?.card_fee_pct ?? DEFAULT_MARKUP.card)
+    : (d?.cash_spread_pct ?? DEFAULT_MARKUP.cash);
+});
+
+const markupInput = ref<number | null>(null);
+/** 使用者自己改過的話,就不要再被切換付款方式蓋掉 */
+const markupTouched = ref(false);
+
+/** 沒被改過就跟著付款方式 / 幣別自動帶入預設值 */
+watch(markupDefault, (next) => {
+  if (!markupTouched.value) markupInput.value = next;
+}, { immediate: true });
+
+const markupPct = computed(() => {
+  if (!isForeign.value) return 0;
+  const v = markupInput.value;
+  return v == null || !Number.isFinite(v) ? markupDefault.value : v;
+});
+
+function resetMarkup(): void {
+  markupTouched.value = false;
+  markupInput.value = markupDefault.value;
+}
+
+/** 加成之後,1 外幣實際被當成多少本位幣 —— 讓使用者看得到這個%到底影響什麼 */
+const markupHint = computed(() => {
+  const pct = markupPct.value;
+  if (!isForeign.value) return '';
+  if (!pct) return '不加計任何手續費,直接用當日中價換算。';
+  return `換算時在當日中價上加 ${pct}% —— ${
+    paymentMethod.value === 'card' ? '相當於國外交易手續費' : '相當於換鈔價差'}。`;
+});
 </script>
 
 <template>
@@ -206,22 +286,87 @@ const amountStep = computed(() => (EXPONENT[currency.value] === 0 ? '1' : '0.01'
         </template>
       </p>
 
+      <!-- 國外交易手續費 / 換鈔價差。有預設值,但一定要能改 —— 每張卡都不一樣 -->
+      <div v-if="isForeign">
+        <div class="flex items-baseline justify-between gap-2">
+          <span class="label">
+            {{ paymentMethod === 'card' ? '國外交易手續費' : '換匯價差' }}
+          </span>
+          <button
+            v-if="markupPct !== markupDefault"
+            type="button" class="text-xs" style="color: var(--brand)"
+            @click="resetMarkup">
+            回到預設 {{ markupDefault }}%
+          </button>
+        </div>
+        <div class="markup-cell">
+          <input
+            v-model.number="markupInput"
+            class="cell-input tnum" type="number" step="0.1" min="0" max="100"
+            inputmode="decimal" :placeholder="String(markupDefault)"
+            :aria-label="paymentMethod === 'card' ? '國外交易手續費百分比' : '換匯價差百分比'"
+            @input="markupTouched = true" />
+          <span class="cur">%</span>
+        </div>
+        <p class="mt-1.5 text-xs leading-relaxed" style="color: var(--text-muted)">
+          {{ markupHint }}
+          <template v-if="paymentMethod === 'card' && !markupTouched">
+            台灣的 Visa / Mastercard / JCB 多為 1.5%(AmEx 約 2%),你的卡不同的話直接改。
+          </template>
+        </p>
+      </div>
+
       <UiAppField v-model="category" label="分類" placeholder="餐飲 / 交通 / 購物(選填)" />
     </div>
 
+    <!-- ── 公費:一鍵套用「公費付錢、全員均分」 ── -->
+    <div v-if="kind === 'shared' && pot" class="card p-4">
+      <button type="button" class="flex w-full items-center gap-3 text-left" @click="fromPot = !fromPot">
+        <span class="pot-box" :class="{ 'is-on': fromPot }">
+          <Icon v-if="fromPot" name="lucide:check" size="14" />
+        </span>
+        <span class="min-w-0 flex-1">
+          <span class="block text-sm font-semibold">這筆從{{ pot.name }}付</span>
+          <span class="block text-xs" style="color: var(--text-muted)">
+            付款人設為{{ pot.name }},並由 {{ people.length }} 位成員均分。
+          </span>
+        </span>
+      </button>
+      <p v-if="fromPot" class="mt-3 flex items-start gap-1.5 text-xs leading-relaxed"
+         style="color: var(--text-muted)">
+        <Icon name="lucide:info" size="14" class="mt-px shrink-0" />
+        <span>
+          付款人與分攤已鎖定。{{ pot.name }}本身不分攤 ——
+          它是出錢的一方,剩多少會在「總覽」算出來。
+        </span>
+      </p>
+    </div>
+
     <ExpensePayerEditor
+      v-if="!fromPot"
       v-model="payers" :members="members" :currency="currency"
       :amount-minor="amountMinor" :summary="payerSummary" />
 
     <ExpenseSplitEditor
-      v-if="kind === 'shared'"
-      v-model="split" :members="members" :currency="currency"
+      v-if="kind === 'shared' && !fromPot"
+      v-model="split" :members="people" :currency="currency"
       :amount-minor="amountMinor" :preview="splitPreview"
       :sum-minor="splitSumMinor" :diff-minor="splitDiffMinor" />
 
-    <div v-else class="card p-4 text-sm" style="color: var(--text-muted)">
+    <div v-else-if="kind === 'personal'" class="card p-4 text-sm" style="color: var(--text-muted)">
       <Icon name="lucide:user" class="inline mr-1.5" />
       個人花費不分攤,全額算在付款人自己頭上。
+    </div>
+
+    <!-- 公費模式:不給編輯,但要看得到結果,不然是黑箱 -->
+    <div v-else-if="fromPot" class="card p-4">
+      <h2 class="text-sm font-semibold">每人分攤</h2>
+      <ul class="mt-2 space-y-1">
+        <li v-for="m in people" :key="m.id" class="flex items-center justify-between gap-3 text-sm">
+          <span class="truncate">{{ m.name }}</span>
+          <UiMoney :minor="splitPreview[m.id] ?? 0" :currency="currency" size="sm" />
+        </li>
+      </ul>
     </div>
 
     <!-- 進階:匯率覆寫。收合起來,因為多數時候不需要 -->
@@ -262,3 +407,70 @@ const amountStep = computed(() => (EXPONENT[currency.value] === 0 ? '1' : '0.01'
     </div>
   </form>
 </template>
+
+<style scoped>
+/* 顏色一律走 main.css 的變數,深色模式自動跟著換。 */
+
+/* 百分比輸入框:外觀對齊 SplitEditor 的列內數字欄,單位放在框內 */
+.markup-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  width: 7rem;
+  min-height: 44px;
+  padding-inline: 0.625rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--bg-elevated);
+  transition: border-color 0.15s ease;
+}
+.markup-cell:focus-within {
+  border-color: var(--brand);
+}
+.markup-cell .cur {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.markup-cell .cell-input {
+  flex: 1 1 0;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: none;
+  text-align: right;
+  font-size: 0.9375rem;
+  color: var(--text);
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.markup-cell .cell-input::-webkit-outer-spin-button,
+.markup-cell .cell-input::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.pot-box {
+  display: grid;
+  place-items: center;
+  width: 1.375rem;
+  height: 1.375rem;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg-elevated);
+  color: var(--brand-text);
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.pot-box.is-on {
+  border-color: transparent;
+  background: var(--brand);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .markup-cell,
+  .pot-box {
+    transition: none;
+  }
+}
+</style>

@@ -13,7 +13,8 @@ export default defineEventHandler(async (event) => {
   const trip = await requireTrip(event, dbh);
 
   const rows = await dbh.prepare(
-    `SELECT id, name, url, opens_at_utc, remind_before_min, reminded_at, status, note
+    `SELECT id, name, url, opens_at_utc, booked_for_utc, booking_name, party_size,
+            remind_before_min, reminded_at, status, note
      FROM reservations
      WHERE trip_id = ?
      ORDER BY opens_at_utc IS NULL, opens_at_utc ASC, name`,

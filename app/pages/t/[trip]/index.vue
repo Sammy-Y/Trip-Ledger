@@ -218,6 +218,58 @@ const filteredList = computed<Expense[]>(() => activeList.value.filter((e) => {
 const filterActive = computed(() => !!filterDate.value || !!filterPayer.value);
 function clearFilters(): void { filterDate.value = ''; filterPayer.value = ''; }
 
+// ── 排序 ────────────────────────────────────────────────────
+/**
+ * 預設按日期(server 已經 ORDER BY spent_at DESC),另外提供按金額排序。
+ *
+ * ⚠️ 金額排序刻意**在同一幣別內**進行,而且清單會改成平鋪、不再按日期分組:
+ *  - 跨幣別比大小沒有意義(¥1,000 排在 NT$900 前面是錯的),
+ *    所以先按幣別分堆(本位幣優先),再在每堆裡比金額。
+ *  - 日期分組和金額排序天生衝突 —— 硬要兩者並存,得到的是
+ *    「每天各自排好」而不是使用者想要的「這趟最貴的是哪幾筆」。
+ */
+type SortKey = 'date' | 'amount-desc' | 'amount-asc';
+
+const SORTS: Array<{ value: SortKey; label: string }> = [
+  { value: 'date', label: '日期(新→舊)' },
+  { value: 'amount-desc', label: '金額(高→低)' },
+  { value: 'amount-asc', label: '金額(低→高)' },
+];
+
+const sortKey = ref<SortKey>('date');
+/** 金額排序時改成平鋪清單,日期分組會失去意義 */
+const byAmount = computed(() => sortKey.value !== 'date');
+
+/** 幣別的排序權重:本位幣優先,其餘按代碼 */
+function currencyRank(cur: string): string {
+  return cur === baseCurrency.value ? ` ${cur}` : cur;
+}
+
+const sortedList = computed<Expense[]>(() => {
+  if (!byAmount.value) return filteredList.value;
+  const dir = sortKey.value === 'amount-desc' ? -1 : 1;
+  return [...filteredList.value].sort((a, b) => {
+    const ra = currencyRank(a.currency), rb = currencyRank(b.currency);
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    if (a.amount_minor !== b.amount_minor) return (a.amount_minor - b.amount_minor) * dir;
+    // 同額時用日期當第二鍵,順序才穩定(不會每次重繪跳動)
+    return a.spent_at < b.spent_at ? 1 : a.spent_at > b.spent_at ? -1 : 0;
+  });
+});
+
+/** 金額排序時,每個幣別一段(段標顯示幣別與小計) */
+interface AmountGroup { currency: string; items: Expense[]; minor: number }
+
+const amountGroups = computed<AmountGroup[]>(() => {
+  const out: AmountGroup[] = [];
+  for (const e of sortedList.value) {
+    const last = out[out.length - 1];
+    if (last && last.currency === e.currency) { last.items.push(e); last.minor += e.amount_minor; }
+    else out.push({ currency: e.currency, items: [e], minor: e.amount_minor });
+  }
+  return out;
+});
+
 // ── 日期分組 ────────────────────────────────────────────────
 const WEEKDAY = ['日', '一', '二', '三', '四', '五', '六'];
 
@@ -542,6 +594,10 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
             <option v-for="m in payerOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
           </select>
 
+          <select v-model="sortKey" class="filter-select" aria-label="排序方式">
+            <option v-for="s in SORTS" :key="s.value" :value="s.value">{{ s.label }}</option>
+          </select>
+
           <button v-if="filterActive" type="button" class="filter-clear" @click="clearFilters">
             <Icon name="lucide:x" size="12" />
             清除
@@ -553,21 +609,58 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
 
           <span class="flex-1" />
 
-          <button type="button" class="day-toggle-all" @click="toggleAll">
+          <!-- 金額排序時是平鋪清單,沒有可收合的「天」 -->
+          <button v-if="!byAmount" type="button" class="day-toggle-all" @click="toggleAll">
             <Icon :name="anyExpanded ? 'lucide:chevrons-down-up' : 'lucide:chevrons-up-down'" size="13" />
             {{ anyExpanded ? '全部收合' : '全部展開' }}
           </button>
         </div>
 
         <!-- 篩到沒東西時要講清楚是篩選造成的,不要讓人以為資料不見了 -->
-        <div v-if="!groups.length" class="card px-4 py-8 text-center">
+        <div v-if="!sortedList.length" class="card px-4 py-8 text-center">
           <p class="text-sm text-[var(--text-muted)]">這個條件下沒有支出。</p>
           <button type="button" class="filter-clear mx-auto mt-3" @click="clearFilters">
             <Icon name="lucide:x" size="12" /> 清除篩選
           </button>
         </div>
 
-        <section v-for="group in groups" :key="group.date">
+        <!-- ── 金額排序:平鋪,按幣別分段 ── -->
+        <template v-else-if="byAmount">
+          <section v-for="group in amountGroups" :key="group.currency">
+            <h3 class="mb-1.5 flex items-baseline gap-2 px-1 pr-1 md:pr-[2.625rem]">
+              <span class="text-xs font-semibold">{{ CURRENCY_LABEL[group.currency] ?? group.currency }}</span>
+              <span class="text-[0.6875rem] text-[var(--text-muted)]">{{ group.items.length }} 筆</span>
+              <span class="flex-1" />
+              <span class="tnum text-[0.6875rem]">{{ formatMoney(group.minor, group.currency) }}</span>
+            </h3>
+            <ul class="flex flex-col gap-2">
+              <li v-for="expense in group.items" :key="expense.id" class="card overflow-hidden">
+                <ExpenseRow
+                  :expense="expense"
+                  :names="memberMap"
+                  :expanded="openId === expense.id"
+                  :detail-id="`detail-${expense.id}`"
+                  @toggle="toggle(expense.id)"
+                />
+                <Transition name="detail">
+                  <div v-if="openId === expense.id" :id="`detail-${expense.id}`">
+                    <ExpenseDetail
+                      :expense="expense"
+                      :names="memberMap"
+                      :base-currency="baseCurrency"
+                      @delete="askDelete(expense)"
+                    />
+                  </div>
+                </Transition>
+              </li>
+            </ul>
+          </section>
+          <p class="px-1 text-[0.6875rem] leading-relaxed text-[var(--text-muted)]">
+            金額排序在同一幣別內進行 —— 日幣和台幣的數字沒有可比性,不會混在一起排。
+          </p>
+        </template>
+
+        <section v-for="group in groups" v-else :key="group.date">
           <!--
             右側 padding 要對齊列裡的金額欄右緣:
             列的 padding-right 0.875rem + 箭頭 1rem + gap 0.75rem = 2.625rem。

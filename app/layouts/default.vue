@@ -44,6 +44,7 @@ interface NavItem {
 const nav = computed<NavItem[]>(() => {
   const base = `/t/${tripId.value}`;
   return [
+    { to: `${base}/overview`, label: '總覽', icon: 'lucide:layout-dashboard' },
     { to: base, label: '支出', icon: 'lucide:receipt-text' },
     { to: `${base}/new`, label: '記一筆', icon: 'lucide:circle-plus' },
     { to: `${base}/settle`, label: '結算', icon: 'lucide:scale' },
@@ -280,17 +281,21 @@ onBeforeUnmount(() => clearTimeout(shareTimer));
   /* iOS 底部安全區:home indicator 不要蓋住 tab */
   padding-bottom: var(--safe-b);
 }
+/* 六個 tab 要能塞進 320px 寬的機身,所以字級與內距都壓到下限,
+   而且 min-width: 0 讓 flex 項目真的可以被壓縮(預設 auto 會撐開)。 */
 .tab-link {
   flex: 1 1 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 0.125rem;
   min-height: 56px;
-  padding: 0.4rem 0.125rem;
-  font-size: 0.6875rem;
+  padding: 0.4rem 0.0625rem;
+  font-size: 0.625rem;
   line-height: 1;
+  white-space: nowrap;
   color: var(--text-muted);
   transition: color 0.15s ease, transform 0.12s ease;
 }
@@ -304,7 +309,7 @@ onBeforeUnmount(() => clearTimeout(shareTimer));
 .tab-icon {
   display: grid;
   place-items: center;
-  width: 2.5rem;
+  width: 2.25rem;
   height: 1.75rem;
   border-radius: 999px;
   transition: background-color 0.18s ease;
