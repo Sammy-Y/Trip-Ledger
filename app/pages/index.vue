@@ -106,6 +106,33 @@ async function signOut() {
   await refresh();
 }
 
+/**
+ * 陌生人第一次進來要看到的東西。
+ *
+ * 沒登入、而且這個瀏覽器一趟旅程都沒有 —— 對這個人來說「我的旅程 /
+ * 還沒有任何旅程」是沒有意義的:他還沒有任何資料,那句話只是在描述空集合。
+ * 要先回答「這是什麼、為什麼要用」。一旦登入或建了第一趟就換回列表。
+ *
+ * 刻意不看 pending:setup 裡的兩個 await(旅程列表與 /auth/me)都在首次
+ * 渲染前就 resolve,所以不會先閃一下 hero 再跳成列表。
+ */
+const showHero = computed(() => !isLoggedIn.value && !trips.value.length);
+
+/**
+ * 三個賣點。
+ *
+ * 每一條只講一件事 —— 原本這些話是塞在一段三句話的副標裡,
+ * 四個賣點擠在一起讀起來像功能列表,手機上更是一整片灰字。
+ *
+ * 「不會被混成一個數字」刻意不用「加成」:這個 App 裡「加成」專指匯率加成
+ * (fx_markup_pct,刷卡手續費那個),拿它來表達「加在一起」會讓人以為在講手續費。
+ */
+const HERO_POINTS = [
+  '日幣台幣各自結算,不會被混成一個數字',
+  '共同花費自動分攤,個人花費只算自己的',
+  '旅伴不用註冊,丟連結就能一起記',
+];
+
 /** 「3 人 · 47 筆 · 3/13」 */
 function subtitle(t: TripRow): string {
   const parts = [`${t.member_count} 人`, `${t.expense_count} 筆`];
@@ -116,7 +143,47 @@ function subtitle(t: TripRow): string {
 
 <template>
   <div class="mx-auto w-full max-w-2xl px-4 py-6 space-y-5">
-    <header class="flex items-start justify-between gap-3">
+    <!-- 第一次進來的人看到的不是空列表,而是「這是什麼」。理由見 showHero -->
+    <section v-if="showHero" class="pb-2 md:py-4">
+      <span class="hero-badge">
+        <Icon name="lucide:luggage" size="14" />
+        旅遊記帳 · 多人分帳
+      </span>
+
+      <h1 class="hero-title mt-4 text-3xl font-bold leading-tight tracking-tight md:text-4xl">
+        出國花的每一筆,回國前分乾淨
+      </h1>
+
+      <p class="hero-sub mt-3 leading-relaxed" style="color: var(--text-muted)">
+        誰墊的錢、誰真的用了,分開記 —— 所以算得出誰該給誰多少。
+      </p>
+
+      <ul class="mt-5 space-y-2.5">
+        <li v-for="point in HERO_POINTS" :key="point" class="flex items-start gap-2.5 text-sm">
+          <Icon name="lucide:check" size="16" class="mt-0.5 shrink-0" style="color: var(--credit)" />
+          <span>{{ point }}</span>
+        </li>
+      </ul>
+
+      <div class="mt-7 flex flex-wrap items-center gap-2.5">
+        <UiAppButton variant="primary" @click="showNew = true">
+          <Icon name="lucide:plus" /> 建立第一趟旅程
+        </UiAppButton>
+        <NuxtLink to="/login">
+          <UiAppButton variant="ghost">登入</UiAppButton>
+        </NuxtLink>
+      </div>
+
+      <!--
+        免註冊是這個產品的賣點,但它有代價,而且代價要在他按下去**之前**講。
+        事後才說「你的資料只在這個瀏覽器裡」等於騙他一次。
+      -->
+      <p class="hero-note mt-6 text-xs leading-relaxed" style="color: var(--text-muted)">
+        不用帳號也能開始記 —— 但那樣旅程只存在這個瀏覽器裡,清除資料或換裝置就找不回來。
+      </p>
+    </section>
+
+    <header v-else class="flex items-start justify-between gap-3">
       <div class="min-w-0">
         <h1 class="text-2xl font-bold">我的旅程</h1>
         <p class="text-sm mt-0.5 truncate" style="color: var(--text-muted)">
@@ -170,7 +237,7 @@ function subtitle(t: TripRow): string {
     </p>
 
     <UiEmptyState
-      v-else-if="!trips.length"
+      v-else-if="!trips.length && !showHero"
       icon="lucide:luggage"
       title="還沒有任何旅程"
       :description="isLoggedIn
@@ -263,3 +330,37 @@ function subtitle(t: TripRow): string {
     </UiAppSheet>
   </div>
 </template>
+
+<style scoped>
+/* 顏色一律走 main.css 的變數,深色模式自動跟著換,不寫死 hex、不用 dark: 前綴 */
+
+/* 標題上方那顆小標。用 brand 的低透明度底色而不是實色 ——
+   它是定位說明,不該比下面的標題還搶眼。 */
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.625rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: color-mix(in oklab, var(--brand) 12%, transparent);
+  color: var(--brand);
+}
+
+/* 標題與副標的折行。
+   `pretty` 會避免行末留下孤字 —— 375px 下副標原本折成「…分開記 —— 所 / 以算得出…」,
+   把「所以」拆開讀起來會頓一下,而 hero 是整頁最多人看的文字。
+   不支援的瀏覽器會忽略它,只是回到預設折行,不影響版面。 */
+.hero-title,
+.hero-sub {
+  text-wrap: pretty;
+}
+
+/* 免註冊的代價那句。用上分隔線而不是加重字色 ——
+   它是註腳的地位,但必須看得到,不能被當成裝飾略過。 */
+.hero-note {
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+</style>

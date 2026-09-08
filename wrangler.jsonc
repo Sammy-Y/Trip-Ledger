@@ -1,36 +1,49 @@
 {
-  "name": "trip-ledger",
-  "compatibility_date": "2026-09-07",
-  "compatibility_flags": ["nodejs_compat"],
-
-  "main": ".output/server/index.mjs",
-  "assets": { "directory": ".output/public" },
-
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "trip-ledger",
-      // 本機 miniflare 不驗證這個值。要部署前先跑 `wrangler d1 create trip-ledger`,
-      // 把回傳的真實 id 換進來。
-      "database_id": "local-dev-placeholder"
-    }
-  ],
-
-  // ⚠️ 這裡必須手動維護,不能省略。
-  //
-  // Nitro 文件說 cloudflare_module preset 會依 nuxt.config.ts 的 scheduledTasks
-  // 在 build 時自動生成 Cron Triggers —— **實測沒有**。跑完 `pnpm build` 後
-  // .output 底下找不到任何含 crons 的 wrangler 設定(對應已知 issue
-  // nuxt-hub/core#648、nitro#3214)。少了這段,部署上去兩個排程都不會執行,
-  // 而且不會有任何錯誤訊息,只是靜靜地不動。
-  //
-  // 時間一律 UTC:
-  //   0 1 * * *    = 台灣 09:00 抓匯率(來源每日 00:0x UTC 更新)
-  //   */5 * * * *  = 每 5 分鐘掃預約提醒
-  // 這兩個排程字串必須和 nuxt.config.ts 的 scheduledTasks 完全一致,
-  // 因為 Nitro 是用 cron 字串去對應要跑哪個 task。
-  // test/cron-config.test.ts 會擋住兩邊不同步。
-  "triggers": {
-    "crons": ["0 1 * * *", "*/5 * * * *"]
-  }
+	"name": "trip-ledger",
+	"compatibility_date": "2026-09-07",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"main": ".output/server/index.mjs",
+	"assets": {
+		"directory": ".output/public"
+	},
+	// ⚠️ 只能有**一個** trip-ledger 的 binding。
+	//
+	// `wrangler d1 execute trip-ledger` 是用 database_name 去找的,兩筆同名時它拿第一筆的
+	// database_id —— 之前這裡留著 "local-dev-placeholder" 又被 dashboard 加了第二筆真的,
+	// 結果 db:init:remote 把佔位符送去 API,回 `Invalid property: databaseId => Invalid uuid`。
+	//
+	// 也不要加 "remote": true。那個旗標會讓**本機 `pnpm dev` 直接讀寫線上資料庫** ——
+	// 跑一次 test:api 就會把正式資料攪成測試殘留。本機一律走 miniflare 模擬。
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "trip-ledger",
+			// 本機 miniflare 不驗證這個值,但線上與 --remote 的指令都靠它。
+			// 換一個 Cloudflare 帳號的話要重跑 `wrangler d1 create trip-ledger` 換掉。
+			// 這不是密鑰(沒有它也存取不到任何東西),所以可以 commit。
+			"database_id": "85bfee59-cf9d-4195-8255-d25beaaab289"
+		}
+	],
+	// ⚠️ 這裡必須手動維護,不能省略。
+	//
+	// Nitro 文件說 cloudflare_module preset 會依 nuxt.config.ts 的 scheduledTasks
+	// 在 build 時自動生成 Cron Triggers —— **實測沒有**。跑完 `pnpm build` 後
+	// .output 底下找不到任何含 crons 的 wrangler 設定(對應已知 issue
+	// nuxt-hub/core#648、nitro#3214)。少了這段,部署上去兩個排程都不會執行,
+	// 而且不會有任何錯誤訊息,只是靜靜地不動。
+	//
+	// 時間一律 UTC:
+	//   0 1 * * *    = 台灣 09:00 抓匯率(來源每日 00:0x UTC 更新)
+	//   */5 * * * *  = 每 5 分鐘掃預約提醒
+	// 這兩個排程字串必須和 nuxt.config.ts 的 scheduledTasks 完全一致,
+	// 因為 Nitro 是用 cron 字串去對應要跑哪個 task。
+	// test/cron-config.test.ts 會擋住兩邊不同步。
+	"triggers": {
+		"crons": [
+			"0 1 * * *",
+			"*/5 * * * *"
+		]
+	}
 }

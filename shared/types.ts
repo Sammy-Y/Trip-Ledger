@@ -37,7 +37,12 @@ export interface Transfer { from: string; to: string; amountMinor: number; }
  * 公費的收支,逐幣別分開(和結算一樣,絕不跨幣別相加)。
  *
  * remainingMinor = 投入 − 公費付掉的 − 已退還。
- * 這個數字就是「公費現在還剩多少現金」,等於公費成員淨額的相反數。
+ * 這個數字就是「公費現在還剩多少現金」。
+ *
+ * ⚠️ 它**不再**等於公費成員淨額的相反數。淨額已經不含投入 / 退還
+ * (見 server/utils/ledger.ts 開頭),所以現在成立的是
+ * 「公費淨額 === spentMinor」—— 剩餘只能從這裡的三個欄位算,
+ * 不能從淨額推回去。
  */
 export interface PotCurrency {
   currency: string;

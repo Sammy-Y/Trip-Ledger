@@ -28,7 +28,7 @@
  * 每一組都自己建一趟新旅程 —— 餘額是「整趟」的概念,
  * 組跟組之間共用旅程的話,前一組留下的帳會污染下一組的數字。
  */
-import { readdirSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { group, check, eq, summary } from './_harness.ts';
@@ -589,8 +589,13 @@ group('[8] 公費的三條規則,PATCH 同樣要守');
   const pot = ((bal.json.pot?.by_currency ?? []) as J[]).find((r) => r.currency === 'JPY');
   eq('公費付掉的金額跟著變成 3000', pot?.spentMinor, 3000);
   eq('公費剩餘 = −3000(還沒有人投入)', pot?.remainingMinor, -3000);
-  // 「公費剩餘 = −公費淨額」是這個 App 的核心不變量,編輯之後也必須成立
-  eq('剩餘 = −淨額,不變量還在', pot?.remainingMinor, -((await netsOf(c.T, 'JPY')).get(potId) ?? 0));
+  // 「公費淨額 = 公費花費」是這個 App 的核心不變量(取代了舊的「剩餘 = −淨額」——
+  // 淨額已經不含投入/退還,見 server/utils/ledger.ts 開頭),編輯之後也必須成立。
+  // ⚠️ 這一組剛好沒有人投入也沒有退還,所以舊的等式在數值上仍然成立;
+  // 改成盯 spentMinor 是為了讓它真的在守新語意,而不是碰巧綠著。
+  const potNet = (await netsOf(c.T, 'JPY')).get(potId) ?? 0;
+  eq('公費淨額 = 公費花費,不變量還在', potNet, pot?.spentMinor);
+  eq('編輯之後也是 3000', potNet, 3000);
   eq('兩人各分攤 1500', lines((await one(c.T, eid))?.shares, c), ['喧 1500', '民 1500']);
 }
 
@@ -764,7 +769,18 @@ function findD1(): string | null {
   try {
     const dir = fileURLToPath(new URL('../.wrangler/state/v3/d1/miniflare-D1DatabaseObject/', import.meta.url));
     const files = readdirSync(dir).filter((n) => n.endsWith('.sqlite') && n !== 'metadata.sqlite');
-    return files.length === 1 ? dir + files[0] : null;
+    if (!files.length) return null;
+    // 目錄裡可能有**多個** .sqlite:miniflare 的本機 D1 檔名是由 wrangler.jsonc 的
+    // database_id 雜湊出來的,所以那個值一改(例如把 local-dev-placeholder 換成真實 UUID
+    // 準備部署),就會多出一個全新的空資料庫,舊的仍然留在磁碟上。
+    //
+    // 原本這裡是 `files.length === 1 ? … : null`,於是那一刻起所有需要數列的斷言
+    // 都變成 `got null`(實測 39 條)—— 而真正的原因和測試完全無關,很難聯想。
+    // dev server 讀的一定是**現在**這份設定對應的那個檔,也就是最近被寫入的那個,
+    // 所以挑 mtime 最新的。
+    return dir + files
+      .map((n) => ({ n, at: statSync(dir + n).mtimeMs }))
+      .sort((a, b) => b.at - a.at)[0]!.n;
   } catch { return null; }
 }
 const D1_PATH = findD1();

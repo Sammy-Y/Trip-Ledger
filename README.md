@@ -958,6 +958,31 @@ npx wrangler secret put NUXT_VAPID_SUBJECT      # mailto:you@example.com
 pnpm deploy
 ```
 
+> [!IMPORTANT]
+> **`NUXT_PBKDF2_ITERATIONS` 決定了登入能不能用,部署前先讀這一段。**
+>
+> Workers 沒有原生 bcrypt/argon2,密碼雜湊只能用 WebCrypto 的 PBKDF2 ——
+> 而 PBKDF2 的重點就是「故意很慢」,偏偏**免費版每次呼叫只有 10ms CPU**。
+> 實測(`node scripts/bench-pbkdf2.mjs`,M 系列 Mac):
+>
+> | 迭代次數 | 本機耗時 | 10ms 預算 |
+> |---|---|---|
+> | 25,000 | 2.6 ms | ✅ 免費版也安全 |
+> | 50,000（預設） | 3.6 ms | ⚠️ 線上 CPU 較慢,**可能剛好超標** |
+> | 100,000 | 7.2 ms | ❌ 免費版幾乎確定超標 |
+> | 600,000（OWASP 建議） | 45.3 ms | ❌ 需要 Workers Paid |
+>
+> 超標的症狀是**登入直接失敗**(Worker 被 CPU limit 中斷),不是變慢。
+>
+> - **走免費版** → 先設 `25000` 確認整條路徑活著,再往上試:
+>   `npx wrangler secret put NUXT_PBKDF2_ITERATIONS`
+> - **走 Workers Paid($5/月,30 秒 CPU)** → 設 `600000`,直接拿到建議強度
+>
+> **兩者之間切換不需要任何資料遷移。** 每個使用者的迭代次數存在自己那一列
+> (`users.password_iter`),調高之後舊帳號照樣登得進來,並在下次登入成功時
+> 自動用新參數重算(見 `server/api/auth/login.post.ts`)。
+> 所以「先免費跑起來、之後再升級」是安全的路徑。
+
 <details>
 <summary><b>產生 VAPID 金鑰</b></summary>
 

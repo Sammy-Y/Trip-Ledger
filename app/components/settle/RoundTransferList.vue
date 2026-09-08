@@ -7,15 +7,17 @@ import { formatMoney } from '~~/shared/money';
  * 這是結算的**結果**:看完明細之後,使用者要的就是一句「誰拿多少給誰」。
  * 所以金額用大字、方向用箭頭,不需要任何解讀。
  *
- * tone 決定這一排是什麼性質,兩者的差別是**會不會被寫進帳**:
+ * tone 決定這一排的視覺層級,差別是**這些錢還沒付 / 已經成為紀錄**:
  *
- *   recorded  兩端都是真人 → 結算回合會真的寫成 settlements。可以有動作按鈕。
- *   deferred  任一端是公費 → **唯讀,永遠不寫入。**
- *             第一天晚上公費淨額 = −(手上剩的現金),照著轉等於把公費清空退還,
- *             而那筆錢明天還要用。公費的結算在旅程結束用總覽的「退還」處理。
+ *   recorded  主色框。「按下結算就會寫成 settlements 的那幾筆」—— 這才是結果。
+ *   deferred  灰底虛線。唯讀、已成定局的紀錄(結算歷史裡「當時記下的轉帳」)。
  *
- * 所以這個元件在 deferred 的時候刻意連 slot 都不吃 —— 沒有任何路徑
- * 能讓它長出一顆會寫入公費腿的按鈕。
+ * 這個元件刻意連 slot 都不吃:它永遠只是顯示,沒有任何路徑能讓某一列
+ * 長出寫入按鈕 —— 寫入一律由頁面負責,才不會有兩個地方各自送出。
+ *
+ * ⚠️ 結算頁**不再顯示任何一端是公費的腿**(以前那些走 tone="deferred")。
+ * 淨額已經改成不含投入 / 退還,公費的投入 / 退還 / 剩餘一律歸「總覽」——
+ * 理由見 pages/t/[trip]/settle.vue 檔頭。
  */
 interface TransferInput {
   from: string;
@@ -29,7 +31,7 @@ const props = withDefaults(defineProps<{
   currency: string;
   /** member_id -> 名字。由 useTrip 的 memberMap 傳進來 */
   names: Map<string, string>;
-  /** 'recorded' = 會寫進帳(主色);'deferred' = 唯讀的公費腿(灰) */
+  /** 'recorded' = 還沒付、按下結算會寫進帳(主色);'deferred' = 已成定局的紀錄(灰) */
   tone?: 'recorded' | 'deferred';
   /** 公費的 member_id,用來在列上標出哪一端是公費 */
   potId?: string | null;
@@ -153,7 +155,7 @@ const withTotal = computed(() => props.showTotal && rows.value.length > 1);
   background: color-mix(in oklab, var(--brand) 7%, var(--bg-elevated));
   border-color: color-mix(in oklab, var(--brand) 30%, var(--border));
 }
-/* 公費的腿:灰底,和上面的結果明顯不同層級 —— 它現在不用轉 */
+/* 已成定局的紀錄:灰底虛線,和「還沒付的結果」明顯不同層級 */
 .row-deferred {
   background: var(--bg-sunken);
   border-style: dashed;

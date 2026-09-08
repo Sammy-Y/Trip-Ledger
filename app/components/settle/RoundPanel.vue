@@ -8,14 +8,19 @@ import { CURRENCY_LABEL } from '~~/shared/money';
  * 一個幣別一塊(一個回合只結一個幣別,日幣台幣永不相加),由上到下就是使用者的動線:
  *   ① 明細   今晚要結的是哪幾筆(還沒列入任何回合的支出)
  *   ② 結果   A → B ¥N,按下結算會真的記下來的那些
- *   ③ 公費   任一端是公費的腿 —— 唯讀,現在不轉
- *   ④ 動作   結算這一輪(後面還有一次確認)
+ *   ③ 動作   結算這一輪(後面還有一次確認)
+ *
+ * ⚠️ 這裡**刻意沒有「公費的部分」那一段**(以前是③)。淨額的語意已經改成不含
+ * 投入 / 退還,公費的腿只剩「大家還欠信封多少」的意思,而那件事真人的淨額本身
+ * 就講完了;在「按下去會寫下什麼」的面板裡再畫一次,會讓人以為結算會動到
+ * 公費的現金。公費的投入 / 退還 / 剩餘一律歸「總覽」——
+ * 完整推導見 pages/t/[trip]/settle.vue 檔頭。
  *
  * ══ 這個面板最容易被誤解的一件事 ═══════════════════════════════
  *
  * **①的範圍和②的範圍刻意不同。**
  *   ① = 還沒列入任何回合的支出
- *   ② = 整趟到現在的淨額結果(含公費)
+ *   ② = 整趟到現在的淨額結果(有公費的話,也含公費付掉的那些共同花費)
  * 只把未結的子集拿來算會重複要錢(完整理由見 server/utils/ledger.ts:
  * settlement 這一列沒有欄位指向它清掉的是哪一筆債)。
  * 所以文案必須明講這件事 —— 不然使用者會拿①的金額去驗②,發現對不起來就不信任這個 App。
@@ -52,8 +57,8 @@ const label = computed(() => CURRENCY_LABEL[props.block.currency] ?? props.block
 const items = computed(() => props.block.items ?? []);
 /** item_count 由 server 算,和 items.length 應該一致;以 server 的為準 */
 const itemCount = computed(() => props.block.item_count ?? items.value.length);
+// block.deferred(任一端是公費的腿)刻意不讀 —— 理由見檔頭那段 ⚠️
 const recorded = computed(() => props.block.recorded ?? []);
-const deferred = computed(() => props.block.deferred ?? []);
 
 /** 沒有新明細、也沒有待轉帳 —— server 這時會回 409,所以按鈕要先鎖起來 */
 const nothingToDo = computed(() => itemCount.value === 0 && recorded.value.length === 0);
@@ -65,7 +70,7 @@ const detailOpen = ref(true);
 
 /**
  * 有明細但算下來沒有人要轉帳(例如每個人都剛好付了自己那份,
- * 或全部的債都落在公費身上)。這種情況結算仍然有意義 —— 它把明細蓋章、
+ * 或剩下的債都是對公費的)。這種情況結算仍然有意義 —— 它把明細蓋章、
  * 讓下一輪從乾淨的地方開始 —— 但按鈕文案不能讓人以為有錢要轉。
  */
 const stampOnly = computed(() => itemCount.value > 0 && recorded.value.length === 0);
@@ -100,20 +105,13 @@ const stampOnly = computed(() => itemCount.value > 0 && recorded.value.length ==
         <span>{{ blocked }}</span>
       </p>
 
-      <!--
-        ── 完全沒事可做 ──
-        「沒有要結算的東西」和「公費還有錢」是兩件事。所以只有在
-        **連公費的腿都沒有**的時候才整塊換成空狀態 ——
-        不然信封裡的現金會在畫面上無聲消失(③ 原本被包在 v-else 裡就是這個 bug)。
-      -->
+      <!-- ── 完全沒事可做 ── -->
       <UiEmptyState
         v-if="nothingToDo"
         dense
         icon="lucide:coffee"
         title="這個幣別目前沒有要結算的東西"
-        :description="deferred.length
-          ? `沒有還沒列入結算的${label}明細,也沒有人需要轉帳。剩下的都是${potName}的部分(見下面),旅程結束再處理。`
-          : `沒有還沒列入結算的${label}明細,也沒有人需要轉帳。再記一筆共同花費,這裡就會出現下一輪。`"
+        :description="`沒有還沒列入結算的${label}明細,也沒有人需要轉帳。再記一筆共同花費,這裡就會出現下一輪。`"
       />
 
       <template v-if="!nothingToDo">
@@ -178,54 +176,23 @@ const stampOnly = computed(() => itemCount.value > 0 && recorded.value.length ==
               class="mt-2"
             />
             <p class="hint">
-              金額是把<strong class="font-medium text-[var(--text)]">整趟到現在</strong>的帳
-              (含公費)一起抵銷後的結果,不是上面那幾筆的加總 ——
+              金額是把<strong class="font-medium text-[var(--text)]">整趟到現在</strong>的共同花費<template
+                v-if="potId"
+              >(含{{ potName }}付掉的)</template>一起抵銷後的結果,不是上面那幾筆的加總 ——
               只算未結的那一小段會重複要錢,所以刻意不那樣算。
               筆數是已簡化的組合,金額一定對得上,但不保證是筆數最少的組法。
             </p>
           </template>
 
           <p v-else-if="stampOnly" class="hint mt-1">
-            算下來沒有人需要轉帳給別人
-            <template v-if="deferred.length">(要處理的都落在{{ potName }}身上,見下面一段)</template>
-            <template v-else>—— 每個人付的和該分攤的剛好對得上</template>。
-            結算仍然有意義:它會把上面
+            算下來沒有人需要轉帳給別人。結算仍然有意義:它會把上面
             <span class="tnum">{{ itemCount }}</span> 筆標記成「已列入第
             <span class="tnum">{{ block.seq }}</span> 次結算」,下一輪就從還沒標記的地方開始。
           </p>
         </section>
       </template>
 
-      <!--
-        ═════ ③ 公費的腿:唯讀 ═════
-        刻意放在 v-if 之外:不管這一輪有沒有東西要結,信封裡的現金都要看得見。
-      -->
-      <section v-if="deferred.length" :class="nothingToDo ? '' : 'topline'">
-        <h5 class="sect-title">
-          <Icon name="lucide:piggy-bank" size="13" aria-hidden="true" />
-          <span>{{ potName }}的部分</span>
-          <span class="sect-readonly">唯讀 · 現在不轉</span>
-        </h5>
-
-        <SettleRoundTransferList
-          :transfers="deferred"
-          :currency="block.currency"
-          :names="names"
-          :pot-id="potId"
-          tone="deferred"
-          class="mt-2"
-        />
-
-        <p class="hint">
-          這幾筆<strong class="font-medium text-[var(--text)]">不會</strong>被結算寫進帳,
-          也沒有「標記已還款」可以按。原因很實際:今晚{{ potName }}的淨額就等於<strong
-            class="font-medium text-[var(--text)]"
-          >信封裡還剩的現金</strong>,照著轉等於把{{ potName }}清空退還 —— 而那筆錢明天還要用。
-          旅程結束時到「總覽」用<strong class="font-medium text-[var(--text)]">投入 / 退還</strong>把剩下的現金分回去,這幾筆就會歸零。
-        </p>
-      </section>
-
-      <!-- ═════ ④ 動作 ═════ -->
+      <!-- ═════ ③ 動作 ═════ -->
       <div v-if="!nothingToDo" class="topline">
         <UiAppButton
           block
@@ -295,16 +262,6 @@ const stampOnly = computed(() => itemCount.value > 0 && recorded.value.length ==
   background: color-mix(in oklab, var(--brand) 12%, transparent);
   color: var(--brand);
 }
-/* 唯讀徽章要用警示色而不是品牌色 —— 它的意思是「別碰」 */
-.sect-readonly {
-  padding: 0.0625rem 0.375rem;
-  border-radius: 999px;
-  font-size: 0.625rem;
-  font-weight: 500;
-  background: color-mix(in oklab, var(--warn) 20%, transparent);
-  color: var(--text);
-}
-
 .toggle {
   display: inline-flex;
   align-items: center;
