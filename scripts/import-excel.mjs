@@ -24,9 +24,20 @@
  * 「付掉了多少」,不知道每個人「投入了多少」—— 原 Excel 沒有記投入。
  * 投入要在總覽頁用「投入」手動補,補完公費才會平。
  *
- * 用法:node scripts/import-excel.mjs [baseUrl]
+ * ══ 要先登入,否則會匯成「無主旅程」════════════════════════════
+ *
+ * 加上存取控制(issue #3)之後,沒帶 cookie 呼叫 POST /api/trips 建出來的旅程
+ * 不屬於任何帳號 —— 進得去、記得了帳,但沒有人能刪除它,換裝置也找不回來。
+ * 所以這支腳本會先登入,讓匯進來的旅程掛在你的帳號下(role = owner)。
+ *
+ * 用法:
+ *   IMPORT_EMAIL=you@example.com IMPORT_PASSWORD=... node scripts/import-excel.mjs [baseUrl]
+ *
+ * 不給帳密也還是跑得完(方便純測試),但會印一行警告。
  */
 const BASE = process.argv[2] || 'http://localhost:3000';
+const EMAIL = process.env.IMPORT_EMAIL || '';
+const PASSWORD = process.env.IMPORT_PASSWORD || '';
 
 // ── 來源資料(從 xlsx 抽出)────────────────────────────────────
 //
@@ -121,12 +132,25 @@ const POT_NAME = '公費';
 // 「這筆從公費付」是一個已確認的事實,不是匯入時的權宜之計。
 const POT_NOTE = `由${POT_NAME}支付:原 Excel 的「人員」欄留空,而留空就代表這筆是從${POT_NAME}出的錢。`;
 
+/**
+ * session cookie。登入之後每一個請求都要帶,否則 server 認不出是誰,
+ * 建立的旅程就不會掛在你的帳號下。
+ */
+const cookies = new Map();
+
 async function req(method, path, body) {
+  const headers = body ? { 'content-type': 'application/json' } : {};
+  if (cookies.size) headers.cookie = [...cookies].map(([k, v]) => `${k}=${v}`).join('; ');
   const r = await fetch(BASE + path, {
     method,
-    headers: body ? { 'content-type': 'application/json' } : {},
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
+  for (const line of r.headers.getSetCookie?.() ?? []) {
+    const pair = line.split(';')[0];
+    const at = pair.indexOf('=');
+    if (at > 0) cookies.set(pair.slice(0, at).trim(), pair.slice(at + 1).trim());
+  }
   const txt = await r.text();
   let json = {};
   try { json = txt ? JSON.parse(txt) : {}; } catch { json = { _raw: txt.slice(0, 300) }; }
@@ -134,7 +158,14 @@ async function req(method, path, body) {
   return json;
 }
 
-console.log(`匯入目標: ${BASE}\n`);
+console.log(`匯入目標: ${BASE}`);
+
+if (EMAIL && PASSWORD) {
+  const me = await req('POST', '/api/auth/login', { email: EMAIL, password: PASSWORD });
+  console.log(`登入身分: ${me.display_name} <${me.email}>\n`);
+} else {
+  console.log('⚠ 沒有給 IMPORT_EMAIL / IMPORT_PASSWORD —— 匯進來的旅程不會有擁有者。\n');
+}
 
 // 匯率必須先有,否則每筆的 fx_rate 都會是 null
 await req('POST', '/api/admin/sync-rates');
