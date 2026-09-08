@@ -159,6 +159,8 @@ export interface ApiClient {
   get: <T>(url: string, query?: ApiQuery) => Promise<T>;
   /** POST JSON。 */
   post: <T>(url: string, body?: unknown) => Promise<T>;
+  /** PATCH JSON(部分更新,例如改成員名字)。 */
+  patch: <T>(url: string, body?: unknown) => Promise<T>;
   /** DELETE。 */
   del: <T>(url: string, query?: ApiQuery) => Promise<T>;
   /** 手動把別處(例如 useFetch)的錯誤轉成可顯示訊息。 */
@@ -167,7 +169,7 @@ export interface ApiClient {
 
 export function useApi(): ApiClient {
   async function request<T>(
-    method: 'GET' | 'POST' | 'DELETE',
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
     url: string,
     opts: { query?: ApiQuery; body?: unknown } = {},
   ): Promise<T> {
@@ -192,6 +194,7 @@ export function useApi(): ApiClient {
   return {
     get: <T>(url: string, query?: ApiQuery) => request<T>('GET', url, { query }),
     post: <T>(url: string, body?: unknown) => request<T>('POST', url, { body }),
+    patch: <T>(url: string, body?: unknown) => request<T>('PATCH', url, { body }),
     del: <T>(url: string, query?: ApiQuery) => request<T>('DELETE', url, { query }),
     errorMessage: apiErrorMessage,
   };

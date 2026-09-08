@@ -90,6 +90,17 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
           {{ expense.description || '未填說明' }}
         </span>
         <span v-if="expense.category" class="chip shrink-0">{{ expense.category }}</span>
+        <!--
+          已列入結算回合的標記。使用者的需求原話是「已結清的記錄就標記起來,
+          下次從尚未被標記的地方開始結算」—— 後半段(結算範圍)在 server 做完了,
+          但前半段是**看得見的標記**,少了它使用者根本不知道哪幾筆已經算過。
+          文案刻意不寫「已結清」:章是蓋在支出上,而債是由那個回合的轉帳
+          「整批」清掉的,不是一筆一筆對應。
+        -->
+        <span v-if="expense.settlement_round_id" class="chip chip-settled shrink-0">
+          <Icon name="lucide:lock" size="9" />
+          已結算
+        </span>
       </span>
 
       <!-- 手機:付款人 · 分攤 · 付款方式 擠在第二行 -->
@@ -210,6 +221,18 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
   line-height: 1.4;
   background: var(--bg-sunken);
   color: var(--text-muted);
+}
+.chip-settled {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.1875rem;
+  background: color-mix(in oklab, var(--credit) 15%, transparent);
+  color: var(--credit);
+}
+/* 展開 / hover 時列背景會變成 sunken,標籤要換個底色才看得出層次 */
+.exp-row[aria-expanded='true'] .chip-settled,
+.exp-row:hover .chip-settled {
+  background: color-mix(in oklab, var(--credit) 20%, transparent);
 }
 /* 展開 / hover 時列背景會變成 sunken,標籤要換個底色才看得出層次 */
 .exp-row[aria-expanded='true'] .chip {

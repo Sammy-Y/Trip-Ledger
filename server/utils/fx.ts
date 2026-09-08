@@ -43,7 +43,71 @@ export async function syncRates(dbh: D1Database, cfg: FxConfig) {
     batch.push(stmt.bind(rateDate, cfg.base, code, 1 / perBase, 'open.er-api.com'));
   }
   if (batch.length) await dbh.batch(batch);
-  return { ok: true as const, date: rateDate, count: batch.length };
+
+  // 剛拿到新匯率,順手把還沒有 snapshot 的支出補上 —— 理由見 backfillMissingRates。
+  // 放在這裡而不是各個呼叫端:task 走 binding、endpoint 走 HTTP,
+  // 兩條路都會經過 syncRates,只有這裡是唯一不會漏掉的位置。
+  const backfilled = await backfillMissingRates(dbh);
+
+  return { ok: true as const, date: rateDate, count: batch.length, backfilled };
+}
+
+/** 一次補多少筆就好。免費版 Workers 每次呼叫只有 10ms CPU,不要一次掃全表。 */
+const BACKFILL_LIMIT = 500;
+
+/**
+ * 把 `fx_rate IS NULL` 的支出補上匯率 snapshot。
+ *
+ * ── 為什麼需要這支 ────────────────────────────────────────────
+ *
+ * 記帳時如果 fx_rates 是空的(還沒跑過 sync-rates),`rateOn()` 會回 null,
+ * 那筆支出的 fx_rate 就留空。而 balance.get.ts 對 fx_rate 為 null 的列
+ * **退回用「今天」的匯率**換算 —— 於是那筆支出的台幣金額**每天都會變**,
+ * 而且支出明細(顯示存下來的匯率)和總覽/結算(顯示今天的匯率)會對不起來。
+ *
+ * 「同一筆帳今天看和明天看要是同一個數字」是這個 App 的基本承諾,
+ * 所以只要匯率一旦可得,就要把它釘進那筆支出裡,讓它停止漂移。
+ *
+ * 補的是**消費當日**的匯率(和記帳時同一套 rateOn 政策,含 fallback:earliest 標記),
+ * 不是今天的 —— 否則補完之後數字雖然固定了,但固定在錯的值上。
+ */
+export async function backfillMissingRates(dbh: D1Database) {
+  const rows = await dbh.prepare(
+    `SELECT e.id, e.currency, e.spent_at, t.base_currency
+     FROM expenses e JOIN trips t ON t.id = e.trip_id
+     WHERE e.fx_rate IS NULL
+     ORDER BY e.created_at
+     LIMIT ?`,
+  ).bind(BACKFILL_LIMIT).all<{
+    id: string; currency: string; spent_at: string; base_currency: string;
+  }>();
+
+  const pending = rows.results ?? [];
+  if (!pending.length) return { updated: 0, unresolved: 0 };
+
+  // 同一天同一個幣別只查一次匯率 —— 幾十筆支出通常只有幾種組合,
+  // 逐筆查會變成幾百次 D1 往返。
+  const resolved = new Map<string, { rate: number; date: string; source: string } | null>();
+  for (const r of pending) {
+    const key = `${r.base_currency}|${r.currency}|${r.spent_at}`;
+    if (resolved.has(key)) continue;
+    resolved.set(key, await rateOn(dbh, r.base_currency, r.currency, r.spent_at.slice(0, 10)));
+  }
+
+  const stmt = dbh.prepare(
+    `UPDATE expenses SET fx_rate = ?, fx_rate_date = ?, fx_rate_source = ? WHERE id = ?`,
+  );
+  const updates = [];
+  let unresolved = 0;
+  for (const r of pending) {
+    const fx = resolved.get(`${r.base_currency}|${r.currency}|${r.spent_at}`);
+    // 這個幣別連一筆匯率都沒有(WANTED 之外的幣別)。留著 null,下次再試。
+    if (!fx) { unresolved++; continue; }
+    updates.push(stmt.bind(fx.rate, fx.date, fx.source, r.id));
+  }
+  if (updates.length) await dbh.batch(updates);
+
+  return { updated: updates.length, unresolved };
 }
 
 /**

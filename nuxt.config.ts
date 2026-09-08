@@ -59,7 +59,12 @@ export default defineNuxtConfig({
     fxBase: 'TWD',
     fxSourceUrl: 'https://open.er-api.com/v6/latest',
     // 估算用的價差假設,不是官方數字。可用每筆的 fx_rate_override 覆寫。
-    cashSpreadPct: '1.5',
+    // 現金預設 0:這個團的做法是**出發前就在台灣換好現金**,
+    // 那筆錢的成本在換鈔當下就固定了,記帳時再加一次價差等於重複計價。
+    // (如果是在當地 ATM 提領或臨櫃換,那才有價差 —— 那種情況每筆自己填。)
+    cashSpreadPct: '0',
+    // 刷卡才有國外交易手續費:國際組織費 + 發卡行加收,
+    // 台灣的 Visa / Mastercard / JCB 實務上合計約 1.5%(AmEx 約 2%)。
     cardFeePct: '1.5',
     // wrangler secret put NUXT_VAPID_PRIVATE_JWK / NUXT_VAPID_PUBLIC_KEY / NUXT_VAPID_SUBJECT
     vapidPrivateJwk: '',

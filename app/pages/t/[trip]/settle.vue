@@ -1,16 +1,34 @@
 <script setup lang="ts">
-import type { Balance, Net, Transfer } from '~~/shared/types';
+import type {
+  Balance, Net, RoundPreview, RoundPreviewBlock, SettlementRound, Transfer,
+} from '~~/shared/types';
 import { CURRENCY_LABEL, formatMoney } from '~~/shared/money';
 
 /**
  * 結算 —— 「誰要給誰多少錢」。這頁是整個產品存在的理由。
  *
- * 三個不可妥協的規則:
+ * 五個不可妥協的規則:
  *  1. **逐幣別分開結算**。日幣和台幣絕不相加成一個總額,每個幣別自己一個區塊。
  *  2. 轉帳建議是貪婪近似解,文案寫「已簡化」而不是「最少」
  *     (最小化轉帳筆數可歸約到 Subset Sum,是 NP-Complete)。
  *  3. balance.disclaimer 與 balance.rate_attribution 必須顯示 ——
  *     前者是「換算值只是估算」的誠實聲明,後者是匯率來源的授權要求。
+ *  4. **公費的腿一律唯讀。** 任一端是公費的轉帳建議絕對不能給出寫入按鈕,
+ *     不管是「標記已還款」還是「結算」。理由見下面 sections 的註解。
+ *  5. 被結算蓋章的支出叫「已列入第 N 次結算」,**不是「已結清」**。
+ *     債務是由那一輪的轉帳整體清掉的,不是一筆一筆對消 ——
+ *     叫它「已結清」會讓人以為可以逐筆勾銷,那個心智模型會算錯錢。
+ *
+ * ══ 結算回合(rounds)的兩個範圍 ═══════════════════════════════
+ *
+ * 這頁同時顯示兩種範圍的數字,而它們**刻意不同**:
+ *   明細範圍  只有 settlement_round_id IS NULL 的支出 → 「本次要結算」列的那幾筆
+ *   算術範圍  整趟到目前為止的所有帳(公費算完整成員)→ 所有的淨額與轉帳金額
+ *
+ * 只把未結的子集拿來算會**重複要錢**(settlement 這一列沒有任何欄位指向
+ * 它清掉的是哪一筆債,所以真子集一定會遇到「還款在範圍內、對應的債在範圍外」),
+ * 完整推導在 server/utils/ledger.ts。畫面上因此必須明講「金額不是上面那幾筆的加總」,
+ * 否則使用者會自己去驗、發現對不起來,然後不敢信任這個 App。
  *
  * 這頁是要拿給朋友看的,所以寧可多一行說明,也不要讓人懷疑數字是怎麼來的。
  */
@@ -18,7 +36,11 @@ useHead({ title: '結算 — 旅遊記帳' });
 
 const tripId = useTripId();
 const api = useApi();
-const { members, memberName } = useTrip(tripId);
+const { members, memberName, memberMap, pot } = useTrip(tripId);
+
+/** 公費的 member_id。這趟沒設公費時是 null。 */
+const potId = computed<string | null>(() => pot.value?.id ?? null);
+const potName = computed(() => pot.value?.name ?? '公費');
 
 // ── 資料 ──────────────────────────────────────────────────────
 // 以 tripId 當 key,和 useTrip 同一套做法:tripId 變了自動重抓。
@@ -43,12 +65,131 @@ const loadError = computed<string | null>(() => {
   return api.errorMessage(e);
 });
 
+// ── 結算回合 ──────────────────────────────────────────────────
+/**
+ * 三份資料,分開抓:
+ *   preview  這一輪要結什麼(明細 + 結果)
+ *   rounds   結算歷史列表
+ *   detail   某一輪的完整明細(展開時才抓)
+ *
+ * 刻意不合併成一支 API:歷史列表就算 preview 掛了也該看得到
+ * (「幾個月後回來查這 1,850 是什麼」不該被今天的網路問題擋住)。
+ */
+const previewState = useAsyncData<RoundPreview | null>(
+  () => `rounds-preview:${tripId.value}`,
+  () => api.get<RoundPreview>(`/api/trips/${encodeURIComponent(tripId.value)}/rounds/preview`),
+  {
+    enabled: computed(() => !!tripId.value),
+    default: () => null,
+    deep: false,
+    dedupe: 'defer',
+  },
+);
+
+const roundsState = useAsyncData<SettlementRound[]>(
+  () => `rounds:${tripId.value}`,
+  () => api.get<SettlementRound[]>(`/api/trips/${encodeURIComponent(tripId.value)}/rounds`),
+  {
+    enabled: computed(() => !!tripId.value),
+    default: () => [],
+    deep: false,
+    dedupe: 'defer',
+  },
+);
+
+/** 一次只展開一輪 —— 和支出列表的 openId 同一套做法,不會殘留一堆展開狀態 */
+const openRoundId = ref<string | null>(null);
+
+/**
+ * 展開那一輪的明細。key 帶 roundId,所以同一輪收起再展開會沿用已抓到的資料;
+ * 但結算 / 撤銷之後一定要 refresh,不然會顯示過期的快照。
+ */
+const detailState = useAsyncData<RoundDetail | null>(
+  () => `round-detail:${tripId.value}:${openRoundId.value ?? ''}`,
+  () => {
+    const id = openRoundId.value;
+    if (!id) return Promise.resolve(null);
+    return api.get<RoundDetail>(
+      `/api/trips/${encodeURIComponent(tripId.value)}/rounds/${encodeURIComponent(id)}`,
+    );
+  },
+  {
+    // 刻意**不用 enabled**。這裡靠的是「反應式 key 變了就重抓」——
+    // 和 useTrip / balance 同一個機制,已知有效。
+    // 用 enabled 從 false 翻成 true 來觸發第一次抓取是另一條路徑,
+    // 萬一那條沒觸發,展開歷史就會永遠停在載入中(而且不會有任何錯誤訊息)。
+    // 沒有 openRoundId 時 handler 直接回 null,不會打出任何請求。
+    default: () => null,
+    deep: false,
+    dedupe: 'defer',
+  },
+);
+
+/** GET /rounds/:id 的形狀。shared/types 沒有宣告(這頁是唯一的消費者)。 */
+interface RoundDetail {
+  id: string;
+  currency: string;
+  seq: number;
+  label: string | null;
+  note: string | null;
+  created_at: string;
+  reverted_at: string | null;
+  items: Array<{
+    id: string; description: string; amount_minor: number; spent_at: string;
+    note?: string | null;
+    payers: Array<{ member_id: string; amount_minor: number }>;
+    shares: Array<{ member_id: string; amount_minor: number }>;
+  }>;
+  nets: Array<{ memberId: string; netMinor: number }>;
+  transfers: Array<{
+    id: string; from_member: string; to_member: string;
+    currency: string; amount_minor: number; settled_at: string;
+  }>;
+}
+
+const preview = computed<RoundPreview | null>(() => previewState.data.value ?? null);
+const previewBlocks = computed<RoundPreviewBlock[]>(() => preview.value?.blocks ?? []);
+const rounds = computed<SettlementRound[]>(() => roundsState.data.value ?? []);
+const roundDetail = computed<RoundDetail | null>(() => detailState.data.value ?? null);
+
+/** 被取消的請求(換頁 / 換 tripId)不是錯誤,不要顯示 */
+function messageOf(raw: unknown): string | null {
+  if (!raw || isAbortError(raw)) return null;
+  return api.errorMessage(raw);
+}
+const previewError = computed(() => messageOf(previewState.error.value));
+/** 第一次載入才顯示骨架;refresh 時保留舊面板不要跳空 */
+const previewPending = computed(
+  () => previewState.status.value === 'pending' && !preview.value,
+);
+const roundsError = computed(() => messageOf(roundsState.error.value));
+const detailError = computed(() => messageOf(detailState.error.value));
+const detailPending = computed(() => detailState.status.value === 'pending');
+const roundsFirstLoad = computed(
+  () => roundsState.status.value === 'pending' && rounds.value.length === 0,
+);
+
+function toggleRound(id: string): void {
+  openRoundId.value = openRoundId.value === id ? null : id;
+}
+
 const refreshing = ref(false);
+/**
+ * 任何寫入之後都要重抓**全部四份**。
+ *
+ * 少抓一份就會出現「畫面上還是舊的」而使用者照著舊畫面再按一次 ——
+ * 結算和標記還款都是寫真實金錢的操作,重複寫入就是重複要錢。
+ */
 async function reload(): Promise<void> {
   refreshing.value = true;
   try {
     // 'cancel':標記還款後一定要拿到重算過的結果,不能沿用可能在路上的舊請求
-    await balanceState.refresh({ dedupe: 'cancel' });
+    await Promise.all([
+      balanceState.refresh({ dedupe: 'cancel' }),
+      previewState.refresh({ dedupe: 'cancel' }),
+      roundsState.refresh({ dedupe: 'cancel' }),
+      openRoundId.value ? detailState.refresh({ dedupe: 'cancel' }) : Promise.resolve(),
+    ]);
   }
   finally {
     refreshing.value = false;
@@ -63,13 +204,18 @@ interface CurrencySection {
   code: string;
   /** 【日幣】【台幣】 */
   label: string;
+  /** 兩端都是真人的轉帳建議 —— **只有這些**能按「標記已還款」 */
   transfers: TransferRow[];
+  /** 任一端是公費的腿 —— 唯讀,旅程結束用總覽的「退還」處理 */
+  deferred: Transfer[];
   /** 非零淨額,應收多的排前面 */
   nets: Net[];
   /** 同幣別最大絕對淨額,bar 的分母 */
   maxAbs: number;
   /** 這個幣別淨額為 0(沒出現在 nets)的成員名字 */
   settledNames: string[];
+  /** 這個幣別的結算預覽區塊。preview 還沒回來 / 抓失敗時是 null */
+  preview: RoundPreviewBlock | null;
 }
 
 const sections = computed<CurrencySection[]>(() => {
@@ -86,33 +232,64 @@ const sections = computed<CurrencySection[]>(() => {
     return a.localeCompare(c);
   });
 
+  const touchesPot = (t: Transfer) => !!potId.value
+    && (t.from === potId.value || t.to === potId.value);
+
   return codes.map((code) => {
     const bucket = b.by_currency[code]!;
     const rawNets = bucket.nets ?? [];
     const nets = [...rawNets].sort((a, c) => c.netMinor - a.netMinor);
     const withNet = new Set(nets.map(n => n.memberId));
 
+    /*
+      ⚠️ 轉帳建議必須分成兩堆,而且只有 recorded 那堆能有按鈕。
+      對公費的腿按下「標記已還款」= 把公費信封裡的現金全部退還出去,
+      而那筆錢明天還要用 —— 而且公費淨額本來就等於 −(手上剩的現金),
+      所以那顆按鈕在第一天晚上就會出現、而且一按就把公費清空。
+      server 的 balance 已經直接給 recorded / deferred;
+      萬一是舊版沒有這兩個欄位,就用 potId 自己分一次,不要退回「全部都能按」。
+    */
+    const recorded = bucket.recorded ?? (bucket.transfers ?? []).filter(t => !touchesPot(t));
+    const deferred = bucket.deferred ?? (bucket.transfers ?? []).filter(touchesPot);
+
     return {
       code,
       label: CURRENCY_LABEL[code] ?? code,
       // 大筆的排前面:先處理金額大的那幾筆最有感
-      transfers: [...(bucket.transfers ?? [])]
+      transfers: [...recorded]
         .sort((a, c) => c.amountMinor - a.amountMinor)
         .map((t, i) => ({ ...t, key: `${code}:${t.from}:${t.to}:${i}` })),
+      deferred: [...deferred].sort((a, c) => c.amountMinor - a.amountMinor),
       nets,
       maxAbs: nets.reduce((max, n) => Math.max(max, Math.abs(n.netMinor)), 0),
       // server 的 nets 已濾掉 0,所以這些人就是已結清的人。
       // 不畫成一整列 ¥0,只在區塊底下列名字,免得洗掉真正要看的數字。
       settledNames: members.value.filter(m => !withNet.has(m.id)).map(m => m.name),
+      preview: previewBlocks.value.find(p => p.currency === code) ?? null,
     };
   });
+});
+
+/**
+ * preview 有、但 balance 沒有的幣別。
+ *
+ * 理論上兩邊都走 utils/ledger.ts 所以幣別集合一致,但明細與算術是兩個查詢 ——
+ * 寧可多畫一塊,也不要讓某個幣別的結算面板整個消失。
+ */
+const orphanBlocks = computed<RoundPreviewBlock[]>(() => {
+  const known = new Set(sections.value.map(s => s.code));
+  return previewBlocks.value.filter(b => !known.has(b.currency));
 });
 
 const hasCurrencies = computed(() => sections.value.length > 0);
 const openTransferCount = computed(
   () => sections.value.reduce((sum, s) => sum + s.transfers.length, 0),
 );
-/** 有共同花費,而且每個幣別都不需要再轉帳 */
+/** 公費的腿(唯讀)。不算進「還有幾筆要轉」,但要另外講,不能靜靜藏起來 */
+const deferredCount = computed(
+  () => sections.value.reduce((sum, s) => sum + s.deferred.length, 0),
+);
+/** 有共同花費,而且每個幣別都不需要人跟人之間再轉帳 */
 const allSettled = computed(() => hasCurrencies.value && openTransferCount.value === 0);
 
 // ── 每人這趟總花費(換算本位幣的估算值) ──────────────────────
@@ -222,6 +399,127 @@ async function confirmSettle(): Promise<void> {
   }
   finally {
     posting.value = false;
+  }
+}
+
+// ── 關閉一次結算回合 ──────────────────────────────────────────
+/**
+ * **單階段。** 關閉回合等於宣告「這些錢已經付了」,沒有 paid_at、沒有「之後再逐筆勾」。
+ *
+ * 兩階段(先產生待付清單、之後逐筆標記)會讓同一筆債同時出現在回合裡
+ * 和上面的「標記已還款」按鈕旁,而兩邊都沒有 idempotency ——
+ * 點兩次就會在 1,500 的債上記下 3,000,然後帳本開始要求反向轉帳。
+ * 所以確認面板必須把「這是已付款的宣告」講到不可能誤解;
+ * 想要部分付款的人應該不要關回合,先用上面的按鈕逐筆標記。
+ */
+const closeOpen = ref(false);
+const closeTarget = ref<RoundPreviewBlock | null>(null);
+const closeLabel = ref('');
+const closing = ref(false);
+const closeError = ref<string | null>(null);
+
+/** 收 null 也不會炸:模板裡 v-if 過的東西,TS 在事件處理器上看不出已經 narrow 過 */
+function askClose(block: RoundPreviewBlock | null): void {
+  if (!block) return;
+  closeTarget.value = block;
+  closeLabel.value = '';
+  closeError.value = null;
+  closeOpen.value = true;
+}
+
+const closeRecorded = computed(() => closeTarget.value?.recorded ?? []);
+const closeRecordedTotal = computed(
+  () => closeRecorded.value.reduce((s, t) => s + t.amountMinor, 0),
+);
+const closeDeferred = computed(() => closeTarget.value?.deferred ?? []);
+const closeCurrencyLabel = computed(() => {
+  const code = closeTarget.value?.currency ?? '';
+  return CURRENCY_LABEL[code] ?? code;
+});
+
+async function confirmClose(): Promise<void> {
+  const b = closeTarget.value;
+  if (!b || closing.value) return;
+  closing.value = true;
+  closeError.value = null;
+  try {
+    /*
+      expect 是「我看到的畫面長這樣」的指紋。兩個人同時操作時,
+      server 會拿它跟現況核對,不一致就回 409 叫我們重新整理 ——
+      否則會照著舊畫面關掉一個內容已經變了的回合(例如別人剛記了一筆帳,
+      那筆會被蓋章進這一輪,但轉帳金額是舊的)。
+    */
+    const res = await api.post<{ id: string; seq: number }>(
+      `/api/trips/${encodeURIComponent(tripId.value)}/rounds`,
+      {
+        currency: b.currency,
+        label: closeLabel.value.trim() || undefined,
+        expect: { item_count: b.item_count, recorded_count: (b.recorded ?? []).length },
+      },
+    );
+    closeOpen.value = false;
+    const n = (b.recorded ?? []).length;
+    flash(
+      `已完成【${CURRENCY_LABEL[b.currency] ?? b.currency}】第 ${res?.seq ?? b.seq} 次結算`
+      + `:${b.item_count} 筆明細已標記為「已列入第 ${res?.seq ?? b.seq} 次結算」`
+      + (n ? `,${n} 筆轉帳已記為已付款。` : '。'),
+    );
+    // 剛結完的那一輪自動展開,使用者馬上看得到「記下了什麼」
+    if (res?.id) openRoundId.value = res.id;
+    await reload();
+  }
+  catch (e) {
+    // 錯誤留在面板裡(尤其 409「請重新整理再結算」),不要把使用者丟回頁面
+    closeError.value = (e as Error).message;
+  }
+  finally {
+    closing.value = false;
+  }
+}
+
+// ── 撤銷一次結算回合 ──────────────────────────────────────────
+/**
+ * 誤按「結算」是會發生的事,而結算寫的是真實金錢的紀錄。
+ * 撤銷會刪掉這一輪產生的轉帳(只有 source='round' 的)、把章拆掉,
+ * 並留下 reverted_at —— 那一列不會消失,帳上看得出「這裡曾經結算過又撤銷」。
+ */
+const revertOpen = ref(false);
+const revertTarget = ref<SettlementRound | null>(null);
+const reverting = ref(false);
+const revertError = ref<string | null>(null);
+
+/** 有寫入正在進行 → 其他寫入按鈕全部鎖住,不要讓同一個人同時改兩處帳 */
+const busy = computed(() => posting.value || closing.value || reverting.value);
+
+function askRevert(round: SettlementRound): void {
+  revertTarget.value = round;
+  revertError.value = null;
+  revertOpen.value = true;
+}
+
+async function confirmRevert(): Promise<void> {
+  const r = revertTarget.value;
+  if (!r || reverting.value) return;
+  reverting.value = true;
+  revertError.value = null;
+  try {
+    await api.del(
+      `/api/trips/${encodeURIComponent(tripId.value)}/rounds/${encodeURIComponent(r.id)}`,
+    );
+    revertOpen.value = false;
+    flash(
+      `已撤銷【${CURRENCY_LABEL[r.currency] ?? r.currency}】第 ${r.seq} 次結算`
+      + `:${r.transfer_count} 筆轉帳已刪除,${r.item_count} 筆明細回到「還沒結算」。`,
+    );
+    // 保持展開:撤銷後那一輪的內容會變空,使用者要看得到「真的撤掉了」
+    openRoundId.value = r.id;
+    await reload();
+  }
+  catch (e) {
+    revertError.value = (e as Error).message;
+  }
+  finally {
+    reverting.value = false;
   }
 }
 
@@ -345,9 +643,18 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
         <div class="settled-badge">
           <Icon name="lucide:check-check" size="26" />
         </div>
-        <p class="text-base font-semibold">已全部結清</p>
+        <p class="text-base font-semibold">人跟人之間已經全部結清</p>
         <p class="mx-auto mt-1.5 max-w-sm text-sm leading-relaxed text-[var(--text-muted)]">
           每個幣別的墊款都對得上,沒有人需要再轉帳給誰。之後再記共同花費,這裡會重新算。
+        </p>
+        <!-- 公費還有錢的時候絕對不能只說「已全部結清」—— 信封裡的現金還沒分回去 -->
+        <p
+          v-if="deferredCount"
+          class="mx-auto mt-2.5 max-w-sm text-xs leading-relaxed"
+          style="color: var(--warn)"
+        >
+          但 {{ potName }}手上還有現金要分回去(<span class="tnum">{{ deferredCount }}</span> 筆)。
+          那部分不在這頁轉,旅程結束到「總覽」用「退還」處理。
         </p>
       </section>
 
@@ -360,7 +667,8 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             還有 <span class="tnum">{{ openTransferCount }}</span> 筆款要轉
           </p>
           <p class="mt-0.5 text-xs leading-relaxed text-[var(--text-muted)]">
-            分 <span class="tnum">{{ sections.length }}</span> 個幣別各自結算。轉完錢在這頁按「標記已還款」。
+            分 <span class="tnum">{{ sections.length }}</span> 個幣別各自結算。
+            一次結掉整輪用各幣別的「結算這一輪」;只有某個人先還了錢就按那一筆的「標記已還款」。
           </p>
         </div>
       </section>
@@ -390,9 +698,11 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             【{{ s.label }}】<span class="ml-1 text-xs font-normal text-[var(--text-muted)]">{{ s.code }}</span>
           </h3>
           <p class="text-xs text-[var(--text-muted)]">
+            <!-- 「已簡化」不是「最少」:最小化轉帳筆數可歸約到 Subset Sum,是 NP-Complete -->
             <template v-if="s.transfers.length">
               已簡化為 <span class="tnum font-medium text-[var(--text)]">{{ s.transfers.length }}</span> 筆轉帳
             </template>
+            <template v-else-if="s.deferred.length">人跟人之間不用轉帳</template>
             <template v-else>這個幣別已結清</template>
           </p>
         </div>
@@ -410,7 +720,7 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             :amount-minor="t.amountMinor"
             :currency="s.code"
             :loading="posting && pending?.key === t.key"
-            :disabled="posting && pending?.key !== t.key"
+            :disabled="busy && pending?.key !== t.key"
             @settle="askSettle(s, t)"
           />
         </div>
@@ -419,9 +729,48 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
           <UiEmptyState
             dense
             icon="lucide:circle-check"
-            title="這個幣別不用轉帳"
-            :description="`所有人在${s.label}的墊款都對得上了。`"
+            title="人跟人之間不用轉帳"
+            :description="s.deferred.length
+              ? `所有人在${s.label}的墊款彼此都對得上了,剩下的都落在${potName}身上(見下面唯讀的那一段)。`
+              : `所有人在${s.label}的墊款都對得上了。`"
           />
+        </div>
+
+        <p v-if="s.transfers.length" class="px-1 text-xs leading-relaxed text-[var(--text-muted)]">
+          某個人先把錢還了 → 按那一筆的「標記已還款」。
+          今晚要一次把整輪結掉 → 用下面的「本次要結算」。
+        </p>
+
+        <!--
+          公費的腿。**刻意沒有任何按鈕。**
+          公費淨額 = −(信封裡剩的現金),照著轉等於把公費清空退還,而那筆錢明天還要用。
+
+          只在「這個幣別沒有結算面板」時才畫 —— 有面板的時候面板裡已經有同樣一段,
+          畫兩次會讓人以為是兩批不同的錢(實測 DOM 真的出現了兩份)。
+          但 preview 掛掉時仍然要看得到這些腿,否則使用者會以為公費沒有未結的錢。
+        -->
+        <div v-if="s.deferred.length && !s.preview" class="card overflow-hidden">
+          <div class="row-head flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 px-4 py-2.5">
+            <h4 class="flex items-center gap-1.5 text-xs font-semibold">
+              <Icon name="lucide:piggy-bank" size="14" class="shrink-0 text-[var(--text-muted)]" />
+              {{ potName }}的部分
+            </h4>
+            <p class="text-[0.6875rem]" style="color: var(--warn)">唯讀 · 現在不轉</p>
+          </div>
+          <div class="p-4">
+            <SettleRoundTransferList
+              :transfers="s.deferred"
+              :currency="s.code"
+              :names="memberMap"
+              :pot-id="potId"
+              tone="deferred"
+            />
+            <p class="mt-3 text-xs leading-relaxed text-[var(--text-muted)]">
+              這幾筆沒有「標記已還款」可以按,結算也不會把它們寫進帳 ——
+              今晚 {{ potName }}的淨額就等於信封裡還剩的現金,照著轉等於現在就把{{ potName }}清空,
+              而那筆錢明天還要用。旅程結束到「總覽」用「投入 / 退還」把剩下的現金分回去。
+            </p>
+          </div>
         </div>
 
         <!-- 每人淨額 -->
@@ -456,6 +805,60 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             </p>
           </div>
         </div>
+
+        <!-- ── 本次要結算(明細 → 結果 → 結算)── -->
+        <SettleRoundPanel
+          v-if="s.preview"
+          :block="s.preview"
+          :names="memberMap"
+          :pot-id="potId"
+          :pot-name="potName"
+          :closing="closing && closeTarget?.currency === s.code"
+          :disabled="busy && closeTarget?.currency !== s.code"
+          @close="askClose(s.preview)"
+        />
+        <UiLoadingBlock
+          v-else-if="previewPending && !previewError"
+          :rows="2"
+          label="正在整理這次要結算的明細"
+        />
+        <p
+          v-else-if="previewError"
+          class="flex items-start gap-2 px-1 text-xs leading-relaxed"
+          style="color: var(--warn)"
+        >
+          <Icon name="lucide:triangle-alert" size="14" class="mt-px shrink-0" />
+          <span>
+            載不到「本次要結算」的明細({{ previewError }})。上面的淨額與轉帳建議還是正確的,
+            只是現在沒辦法結算這一輪。
+          </span>
+        </p>
+      </section>
+
+      <!--
+        preview 有、balance 沒有的幣別。兩邊都走同一份 ledger 所以理論上不會發生,
+        但寧可多畫一塊,也不要讓某個幣別的結算面板整個消失(那會掉錢)。
+      -->
+      <section
+        v-for="b in orphanBlocks"
+        :key="`orphan:${b.currency}`"
+        class="space-y-3"
+        :aria-label="`${b.currency}結算`"
+      >
+        <h3 class="text-lg font-semibold">
+          【{{ CURRENCY_LABEL[b.currency] ?? b.currency }}】<span
+            class="ml-1 text-xs font-normal text-[var(--text-muted)]"
+          >{{ b.currency }}</span>
+        </h3>
+        <SettleRoundPanel
+          :block="b"
+          :names="memberMap"
+          :pot-id="potId"
+          :pot-name="potName"
+          :closing="closing && closeTarget?.currency === b.currency"
+          :disabled="busy && closeTarget?.currency !== b.currency"
+          @close="askClose(b)"
+        />
       </section>
 
       <!-- ───────── 每人這趟總花費 ───────── -->
@@ -578,12 +981,95 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             金額一定對得上,筆數可能還有別的組法。
           </li>
           <li>每個幣別各自結算。跨幣別的換算只用在上面的「這趟花費」參考數字,不會混進轉帳金額。</li>
+          <li>
+            結算的<strong class="font-medium text-[var(--text)]">明細</strong>只列還沒列入任何結算的那幾筆,
+            但<strong class="font-medium text-[var(--text)]">金額</strong>一律是把整趟到現在的帳
+            (含{{ potName }})一起算出來的。只算未結的那一小段會重複要錢,所以刻意不那樣算。
+          </li>
+          <li>
+            結算過的支出會標記成「已列入第 N 次結算」,而不是「已結清」——
+            債務是由那一輪的轉帳整體清掉的,不是一筆一筆對消。
+          </li>
         </ul>
         <p class="attribution mt-3 pt-3 text-[0.6875rem] leading-relaxed text-[var(--text-muted)]">
           {{ balance.rate_attribution }}
         </p>
       </section>
     </template>
+
+    <!--
+      ───────── 結算歷史 ─────────
+      刻意放在 balance 的 v-if 之外:幾個月後回來查「這 1,850 是什麼」
+      不該被今天算不出淨額(網路 / 匯率)擋住。
+    -->
+    <section class="space-y-3" aria-label="結算歷史">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <h3 class="text-lg font-semibold">結算歷史</h3>
+        <p v-if="rounds.length" class="text-xs text-[var(--text-muted)]">
+          共 <span class="tnum font-medium text-[var(--text)]">{{ rounds.length }}</span> 次
+        </p>
+      </div>
+
+      <UiLoadingBlock v-if="roundsFirstLoad" :rows="2" label="正在載入結算歷史" />
+
+      <div
+        v-else-if="roundsError && !rounds.length"
+        class="card p-4 text-center"
+        style="border-color: color-mix(in oklab, var(--debit) 35%, var(--border))"
+      >
+        <p class="text-sm leading-relaxed" style="color: var(--debit)">{{ roundsError }}</p>
+        <UiAppButton
+          class="mt-3"
+          variant="ghost"
+          icon="lucide:rotate-cw"
+          :loading="refreshing"
+          @click="reload"
+        >
+          再試一次
+        </UiAppButton>
+      </div>
+
+      <div v-else-if="!rounds.length" class="card">
+        <UiEmptyState
+          dense
+          icon="lucide:history"
+          title="還沒有結算過"
+          description="每天晚上(或旅程結束)按一次「結算這一輪」,這裡就會留下那一次列入了哪些明細、誰給誰多少。之後有人問起就答得出來。"
+        />
+      </div>
+
+      <template v-else>
+        <p class="px-1 text-xs leading-relaxed text-[var(--text-muted)]">
+          點開任一次就看得到當時列入的明細、記下的轉帳與淨額快照 ——
+          幾個月後有人問「這筆錢是什麼」也答得出來。
+        </p>
+        <div class="space-y-2.5">
+          <SettleRoundHistoryCard
+            v-for="r in rounds"
+            :key="r.id"
+            :round="r"
+            :names="memberMap"
+            :pot-id="potId"
+            :expanded="openRoundId === r.id"
+            :detail="openRoundId === r.id ? roundDetail : null"
+            :loading="openRoundId === r.id && detailPending"
+            :error="openRoundId === r.id ? detailError : null"
+            :reverting="reverting && revertTarget?.id === r.id"
+            :disabled="busy"
+            @toggle="toggleRound(r.id)"
+            @revert="askRevert(r)"
+          />
+        </div>
+        <p
+          v-if="roundsError"
+          class="flex items-start gap-2 px-1 text-xs leading-relaxed"
+          style="color: var(--warn)"
+        >
+          <Icon name="lucide:triangle-alert" size="14" class="mt-px shrink-0" />
+          <span>重新載入歷史失敗({{ roundsError }})。上面是上一次拿到的清單。</span>
+        </p>
+      </template>
+    </section>
 
     <!-- ───────── 標記已還款的確認 ───────── -->
     <UiAppSheet
@@ -631,6 +1117,198 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
         </UiAppButton>
       </template>
     </UiAppSheet>
+
+    <!--
+      ───────── 結算這一輪的確認 ─────────
+      這是**單階段**的:按下去就等於宣告那些錢已經付了,沒有「之後再標記已付」。
+      所以這裡必須把它講到不可能誤解 —— 兩階段的設計會讓同一筆債
+      同時出現在回合裡和「標記已還款」旁邊,點兩次就在 1,500 的債上記下 3,000。
+    -->
+    <UiAppSheet
+      v-model:open="closeOpen"
+      size="lg"
+      :title="closeTarget ? `結算【${closeCurrencyLabel}】第 ${closeTarget.seq} 次?` : '結算這一輪?'"
+      :dismissible="!closing"
+      @close="closeError = null"
+    >
+      <div v-if="closeTarget">
+        <!--
+          最重要的一句話放最上面,不要藏在說明的第三行。
+          ⚠️ 沒有轉帳的時候必須換一套說法 —— 「宣告 0 筆轉帳已經付了」
+          既是廢話又會讓人以為自己漏看了什麼(實測踩到)。
+        -->
+        <p class="declare">
+          <Icon name="lucide:circle-alert" size="16" class="mt-px shrink-0" style="color: var(--warn)" />
+          <span v-if="closeRecorded.length">
+            按下確認等於宣告下面
+            <span class="tnum font-semibold">{{ closeRecorded.length }}</span> 筆轉帳
+            <strong class="font-semibold">已經付了</strong>。
+            這是一次完成的動作,<strong class="font-semibold">沒有「之後再標記已付」</strong>——
+            錢還沒給出去就先不要結算。
+            只有某幾個人先還了的話,回上一頁用那一筆的「標記已還款」比較準。
+          </span>
+          <span v-else>
+            這一輪<strong class="font-semibold">沒有任何轉帳要記</strong>——
+            算下來沒有人需要付錢給別人,所以按下確認<strong class="font-semibold">不會</strong>宣告任何人付了錢,
+            只是把下面那些明細標記成已列入這一輪。
+          </span>
+        </p>
+
+        <!-- 會被寫進帳的那些 -->
+        <section v-if="closeRecorded.length" class="mt-4">
+          <h4 class="sheet-title">會記下這些轉帳</h4>
+          <SettleRoundTransferList
+            :transfers="closeRecorded"
+            :currency="closeTarget.currency"
+            :names="memberMap"
+            :pot-id="potId"
+            tone="recorded"
+          />
+        </section>
+
+        <ul class="mt-4 space-y-2 text-sm leading-relaxed text-[var(--text-muted)]">
+          <li class="flex items-start gap-2">
+            <Icon name="lucide:stamp" size="15" class="mt-0.5 shrink-0" />
+            <span>
+              <span class="tnum">{{ closeTarget.item_count }}</span> 筆明細會被標記成
+              「已列入第 <span class="tnum">{{ closeTarget.seq }}</span> 次結算」。
+              下次結算就從還沒標記的那些開始 —— 那是<strong class="font-medium text-[var(--text)]">顯示用的標記</strong>,
+              不是「這一筆已結清」。
+            </span>
+          </li>
+          <li v-if="closeRecorded.length" class="flex items-start gap-2">
+            <Icon name="lucide:coins" size="15" class="mt-0.5 shrink-0" />
+            <span>
+              轉帳合計
+              <span class="tnum font-medium text-[var(--text)]">
+                {{ formatMoney(closeRecordedTotal, closeTarget.currency) }}
+              </span>。
+              金額是把整趟到現在的帳一起抵銷後的結果,不是上面那幾筆明細的加總。
+            </span>
+          </li>
+          <li v-if="closeDeferred.length" class="flex items-start gap-2">
+            <Icon name="lucide:piggy-bank" size="15" class="mt-0.5 shrink-0" />
+            <span>
+              {{ potName }}的 <span class="tnum">{{ closeDeferred.length }}</span> 筆
+              <strong class="font-medium text-[var(--text)]">不會</strong>被寫入 ——
+              旅程結束到「總覽」用「退還」處理。
+            </span>
+          </li>
+          <li class="flex items-start gap-2">
+            <Icon name="lucide:undo-2" size="15" class="mt-0.5 shrink-0" />
+            <span>按錯了可以在「結算歷史」撤銷,轉帳會刪掉、明細會回到還沒結算。</span>
+          </li>
+        </ul>
+
+        <div class="mt-4">
+          <UiAppField
+            v-model="closeLabel"
+            label="這次結算的標記(選填)"
+            placeholder="例:第一晚對帳"
+            hint="會顯示在結算歷史上,之後比較好認是哪一次。"
+            :disabled="closing"
+          />
+        </div>
+
+        <p
+          v-if="closeError"
+          class="mt-3.5 flex items-start gap-2 text-sm leading-relaxed"
+          style="color: var(--debit)"
+        >
+          <Icon name="lucide:triangle-alert" size="15" class="mt-0.5 shrink-0" />
+          <span>{{ closeError }}</span>
+        </p>
+      </div>
+
+      <template #footer>
+        <UiAppButton variant="ghost" block :disabled="closing" @click="closeOpen = false">
+          取消
+        </UiAppButton>
+        <UiAppButton block icon="lucide:stamp" :loading="closing" @click="confirmClose">
+          確認已付款並結算
+        </UiAppButton>
+      </template>
+    </UiAppSheet>
+
+    <!-- ───────── 撤銷結算的確認 ───────── -->
+    <UiAppSheet
+      v-model:open="revertOpen"
+      size="sm"
+      :title="revertTarget ? `撤銷第 ${revertTarget.seq} 次結算?` : '撤銷這次結算?'"
+      :dismissible="!reverting"
+      @close="revertError = null"
+    >
+      <div v-if="revertTarget">
+        <div class="rounded-xl px-3.5 py-3" style="background: var(--bg-sunken)">
+          <p class="text-sm font-medium">
+            【{{ CURRENCY_LABEL[revertTarget.currency] ?? revertTarget.currency }}】第
+            <span class="tnum">{{ revertTarget.seq }}</span> 次結算
+          </p>
+          <p class="mt-1 text-xs text-[var(--text-muted)]">
+            <span class="tnum">{{ revertTarget.item_count }}</span> 筆明細
+            · <span class="tnum">{{ revertTarget.transfer_count }}</span> 筆轉帳<template
+              v-if="revertTarget.transfer_count"
+            > · 合計
+              <span class="tnum">
+                {{ formatMoney(revertTarget.transfer_total_minor, revertTarget.currency) }}
+              </span>
+            </template>
+          </p>
+        </div>
+
+        <ul class="mt-3.5 space-y-2 text-sm leading-relaxed text-[var(--text-muted)]">
+          <li class="flex items-start gap-2">
+            <Icon name="lucide:trash-2" size="15" class="mt-0.5 shrink-0" />
+            <!-- 沒有轉帳的回合(只蓋章)不要寫「0 筆會被刪除」,那句話沒有意義 -->
+            <span v-if="revertTarget.transfer_count">
+              這一輪記下的 <span class="tnum">{{ revertTarget.transfer_count }}</span> 筆轉帳會被
+              <strong class="font-medium text-[var(--text)]">刪除</strong>,結算金額立刻重算。
+            </span>
+            <span v-else>
+              這一輪沒有記下任何轉帳(當時算下來沒有人要付錢),所以沒有款項會被刪除。
+            </span>
+          </li>
+          <li class="flex items-start gap-2">
+            <Icon name="lucide:rotate-ccw" size="15" class="mt-0.5 shrink-0" />
+            <span>
+              <span class="tnum">{{ revertTarget.item_count }}</span> 筆明細會回到
+              <strong class="font-medium text-[var(--text)]">還沒結算</strong>,
+              下次結算又會出現在「本次要結算」裡。
+            </span>
+          </li>
+          <li class="flex items-start gap-2">
+            <Icon name="lucide:shield-check" size="15" class="mt-0.5 shrink-0" />
+            <span>
+              你自己按「標記已還款」記的還款、以及投入 / 退還{{ potName }}的紀錄
+              <strong class="font-medium text-[var(--text)]">不會</strong>被動到 ——
+              那些是真的發生過的付款。
+            </span>
+          </li>
+        </ul>
+
+        <p class="mt-3.5 text-xs leading-relaxed text-[var(--text-muted)]">
+          這一列會留在歷史裡並標成「已撤銷」,帳上看得出這裡曾經結算過又撤銷。
+        </p>
+
+        <p
+          v-if="revertError"
+          class="mt-3.5 flex items-start gap-2 text-sm leading-relaxed"
+          style="color: var(--debit)"
+        >
+          <Icon name="lucide:triangle-alert" size="15" class="mt-0.5 shrink-0" />
+          <span>{{ revertError }}</span>
+        </p>
+      </div>
+
+      <template #footer>
+        <UiAppButton variant="ghost" block :disabled="reverting" @click="revertOpen = false">
+          取消
+        </UiAppButton>
+        <UiAppButton block icon="lucide:undo-2" :loading="reverting" @click="confirmRevert">
+          撤銷這次結算
+        </UiAppButton>
+      </template>
+    </UiAppSheet>
   </div>
 </template>
 
@@ -651,6 +1329,29 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
 .attribution,
 .hairline {
   border-top: 1px solid var(--border);
+}
+
+/* 結算確認面板最上面那句宣告。用警示框而不是灰字 ——
+   「按下去等於錢已經付了」是這個動作唯一不可逆的部分,不能長得像註腳。 */
+.declare {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.7;
+  background: color-mix(in oklab, var(--warn) 12%, transparent);
+  border: 1px solid color-mix(in oklab, var(--warn) 34%, var(--border));
+  color: var(--text);
+}
+
+.sheet-title {
+  margin-bottom: 0.5rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
 }
 
 .settled-badge,

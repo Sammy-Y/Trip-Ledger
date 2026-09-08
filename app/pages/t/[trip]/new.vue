@@ -2,7 +2,7 @@
 /** 記一筆支出。表單本體在 ExpenseForm,這頁只負責取資料與送出。 */
 const route = useRoute();
 const tripId = computed(() => String(route.params.trip ?? ''));
-const { trip, members, pending, refresh } = useTrip(tripId);
+const { trip, members, fxDefaults, pending } = useTrip(tripId);
 const api = useApi();
 
 const submitting = ref(false);
@@ -55,6 +55,7 @@ async function onSubmit(payload: Record<string, unknown>) {
       v-else
       :members="members"
       :base-currency="trip?.base_currency ?? 'TWD'"
+      :fx-defaults="fxDefaults"
       :submitting="submitting"
       :error-message="errorMessage"
       @submit="onSubmit" />
