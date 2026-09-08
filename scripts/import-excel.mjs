@@ -349,8 +349,12 @@ console.log(`支出: ${ok} 成功 / ${fail} 失敗`
 // 會以為匯入壞了,而那正是最該讓他一眼看懂的事。
 if (skipped) {
   console.log(`ℹ 這批只匯了窗口 ${WINDOW_LABEL} 的部分,還有 ${skipped} 筆要用另一批匯:`);
+  // --from 要指到「這次窗口結束的隔天」,不然那天會被匯第二次。
+  const nextDay = UNTIL
+    ? new Date(Date.parse(`${UNTIL}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10)
+    : null;
   console.log(`    node scripts/import-excel.mjs --trip=${trip.id}`
-    + (UNTIL ? ` --from=${UNTIL}` : '') + (UNTIL ? '   # 記得把 --from 調成下一天' : ''));
+    + (nextDay ? ` --from=${nextDay}` : ''));
 }
 // 這個數字要一直印出來:它是原 Excel 算不出「誰欠誰」的原因,
 // 也是解釋「為什麼公費付了這麼多筆」的唯一線索。
