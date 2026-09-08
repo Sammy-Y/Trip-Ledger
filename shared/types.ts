@@ -39,10 +39,9 @@ export interface Transfer { from: string; to: string; amountMinor: number; }
  * remainingMinor = 投入 − 公費付掉的 − 已退還。
  * 這個數字就是「公費現在還剩多少現金」。
  *
- * ⚠️ 它**不再**等於公費成員淨額的相反數。淨額已經不含投入 / 退還
- * (見 server/utils/ledger.ts 開頭),所以現在成立的是
- * 「公費淨額 === spentMinor」—— 剩餘只能從這裡的三個欄位算,
- * 不能從淨額推回去。
+ * ⚠️ 它等於公費成員淨額的相反數:`公費淨額 === −remainingMinor`。
+ * 淨額含投入 / 退還(見 server/utils/ledger.ts 開頭),兩條路徑必須給出
+ * 同一個數字 —— 這是這套語意的正確性支點,不是巧合。
  */
 export interface PotCurrency {
   currency: string;
@@ -126,7 +125,7 @@ export interface RoundPreviewBlock {
   seq: number;
   items: Expense[];
   item_count: number;
-  /** 整趟淨額(含公費),加起來必為 0 */
+  /** 整趟淨額(含公費,公費那一列 = −公費剩餘),加起來必為 0 */
   nets: Net[];
   /** 兩端都不是公費 —— 結算會真的寫下來的 */
   recorded: Transfer[];

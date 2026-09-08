@@ -83,7 +83,17 @@ export default defineEventHandler(async (event) => {
       + `與支出金額 ${formatMoney(amountMinor, b.currency)} 不符` });
   }
 
-  const payerSum = b.payers.length === 1 && b.payers[0].amount == null
+  /**
+   * 「只有一位付款人、而且沒帶金額」= 慣例上的全額付款(見 PayerEditor 的說明)。
+   *
+   * 抽成一個具名的值而不是在三個地方各寫一次 `b.payers.length === 1 && b.payers[0]!.amount == null`
+   * —— 那三處(驗證合計、決定要 INSERT 哪一種、拿 member_id)必須永遠一致,
+   * 分開寫就會有一天只改到其中兩處。順帶也讓 noUncheckedIndexedAccess 不必靠 ! 過關。
+   */
+  const soloPayer = b.payers.length === 1 ? b.payers[0]! : null;
+  const payerIsFullAmount = !!soloPayer && soloPayer.amount == null;
+
+  const payerSum = payerIsFullAmount
     ? amountMinor
     : b.payers.reduce((s, p) => s + toMinor(p.amount ?? 0, b.currency), 0);
   if (payerSum !== amountMinor) {
@@ -156,9 +166,9 @@ export default defineEventHandler(async (event) => {
       method, fx?.rate ?? null, fx?.date ?? null, fx?.source ?? null,
       b.fx_rate_override ?? null, markup, b.spent_at, b.note ?? null,
     ),
-    ...(b.payers.length === 1 && b.payers[0].amount == null
+    ...(payerIsFullAmount
       ? [dbh.prepare(`INSERT INTO expense_payers (expense_id, member_id, amount_minor) VALUES (?,?,?)`)
-          .bind(id, b.payers[0].member_id, amountMinor)]
+          .bind(id, soloPayer!.member_id, amountMinor)]
       : b.payers.map((p) =>
           dbh.prepare(`INSERT INTO expense_payers (expense_id, member_id, amount_minor) VALUES (?,?,?)`)
             .bind(id, p.member_id, toMinor(p.amount ?? 0, b.currency)))),

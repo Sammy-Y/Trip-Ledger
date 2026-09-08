@@ -59,25 +59,30 @@ export function minCashFlow(nets: Net[]): Transfer[] {
   for (let guard = 0; guard < maxIterations && pool.length > 1; guard++) {
     let maxCreditor = 0, maxDebtor = 0;
     for (let i = 1; i < pool.length; i++) {
-      if (pool[i].netMinor > pool[maxCreditor].netMinor) maxCreditor = i;
-      if (pool[i].netMinor < pool[maxDebtor].netMinor) maxDebtor = i;
+      if (pool[i]!.netMinor > pool[maxCreditor]!.netMinor) maxCreditor = i;
+      if (pool[i]!.netMinor < pool[maxDebtor]!.netMinor) maxDebtor = i;
     }
-    const credit = pool[maxCreditor].netMinor;
-    const debt = pool[maxDebtor].netMinor;
+    // 兩個索引都在 [0, pool.length) 裡(迴圈條件保證),所以 ! 是安全的。
+    // 取成具名的區域變數而不是每次都 pool[...]! —— 下面要改它們的 netMinor,
+    // 而「改的是陣列裡的那個物件」這件事寫成 creditor.netMinor -= amount 才看得出來。
+    const creditor = pool[maxCreditor]!;
+    const debtor = pool[maxDebtor]!;
+    const credit = creditor.netMinor;
+    const debt = debtor.netMinor;
     if (credit <= 0 || debt >= 0) break;   // 已全部歸零
 
     const amount = Math.min(credit, -debt);
     transfers.push({
-      from: pool[maxDebtor].memberId,
-      to: pool[maxCreditor].memberId,
+      from: debtor.memberId,
+      to: creditor.memberId,
       amountMinor: amount,
     });
-    pool[maxCreditor].netMinor -= amount;
-    pool[maxDebtor].netMinor += amount;
+    creditor.netMinor -= amount;
+    debtor.netMinor += amount;
 
     // 移除已歸零的人(從後往前刪,避免索引位移)。
     for (const i of [maxCreditor, maxDebtor].sort((a, b) => b - a)) {
-      if (pool[i].netMinor === 0) pool.splice(i, 1);
+      if (pool[i]!.netMinor === 0) pool.splice(i, 1);
     }
   }
   return transfers;

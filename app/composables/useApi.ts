@@ -191,6 +191,14 @@ export function useApi(): ApiClient {
     opts: { query?: ApiQuery; body?: unknown } = {},
   ): Promise<T> {
     try {
+      /*
+        `as T` 是必要的,不是偷懶。$fetch<T> 宣告的回傳是
+        `TypedInternalResponse<NitroFetchRequest, T, method>` —— 那個型別會去查
+        Nitro 自動產生的路由型別表,對表上有的路徑回實際型別、對不上才退回 T。
+        我們這裡的 url 是執行期才組出來的字串(`/api/trips/${id}/expenses`),
+        查不到表,所以 TS 只能說「它可能是任何東西,不保證是 T」。
+        呼叫端已經在每一處明講了 T(例如 api.get<Expense[]>(...)),那就是這一層的契約。
+      */
       return await $fetch<T>(url, {
         method,
         query: cleanQuery(opts.query),
@@ -198,7 +206,7 @@ export function useApi(): ApiClient {
         // 預設不重試。記帳是寫入操作,重試會變成重複記一筆。
         retry: 0,
         timeout: 15_000,
-      });
+      }) as T;
     }
     catch (e) {
       // 被取消的請求原封不動丟回去 —— useAsyncData 靠 DOMException 判斷「這是取消不是失敗」,

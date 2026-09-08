@@ -56,12 +56,12 @@ export default defineEventHandler(async (event) => {
       item_count: mine.length,
       /**
        * 整趟淨額(含公費),加起來必為 0。
-       * 不含投入公費 / 公費退還 —— 公費那一列的值 = 公費花掉的錢(見 utils/ledger.ts)。
+       * 含投入公費 / 公費退還 —— 公費那一列的值 = −公費剩餘(見 utils/ledger.ts)。
        */
       nets: block?.nets ?? [],
       /** 真的要記下來的轉帳:兩端都不是公費 */
       recorded: block?.recorded ?? [],
-      /** 公費的腿:「還要投入多少」的唯讀顯示。投入/退還都在總覽頁做,不在這裡轉 */
+      /** 公費的腿:「結束時退還 / 還要補多少」的唯讀顯示。投入 / 退還都在總覽頁做 */
       deferred: block?.deferred ?? [],
       /** 帳目不平衡時不准結算 —— 寧可擋住也不要寫錯的金額 */
       blocked_reason: zeroSumProblem

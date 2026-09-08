@@ -97,7 +97,8 @@ export function previewShares(input: {
 /** 按份數/比例分攤(shares 可以是份數 2:1:1,也可以是百分比 50/25/25)。 */
 export function splitByShares(amountMinor: number, shares: Record<string, number>): Map<string, number> {
   const ids = Object.keys(shares).sort();
-  const total = ids.reduce((s, id) => s + shares[id], 0);
+  // ids 來自 Object.keys(shares),所以每個 key 一定查得到 —— ! 是安全的。
+  const total = ids.reduce((s, id) => s + shares[id]!, 0);
   const out = new Map<string, number>();
   if (total <= 0) return out;
 
@@ -105,7 +106,7 @@ export function splitByShares(amountMinor: number, shares: Record<string, number
   const abs = Math.abs(amountMinor);
 
   // 先取整數部分,再把餘數依小數部分由大到小補給前幾位(最大餘數法)。
-  const exact = ids.map((id) => ({ id, v: (abs * shares[id]) / total }));
+  const exact = ids.map((id) => ({ id, v: (abs * shares[id]!) / total }));
   const floored = exact.map((e) => ({ ...e, f: Math.floor(e.v), frac: e.v - Math.floor(e.v) }));
   let remainder = abs - floored.reduce((s, e) => s + e.f, 0);
 

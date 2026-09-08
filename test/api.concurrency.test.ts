@@ -356,15 +356,15 @@ group('[競態] 公費投入:併發不能少記或多記');
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[不變量] 公費淨額 = 公費花費,在併發之後仍然成立');
+group('[不變量] 公費淨額 = −公費剩餘,在併發之後仍然成立');
 
-// 這條是整個公費功能的正確性支點。稽核找到唯一能讓它失效的路徑是
+// 這條是整個公費功能的正確性支點,而且是**兩條獨立路徑算同一個數字**:
+// 一邊 pot.by_currency 的三個 SUM 相減,一邊 netBalances 的一堆加減
+// (見 server/utils/ledger.ts 開頭)。稽核找到唯一能讓它失效的路徑是
 // 「把已經有帳的成員改標成公費」,那個現在被 409 擋住了。
 //
-// ⚠️ 舊版這裡驗的是「剩餘 = −公費淨額」。淨額改成不含投入/退還之後那條不再成立
-// (見 server/utils/ledger.ts 開頭)—— 剩餘只住在 pot.by_currency,
-// 而淨額換成和 spentMinor 對帳。兩者仍然是兩條獨立路徑算同一個數字:
-// spentMinor 直接加總 expense_payers,淨額走 netBalances 的加減。
+// 併發是這裡的重點:退還與結算同時發生時,兩條路徑會在不同的時間點讀資料庫。
+// 不管誰贏,回來的那一份快照裡兩邊都必須對得上。
 {
   const { T, id, potId } = await newTrip(true);
   await post(`/api/trips/${T}/pot/moves`, {
@@ -387,21 +387,21 @@ group('[不變量] 公費淨額 = 公費花費,在併發之後仍然成立');
   const row = (bal.pot?.by_currency ?? []).find((c: J) => c.currency === 'TWD');
   const nets = (bal.by_currency?.TWD?.nets ?? []) as J[];
   const potNet = nets.find((n) => n.memberId === potId)?.netMinor ?? 0;
-  eq('公費淨額 = 公費花費', potNet, row?.spentMinor);
-  eq('Σ(真人淨額) = −公費花費',
+  eq('公費淨額 = −剩餘', potNet, -(row?.remainingMinor ?? 0));
+  eq('Σ(真人淨額) = 剩餘',
     nets.filter((n) => n.memberId !== potId).reduce((s, n) => s + n.netMinor, 0),
-    -(row?.spentMinor ?? 0));
+    row?.remainingMinor);
   eq('淨額總和仍為 0', nets.reduce((s, n) => s + n.netMinor, 0), 0);
   // 投入 1,600,000 − 花掉 600,000 − 退還(成功的話 200,000)。退還可能被回合擠掉,
   // 所以只斷言「剩餘完全由 pot 的三個量決定」,不去猜那一次併發誰贏。
-  eq('剩餘 = 投入 − 花費 − 退還(和淨額無關)',
+  eq('剩餘 = 投入 − 花費 − 退還',
     row?.remainingMinor,
     (row?.contributedMinor ?? 0) - (row?.spentMinor ?? 0) - (row?.refundedMinor ?? 0));
 }
 
 group('[防護] 個人花費的付款人不能事後被改成公費');
 
-// 這條路徑會讓「公費淨額 = 公費花費」差掉那筆個人花費的金額,
+// 這條路徑會讓「公費淨額 = −剩餘」差掉那筆個人花費的金額,
 // 而那筆錢會卡在沒有任何畫面能解決的地方(實測 5,000 卡住):
 // 剩餘說公費花掉了,卻沒有任何人的淨額欠著它。
 {

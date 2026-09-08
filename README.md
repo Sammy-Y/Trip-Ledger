@@ -44,7 +44,7 @@ Nuxt 4 · TypeScript · Cloudflare Workers · D1
   但**金額一律用整趟重算**,不是只算未結的那幾筆 —— 理由見下方,那是這個功能的核心
 - **公費(common pot)** — 大家先各拿一筆錢出來,吃飯直接從公費付。結算時算出公費該退誰多少
 - **公費投入是勾選式的** — 「今天大家各拿 5,000 出來」勾人、金額填一次,一次原子寫入
-- **三種分攤方式** — 均分 / 按份數 / 指定金額,只列實際參與的人
+- **兩種分攤方式** — 均分 / 指定金額,只列實際參與的人
 - **總覽頁** — 一頁看完:公費剩多少、逐幣別總花費、每人合計與淨額
 - **匯率在記帳當下 snapshot** — 取「消費當日」而非「查詢當下」,每筆可手動覆寫。
   當時抓不到匯率的支出,之後每次同步都會回頭補寫(否則那筆的換算金額會**每天漂移**)
@@ -124,7 +124,7 @@ app/
     login.vue                 ★ 登入 / 註冊（一頁兩用）
     t/[trip]/overview.vue     ★ 總覽：公費剩餘 / 總花費 / 每人合計 / 投入・退還
     t/[trip]/index.vue        支出列表（可收合、可篩選、可依金額排序）
-    t/[trip]/new.vue          記一筆
+    t/[trip]/new.vue          記一筆（送出後留在本頁,清掉金額與說明、保留幣別/付款人/分攤,可以連續記）
     t/[trip]/settle.vue       ★ 誰欠誰多少 + 結算回合（預覽 / 關閉 / 歷史 / 撤銷）
     t/[trip]/plan.vue         預約 + 訂位
     t/[trip]/members.vue      成員（可改名 / 刪除）+ 公費 + 分享連結
@@ -842,18 +842,20 @@ pnpm test:edit      # 只跑編輯支出那一支（需要 dev server）        
 | `settle.test.ts` | 17 | 結算引擎:拆分守恆、淨額歸零、環狀債務壓縮 |
 | `money.test.ts` | 28 | 金額轉換、四捨五入、幣別符號唯一性 |
 | `split-preview.test.ts` | 34 | 表單的分攤試算 —— **個人花費送出鈕被鎖死那個 bug 的回歸測試** |
-| `ledger.test.ts` | 66 | **結算的數學**:子集算術會重複要錢的反例、`minCashFlow` 的單邊性、公費殘額同號、`Σ 殘額 = −net(公費)`、`assertZeroSum` |
+| `expense-form-reset.test.ts` | 14 | **連續記帳的欄位契約**:掃 `ExpenseForm` 的原始碼,要求每個表單 ref 要嘛被 `startNextEntry()` 清掉、要嘛在 STICKY 名單裡 —— 加了新欄位卻忘了決定就會紅 |
+| `ledger.test.ts` | 100 | **結算的數學**:子集算術會重複要錢的反例、`minCashFlow` 的單邊性、公費殘額同號、`Σ 殘額 = −net(公費) = 公費剩餘`、`assertZeroSum` |
 | `sql-safety.test.ts` | 2 | **掃描原始碼**,把 SQL 插值 / 串接 / 動態子句本身當失敗 |
 | `schema-types.test.ts` | 15 | `schema.sql` ↔ `shared/types.ts` 欄位一致 |
 | `cron-config.test.ts` | 8 | `nuxt.config.ts` ↔ `wrangler.jsonc` 的 cron 同步 |
 | `vue-compile.test.mjs` | 28 | 所有 SFC 實際編譯 |
 | `settle.fuzz.ts` | 20000 | 隨機案例:全部歸零、不漏帳、轉帳 ≤ n−1 筆 |
 | `api.test.ts` | 56 | 真實 HTTP + 真實 D1:驗證、結算、還款、刪除 |
-| `api.features.test.ts` | 89 | 公費收支與不變量、成員改名/刪除防護、刷卡手續費、訂位兩個時間 |
-| `api.concurrency.test.ts` | 25 | **併發競態**:`Promise.all` 打同一組端點 —— 結算 + 標記已還款的 3ms 空窗、兩支手機同時退還公費 |
-| `api.access.test.ts` | 51 | **存取控制**:旅程之間互不可見、id 不是憑證、editor 拿不到 share_token、只有 owner 能刪、認領無主旅程、登出後看不到東西 |
-| `api.rounds.test.ts` | 306 | **結算回合的 15 組情境**:公費不會被清空、公費墊款後不再重複收、吸收手動還款不吐反向轉帳、連續兩回合不互相反轉、撤銷是精確反運算且不刪手動還款、舊畫面指紋防護、蓋章的支出不准刪、幣別互相隔離、`pot/moves` 的原子性 |
-| `api.edit.test.ts` | 187 | **編輯支出的 12 組情境**:改文字不動到第二個欄位、`created_at` 不變、改金額三邊(payers / shares / balance)一起對、換幣別與換日期都重新 snapshot 匯率、換分攤模式沒有殘留列、**驗證失敗時整筆快照一格都沒動**、別趟的 id → 404、蓋章 → 409 撤銷後 → 200、`fx_rate_override` 沒送就是清掉 |
+| `api.features.test.ts` | 93 | 公費收支與不變量(`公費淨額 = −剩餘`)、成員改名/刪除防護、刷卡手續費、訂位兩個時間 |
+| `api.concurrency.test.ts` | 38 | **併發競態**:`Promise.all` 打同一組端點 —— 結算 + 標記已還款的 3ms 空窗、兩支手機同時退還公費 |
+| `api.access.test.ts` | 58 | **存取控制**:旅程之間互不可見、id 不是憑證、editor 拿不到 share_token、只有 owner 能刪、認領無主旅程、登出後看不到東西 |
+| `api.rounds.test.ts` | 413 | **結算回合的 17 組情境**:公費不會被清空、出資不均的債留在人跟人之間、吸收手動還款不吐反向轉帳、連續兩回合不互相反轉、撤銷是精確反運算且不刪手動還款、舊畫面指紋防護、蓋章的支出不准刪、幣別互相隔離、還款上限兩側都看 |
+| `api.pot.test.ts` | 251 | **公費金流逐筆改 / 刪的 10 組情境**:剩餘不可為負、被擋下來時資料庫一個字都沒動、**擋人的是 SQL 前提不是 JS 那個 if**(併發才驗得出來)、超支之後修正帳的編輯不可以被鎖死、退還走 `/settlements` 也要有資料庫層上限 |
+| `api.edit.test.ts` | 231 | **編輯支出的 12 組情境**:改文字不動到第二個欄位、`created_at` 不變、改金額三邊(payers / shares / balance)一起對、換幣別與換日期都重新 snapshot 匯率、換分攤模式沒有殘留列、**驗證失敗時整筆快照一格都沒動**、別趟的 id → 404、蓋章 → 409 撤銷後 → 200、`fx_rate_override` 沒送就是清掉 |
 
 `ledger.test.ts` 是純函式測試(不需要 dev server),`api.rounds.test.ts` 打真實 HTTP。
 兩層是刻意的:數學性質在單元層用隨機案例壓,而「錢真的有沒有寫進資料庫」
@@ -936,6 +938,22 @@ pnpm test:edit      # 只跑編輯支出那一支（需要 dev server）        
 > 對這個專案來說遠遠用不到(每 5 分鐘的排程一天 288 次查詢,
 > 免費額度是每天 5M 列讀取),但值得知道。
 
+> [!IMPORTANT]
+> **`typescript` 被刻意釘在 `~5.9.3`,不要升到 7.x。**
+>
+> 這個專案沒有直接用到 typescript,它是被 vue 的 peer dependency 拉進來的 ——
+> 所以 pnpm 一度解到當時的 latest(7.0.2)。而 TypeScript 7 移掉了
+> `./lib/tsc` 這個 export,`vue-tsc` 3.3.11(目前最新)還在 require 它,
+> 於是 `pnpm typecheck` **在讀到任何專案檔案之前就先炸了**:
+> `ERR_PACKAGE_PATH_NOT_EXPORTED`。
+>
+> 那不是一個小麻煩 —— typecheck 跑不起來的期間累積了 14 個真實的型別錯誤
+> 都沒有露出來,其中一個是 `SplitEditor.vue` 用
+> `export type { SplitDraft } from '...'` 轉出型別:那種寫法**不會建立本地繫結**,
+> 所以同一個檔案裡的 `defineModel<SplitDraft>()` 找不到名字,整個 model 退化成 `any`。
+> 把它釘回 5.x 之後 `pnpm typecheck` 是 0 錯誤,請保持這樣。
+> vue-tsc 支援 TS 7 之後才可以解除。
+
 ### 步驟(Cloudflare)
 
 ```bash
@@ -950,7 +968,9 @@ pnpm db:migrate:remote                 # 補上增量變更（is_pot / booked_fo
 
 ```bash
 npx wrangler secret put NUXT_TASK_SECRET
-npx wrangler secret put NUXT_PUBLIC_ORIGIN      # https://trip-ledger.com（wrangler.jsonc routes 綁的自訂網域）
+npx wrangler secret put NUXT_PUBLIC_ORIGIN      # https://trip-ledger.<你的子網域>.workers.dev
+                                                #   （第一次 deploy 完 wrangler 會印出這個位址。
+                                                #     日後綁自訂網域的話這裡要跟著改，見 wrangler.jsonc 註解）
 npx wrangler secret put NUXT_VAPID_PRIVATE_JWK  # 推播用，不做推播可跳過
 npx wrangler secret put NUXT_VAPID_PUBLIC_KEY
 npx wrangler secret put NUXT_VAPID_SUBJECT      # mailto:you@example.com
@@ -1192,10 +1212,6 @@ CRUD 與 2–10 人結算是微秒級,沒問題。**不要在 Worker 裡跑 OCR*
 - [ ] **行程表** — 原 Excel 的「行程」「景點美食」「必買必逛」「行李清單」四張表**還沒有對應功能**,
       資料庫也沒有能放的表(見下方 Project Status)
 - [ ] 實際部署到 Cloudflare
-- [ ] `pnpm typecheck` 修復 —— **目前是壞的,而且不是專案的錯**:
-      TypeScript 7.0.2 移掉了 `./lib/tsc` 這個 export,而 vue-tsc 3.3.11 還在 require 它,
-      所以它在讀到任何專案檔案之前就先炸了。要嘛把 typescript 釘回 5.x,要嘛等 vue-tsc 更新。
-      (`pnpm test` 的 `vue-compile` 有實際編譯所有 SFC,所以不是完全沒有把關。)
 - [ ] 手機斷點驗證 —— 底部 tab bar 現在有 **6 個**,320px 機身要親眼確認
 - [ ] 預約的刪除(目前只能標成已取消)
 
@@ -1243,7 +1259,9 @@ CRUD 與 2–10 人結算是微秒級,沒問題。**不要在 Worker 裡跑 OCR*
 
 **未驗證**
 
-- **沒有實際部署過**。`wrangler.jsonc` 的 `database_id` 仍是 placeholder
+- **沒有實際部署過**。不過 `wrangler.jsonc` 的 `database_id` 已經是真的了
+  (`85bfee59-…`),**不要再跑一次 `wrangler d1 create trip-ledger`** ——
+  同名兩筆會讓 `d1 execute` 抓錯那一筆,理由見 wrangler.jsonc 的註解
 - **`pnpm build` 沒有在這一輪重跑** —— 上次成功的數字(286 kB / 98.2 kB gzip)
   是加結算回合 UI 之前的。`vue-compile` 有實際編譯全部 28 個 SFC,
   所以編譯錯誤擋住了,但 bundle 大小是舊數字
@@ -1255,7 +1273,6 @@ CRUD 與 2–10 人結算是微秒級,沒問題。**不要在 Worker 裡跑 OCR*
 - **結算回合的 UI 尤其需要親眼看** —— 那頁現在要同時顯示兩種範圍的數字
   (明細是未結的那幾筆、金額是整趟重算),文案有沒有把這件事講清楚
   只有真的看過才知道。看不懂的話使用者會自己去加總、發現對不起來,然後不敢信任這個 App
-- `pnpm typecheck` 是壞的(見 Roadmap,原因在工具鏈不在專案)
 - Web Push 沒對真實 iOS 裝置測過
 - **手機斷點沒驗證** —— 底部 tab bar 現在有 6 個,請把視窗拉到 320–400px 確認沒有擠爆
 

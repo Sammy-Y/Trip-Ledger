@@ -2,10 +2,17 @@
 /**
  * 總覽 —— 一頁看完這趟的全貌。
  *
- * 三塊,由上而下就是「我最想知道什麼」的順序:
- *  1. 公費還剩多少、誰出了多少（沒設公費就不顯示這塊）
+ * 由上而下就是「我最想知道什麼」的順序:
+ *  0. 首屏那張「目前」—— 每個幣別花了多少、公費還剩多少
+ *  1. 公費的細節:誰出了多少、逐筆金流、投入 / 退還（沒設公費就不顯示這塊）
  *  2. 這趟總共花了多少（逐幣別 + 換算本位幣的估算）
  *  3. 每人合計與淨額（誰墊得多、誰還要付）
+ *
+ * 第 0 塊是刻意的重複。這兩個數字原本一個在公費卡的最上面、一個在
+ * 「這趟總花費」裡 —— 而公費卡把投入 / 已支出 / 已退還、誰投入的、
+ * 金流紀錄、兩顆按鈕全都攤開,總花費因此被推到第一屏之外,
+ * 「現在花多少了」變成一個要先捲動才能回答的問題。
+ * 摘要在上、細節在下,細節照舊完整,不是把它們搬走。
  *
  * 逐幣別分開這件事在這頁同樣不能妥協:日幣和台幣不相加。
  * 只有「換算本位幣」那一欄是估算的參考值,而且必須標明。
@@ -78,16 +85,50 @@ const totals = computed<CurrencyTotal[]>(() => {
   };
   add(sharedTrack.data.value ?? [], 'sharedMinor');
   add(personalTrack.data.value ?? [], 'personalMinor');
-  // 本位幣優先,其餘按代碼 —— 不用金額排,跨幣別比大小沒有意義
-  return [...map.values()].sort((a, b) => {
-    if (a.currency === b.currency) return 0;
-    if (a.currency === baseCurrency.value) return -1;
-    if (b.currency === baseCurrency.value) return 1;
-    return a.currency.localeCompare(b.currency);
-  });
+  return [...map.values()].sort((a, b) => byBaseFirst(a.currency, b.currency));
 });
 
+/** 本位幣優先,其餘按代碼 —— 不用金額排,跨幣別比大小沒有意義 */
+function byBaseFirst(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a === baseCurrency.value) return -1;
+  if (b === baseCurrency.value) return 1;
+  return a.localeCompare(b);
+}
+
 const hasExpenses = computed(() => totals.value.length > 0);
+
+// ── 首屏摘要 ────────────────────────────────────────────────
+/**
+ * 「這個幣別花了多少 / 公費還剩多少」—— 一個幣別一列。
+ *
+ * 幣別取聯集,兩邊都要留:
+ *   只有花費沒有公費   → 這趟根本沒用公費付這個幣別,剩餘欄留白(不是 0,是「沒這回事」)
+ *   只有公費沒有花費   → 錢投進去了還沒開始花,那一列在總花費表裡完全不存在,
+ *                        少了它,首屏就會漏掉一筆真的躺在信封裡的現金
+ */
+interface Glance {
+  currency: string;
+  spentMinor: number;
+  /** null = 這個幣別沒有公費金流,不是剩 0 */
+  potRemainingMinor: number | null;
+}
+
+const glance = computed<Glance[]>(() => {
+  const potBy = new Map(
+    (potInfo.value?.by_currency ?? []).map(r => [r.currency, r.remainingMinor]),
+  );
+  const spentBy = new Map(
+    totals.value.map(t => [t.currency, t.sharedMinor + t.personalMinor]),
+  );
+  return [...new Set([...spentBy.keys(), ...potBy.keys()])]
+    .sort(byBaseFirst)
+    .map(currency => ({
+      currency,
+      spentMinor: spentBy.get(currency) ?? 0,
+      potRemainingMinor: potBy.has(currency) ? potBy.get(currency)! : null,
+    }));
+});
 
 // ── 每人合計 ────────────────────────────────────────────────
 const ZERO = { sharedOwedBase: 0, personalBase: 0, totalBase: 0, unconverted: 0 };
@@ -521,6 +562,52 @@ async function confirmDeleteMove() {
     </div>
 
     <template v-else>
+      <!--
+        ── 目前(首屏摘要)──
+        每個幣別一列:花了多少、公費還剩多少。下面每一張卡都是它的細節版。
+      -->
+      <section v-if="glance.length" class="card p-4">
+        <h2 class="font-semibold">
+          目前
+        </h2>
+
+        <ul class="mt-2.5 flex flex-col gap-2">
+          <li v-for="row in glance" :key="row.currency" class="glance-row">
+            <span class="glance-cur">{{ CURRENCY_LABEL[row.currency] ?? row.currency }}</span>
+
+            <span class="glance-cell">
+              <span class="glance-label">花了</span>
+              <span class="tnum text-base font-bold">{{ formatMoney(row.spentMinor, row.currency) }}</span>
+            </span>
+
+            <!--
+              沒有公費金流的幣別留白 —— 印一個 0 會被讀成「公費花光了」,
+              而事實是這個幣別根本沒走過公費。
+            -->
+            <span class="glance-cell">
+              <span class="glance-label">{{ pot?.name ?? '公費' }}剩</span>
+              <span
+                v-if="row.potRemainingMinor != null"
+                class="tnum text-base font-bold"
+                :style="{ color: row.potRemainingMinor < 0 ? 'var(--debit)' : 'var(--credit)' }"
+              >{{ formatMoney(row.potRemainingMinor, row.currency) }}</span>
+              <span v-else class="text-base" style="color: var(--text-muted)">—</span>
+            </span>
+          </li>
+        </ul>
+
+        <div
+          v-if="hasExpenses"
+          class="mt-2.5 flex items-baseline justify-between gap-3 rounded-xl px-3 py-2"
+          style="background: var(--bg-sunken)"
+        >
+          <span class="text-xs" style="color: var(--text-muted)">
+            花費換算{{ CURRENCY_LABEL[baseCurrency] ?? baseCurrency }}(估算)
+          </span>
+          <span class="tnum text-sm font-bold">{{ formatMoney(tripTotalBase, baseCurrency) }}</span>
+        </div>
+      </section>
+
       <!-- ── 公費 ── -->
       <section v-if="pot" class="card p-4">
         <div class="flex items-start gap-3">
@@ -623,7 +710,6 @@ async function confirmDeleteMove() {
           >
             <Icon name="lucide:receipt-text" size="15" class="shrink-0" style="color: var(--text-muted)" />
             <span class="min-w-0 flex-1 text-left text-sm font-medium">金流紀錄</span>
-            <span class="shrink-0 text-xs" style="color: var(--text-muted)">記錯了可以改或刪</span>
             <Icon
               :name="movesOpen ? 'lucide:chevron-up' : 'lucide:chevron-down'"
               size="16" class="shrink-0" style="color: var(--text-muted)"
@@ -803,10 +889,6 @@ async function confirmDeleteMove() {
               </tbody>
             </table>
           </div>
-          <p class="mt-2 text-xs leading-relaxed" style="color: var(--text-muted)">
-            每個幣別各自一列,不相加 —— 日幣和台幣加在一起的數字沒有意義。
-          </p>
-
           <div class="mt-3 flex items-baseline justify-between gap-3 rounded-xl px-3 py-2.5"
                style="background: var(--bg-sunken)">
             <span class="text-xs" style="color: var(--text-muted)">
@@ -1107,6 +1189,35 @@ async function confirmDeleteMove() {
 </template>
 
 <style scoped>
+/*
+ * 首屏摘要的一列。窄螢幕排成「幣別 / 花了 / 公費剩」三格一行,
+ * 金額用 tnum 對齊,幣別欄固定寬度,兩個數字的左緣才不會因為
+ * 「日幣」和「台幣」字寬相同、但未來多一個「歐元」就歪掉。
+ */
+.glance-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+.glance-cur {
+  flex-shrink: 0;
+  width: 2.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.glance-cell {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.0625rem;
+}
+.glance-label {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+
 /* 顏色一律走 main.css 的變數,深色模式自動跟著換。 */
 
 .link-btn {

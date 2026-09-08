@@ -112,27 +112,45 @@ export default defineEventHandler(async (event) => {
   // ⚠️ 上限有**兩側**,只看付款人欠多少是不夠的 ————————————————
   //
   // 欠款只說得出「這個人總共還欠多少」,說不出「這個**收款人**還被欠多少」。
-  // 兩者不一樣的時機是「債權分散在多個人身上」,而公費一旦付過共同支出就必然如此
-  // (新語意下公費淨額 = +公費花費,它恆為債權人之一,見 utils/ledger.ts)。
-  // 實測:公費付 ¥6,000 兩人均分、AA 墊 ¥20,000 兩人均分
+  // 兩者不一樣的時機是「債權分散在多個人身上」,而只要公費手上還有現金就必然如此
+  // (公費淨額 = −剩餘,剩餘 > 0 時它是債務人之一,見 utils/ledger.ts)。
+  // 實測:公費付 ¥6,000 兩人均分、AA 墊 ¥20,000 兩人均分、沒有人投入過公費
   //   → 淨額 AA +7,000 / BB −13,000 / 公費 +6,000,建議只有 BB→AA ¥7,000
   //   → 直接 POST { BB→AA 13,000 }(= owes(BB))舊寫法兩道防護都放行 → 201
   //   → 之後淨額變成 AA −6,000 / 公費 +6,000:AA 憑空多出一筆 ¥6,000 的欠款,
   //     轉帳建議整個變空 —— 錢被「還」到一個沒有那麼多債權的人身上。
   // 多出來的那 6,000 本來該流向公費,而公費的腿一律不寫進 settlements
-  // (那等於幫人記一筆他沒付的投入),所以它只能由使用者在總覽頁投入/退還。
-  //
-  // 這道縫舊語意就在,只是當時要「公費信封被超領」才走得到;淨額不含投入/退還
-  // 之後它變成「只要公費付過共同支出就一直成立」—— 曝露面被上一次改動放大了。
+  // (那等於幫人記一筆他沒付的投入),所以它只能由使用者在總覽頁投入 / 退還。
   //
   // 加上收款人這一側不會誤擋正常流程:UI 只送 minCashFlow 的建議金額,
   // 而每一筆建議 = min(當時的 credit, −debt),天生 ≤ 兩側上限;先記掉的那些
   // 同時等量扣掉兩側,所以剩下的建議照什麼順序按都還在上限內。
   //
-  // 只管人對人。投入公費(人 → 公費)不是還款,是搬現金 —— 它現在連淨額都不進
-  // (見 utils/ledger.ts 開頭),拿欠款去限制它毫無意義:一個什麼都不欠的人
-  // 照樣可以往信封裡放錢。公費退還則有自己的上限(上面那段)。
+  // 只管人對人。投入公費(人 → 公費)雖然**會**進淨額(它是他掏出去的錢),
+  // 但它不是還款,是搬現金 —— 拿欠款去限制它毫無意義:一個什麼都不欠的人
+  // 照樣可以往信封裡放錢,而那只會讓他的淨額往上走,不會弄壞任何人的帳。
+  // 公費退還則有自己的上限(上面那段:不能退超過信封裡的現金)。
   const involvesPot = !!pot && (b.from_member === pot.id || b.to_member === pot.id);
+  /**
+   * 退還(公費 → 人)要走自己那條有上限的 INSERT;投入(人 → 公費)沒有上限
+   * (錢是流進信封的,不可能超支),走無條件的那條。
+   *
+   * ⚠️ 這個區分不能省。上面那個 remaining 檢查只是**事前**的:讀取與寫入是
+   * 兩次往返,兩支請求可以雙雙讀到「剛好還夠」再雙雙寫入。姊妹端點
+   * pot/moves.post.ts 對**完全一樣的那一列**早就有 SQL 前提,而且它的註解
+   * 記著實測結果:「兩支手機同時各退還剛好等於全部餘額的金額,兩支都通過
+   * 事前檢查、兩筆都寫進去 → 公費剩餘變成負的」。這一支以前只有 JS 那道,
+   * 換個端點打同一筆錢就繞過去了 —— 正是上面那段註解說要防的事。
+   *
+   * 淨額含投入 / 退還之後這個縫從「顯示問題」升級成**算錯錢**:
+   * A 投入 NT$10,000、兩支併發各退還 NT$10,000 給 B(實測 netBalances/minCashFlow):
+   *   nets  A +10,000 / B −20,000 / 公費 +10,000
+   *   recorded **B → A NT$10,000** ← 兩端都是真人,下一次結算回合會把它寫進
+   *                                   settlements,變成 B 真的要付的錢
+   * B 只從信封拿過一次 10,000,卻被要求總共吐出 20,000。
+   * (舊語意下這兩列不進淨額,transfers 是空的 —— 所以是語意改動讓它開始要錢。)
+   */
+  const isRefund = !!pot && b.from_member === pot.id;
   if (!involvesPot) {
     const ledger = await tripLedger(dbh, trip.id, b.currency);
     const nets = ledger.byCurrency[b.currency]?.nets ?? [];
@@ -191,27 +209,48 @@ export default defineEventHandler(async (event) => {
    *
    * 上限是 **min(付款人欠款, 收款人債權)**,所以這裡有兩個 `?6 <= (...)`:
    *
-   *   owes(?3)   = -net(?3) = 分攤 − 墊款 + 收到的還款 − 付出的還款
-   *   credit(?4) =  net(?4) = 墊款 − 分攤 − 收到的還款 + 付出的還款
+   *   owes(?3)   = -net(?3) = 分攤 − 墊款 + 收到的 − 付出的
+   *   credit(?4) =  net(?4) = 墊款 − 分攤 − 收到的 + 付出的
+   * (「收到的 / 付出的」是 settlements 全部,投入公費與公費退還都算在內。)
    *
    * 收款人那一側是付款人那一側的**鏡像**(每一項符號相反,member_id 換成 ?4),
    * 刻意寫成對照得出來的形狀 —— 兩塊長得不一樣的時候就是有人只改了一邊。
    * (net 的定義見 utils/settle.ts 的 netBalances;為什麼上限要看兩側,
    *  以及只看付款人時實測會生出什麼假債務,見上面 JS 那段。)
    *
-   * ⚠️ 四個還款加總全都必須排掉「對方是公費」的那些列 —— 淨額不含投入/退還
-   * (見 utils/ledger.ts 開頭)。這句 SQL 是上面那個 JS 檢查的資料庫層雙胞胎,
-   * **兩邊算的必須是同一個上限**,否則就是這個 repo 剛修完的那一類 bug:
-   * JS 放行、SQL 擋掉,使用者得到一句「這筆已經結清了」而其實沒有。
-   * 具體會壞掉的流程:A 投入公費 10,000,同時欠 B 5,000(B 墊的共同支出)。
-   * 新語意 owes(A) = 5,000,結算頁就是這樣建議的;舊算法是 5,000 − 10,000 = −5,000
-   * → 這句 SQL 一列都插不進去 → 照著畫面按「標記已還款」永遠是 409。
-   * (?8 = 公費 id,沒有公費時是 NULL,用 `?8 IS NULL OR ...` 的 sentinel 寫法 ——
-   *  直接寫 `from_member <> NULL` 會求值成 NULL,把每一列都濾掉。)
+   * ⚠️ 四個還款加總**一列都不排**,任一端是公費的那些也照算 ——
+   * 淨額含投入 / 退還(見 utils/ledger.ts 開頭)。這句 SQL 是上面那個 JS 檢查的
+   * 資料庫層雙胞胎,**兩邊算的必須是同一個上限**,否則就是這個 repo 反覆踩到的
+   * 那一類 bug:一邊放行、另一邊擋掉,使用者得到一句「這筆已經結清了」而其實沒有。
+   *
+   * 這裡曾經有一組 `(?8 IS NULL OR from_member <> ?8)` 把公費那幾列濾掉,
+   * 那是淨額不含投入 / 退還時的寫法。語意改回去之後它就變成單邊漂移:
+   * A 投入公費 10,000、B 墊了 30,000 兩人均分 → JS 算 owes(A) = 5,000(畫面也這樣建議),
+   * 舊 SQL 算 15,000 —— 送 15,000 進來 JS 擋、SQL 放,只要有人繞過 UI 直接打 API
+   * 就會寫出一筆超過債權的還款,把收款人的淨額打成負的。
    *
    * 寫不進去(changes = 0)就代表在這一瞬間其中一側已經不夠了 → 409。
    */
-  const res = involvesPot
+  const res = isRefund
+    // 退還:上限寫進 SQL 本身。這句和 pot/moves.post.ts 的退還那句**必須一模一樣**
+    // (剩餘 = 投入 − 公費花掉的 − 已退還 ≥ 這次要退的金額),
+    // 兩邊算的不是同一個數的話,擋在一支的請求換一支打就過了。
+    ? await dbh.prepare(
+        `INSERT INTO settlements (id, trip_id, from_member, to_member, currency, amount_minor, note)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+         WHERE (
+           COALESCE((SELECT SUM(amount_minor) FROM settlements
+                      WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?3), 0)
+           - COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p
+                        JOIN expenses e ON e.id = p.expense_id
+                        WHERE e.trip_id = ?2 AND e.kind = 'shared'
+                          AND e.currency = ?5 AND p.member_id = ?3), 0)
+           - COALESCE((SELECT SUM(amount_minor) FROM settlements
+                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?3), 0)
+         ) >= ?6`,
+      ).bind(id, trip.id, b.from_member, b.to_member, b.currency, b.amount_minor, b.note ?? null).run()
+    : involvesPot
+    // 投入(人 → 公費):沒有上限,錢是流進信封的。
     ? await dbh.prepare(
         `INSERT INTO settlements (id, trip_id, from_member, to_member, currency, amount_minor, note)
          VALUES (?,?,?,?,?,?,?)`,
@@ -229,11 +268,9 @@ export default defineEventHandler(async (event) => {
                         WHERE e.trip_id = ?2 AND e.kind = 'shared'
                           AND e.currency = ?5 AND p.member_id = ?3), 0)
            + COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?3
-                          AND (?8 IS NULL OR from_member <> ?8)), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?3), 0)
            - COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?3
-                          AND (?8 IS NULL OR to_member <> ?8)), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?3), 0)
          )
          AND ?6 <= (
            COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p
@@ -245,20 +282,23 @@ export default defineEventHandler(async (event) => {
                         WHERE e.trip_id = ?2 AND e.kind = 'shared'
                           AND e.currency = ?5 AND s.member_id = ?4), 0)
            + COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?4
-                          AND (?8 IS NULL OR to_member <> ?8)), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?4), 0)
            - COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?4
-                          AND (?8 IS NULL OR from_member <> ?8)), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?4), 0)
          )`,
-      ).bind(id, trip.id, b.from_member, b.to_member, b.currency, b.amount_minor, b.note ?? null,
-        pot?.id ?? null).run();
+      ).bind(id, trip.id, b.from_member, b.to_member, b.currency, b.amount_minor, b.note ?? null).run();
 
   if (!res.meta?.changes) {
+    // 兩種前提、兩種說法。退還被擋的原因和人對人的還款完全不同,
+    // 給同一句話會讓使用者去看錯的地方(「我沒有在結算啊」)。
     throw createError({
       statusCode: 409,
-      statusMessage: '付款人的欠款或收款人的債權在你按下的這一瞬間已經不夠這筆金額了'
-        + '(可能剛剛的結算把它算進去了)。什麼都沒有寫入,請重新整理看最新狀態。',
+      statusMessage: isRefund
+        ? `${pot?.name ?? '公費'}手上的${b.currency}在你按下的這一瞬間已經不夠退這筆了`
+          + '(可能有人同時也在退還、或剛記了一筆公費付的支出)。'
+          + '什麼都沒有寫入,請重新整理看最新的剩餘。'
+        : '付款人的欠款或收款人的債權在你按下的這一瞬間已經不夠這筆金額了'
+          + '(可能剛剛的結算把它算進去了)。什麼都沒有寫入,請重新整理看最新狀態。',
     });
   }
 

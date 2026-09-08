@@ -13,35 +13,40 @@ import { CURRENCY_LABEL, formatMoney } from '~~/shared/money';
  *     (最小化轉帳筆數可歸約到 Subset Sum,是 NP-Complete)。
  *  3. balance.disclaimer 與 balance.rate_attribution 必須顯示 ——
  *     前者是「換算值只是估算」的誠實聲明,後者是匯率來源的授權要求。
- *  4. **這頁只講真人。** 公費在這裡只以「先付掉多少」出現一行;
- *     投入 / 退還 / 剩餘一律歸「總覽」。理由見下面那一整段 ——
- *     順帶保住舊的鐵則:任一端是公費的轉帳建議永遠不會長出寫入按鈕
+ *  4. **轉帳清單只講真人。** 公費在這裡以「還剩多少 / 超支多少」出現一行,
+ *     實際的投入 / 退還動作一律歸「總覽」。理由見下面那一整段 ——
+ *     順帶保住鐵則:任一端是公費的轉帳建議永遠不會長出寫入按鈕
  *     (這頁根本只渲染 recorded,公費的腿沒有任何路徑能被畫出來)。
  *  5. 被結算蓋章的支出叫「已列入第 N 次結算」,**不是「已結清」**。
  *     債務是由那一輪的轉帳整體清掉的,不是一筆一筆對消 ——
  *     叫它「已結清」會讓人以為可以逐筆勾銷,那個心智模型會算錯錢。
  *
- * ══ 為什麼公費的「剩餘」不能出現在這頁 ═══════════════════════════
+ * ══ 公費在這頁是「信封還剩多少」,不是「大家欠信封多少」════════
  *
- * 淨額的語意刻意**不含投入 / 退還**(任一端是公費的 settlement):
- *   淨額 = Σ(他為共同花費付掉的) − Σ(他該分攤的) − Σ(人對人的還款)
+ * 淨額**含**投入 / 退還(見 server/utils/ledger.ts):
+ *   淨額 = Σ(他為共同花費付掉的) − Σ(他該分攤的) + Σ(他付出去的) − Σ(他收到的)
  *
- * 舊語意把投入也算進淨額,畫面就變成這樣:
- *   MIN +38,942   Hsuan +28,944   公費 −67,886
- * 而 67,886 就是信封裡剩的現金 —— 剩餘只是被拆成兩列掛在真人身上。
- * 所以「只把公費那一列藏起來」是沒用的:剩餘還是留在頁上。
- * 要真的把它趕回總覽,必須把投入 / 退還從這頁的算術裡整個拿掉。
+ * 所以投入公費和刷卡墊一頓飯在算術上是同一件事 —— 都是他掏出去的錢。
+ * 這件事必須成立,否則這頁會對著已經先付過錢的人說他還欠錢:
  *
- * 債不會因此消失,只是改走公費。MIN 投 5 萬、Hsuan 投 0、公費花掉 32,114 均分:
- *   舊語意  Hsuan → MIN 16,057(人對人)
- *   新語意  Hsuan 淨額 −16,057(他確實還欠,只是對象是公費的信封)
- *          → 他到總覽投入 16,057 → 信封退還給 MIN 33,943
- *          → 而 MIN 實付 50,000 − 16,057 = 33,943,完全對得上。
+ *   MIN 投 ¥20,000、Hsuan 投 ¥15,000,公費付掉 ¥15,000 兩人均分
+ *     漏算投入  MIN −7,500   Hsuan −7,500     兩個人都「應付」← 錯的
+ *     照算      MIN +12,500  Hsuan +7,500     公費 −20,000    ← 信封裡真的還有 2 萬
  *
- * 附帶好處:新語意下**公費的淨額剛好等於公費付掉的錢**,所以畫面上那行
- * 「公費先付掉的」不是另外算出來的數字,而是同一個數字換個說法呈現。
- * 也因此 Σ(真人淨額) = −(公費花費) —— 使用者看到一排負數會問「錢去哪了」,
- * 那一行就是答案。它必須寫得像算式的另一半,不能只丟一個孤零零的金額。
+ * 於是公費那一列的值恆等於 −剩餘,而 Σ(真人淨額) = 剩餘。
+ * 畫面因此長成:公費那一列不進「每人淨額」,改成卡片上方
+ * 「{公費}還剩 X」一行,而 X 正是下面所有真人淨額的總和 ——
+ * 使用者一定會把那排數字加起來,加出來的東西必須在畫面上有名字。
+ *
+ * ⚠️ **有剩餘不代表現在可以去要錢。** 那筆現金明天還要買車票。
+ * 所以公費的腿一律是 deferred:這頁只說「旅程結束在總覽退還」,
+ * 永遠不畫成一筆可以按下去的轉帳。這條線劃在「寫不寫」,不是劃在「算不算」——
+ * 曾經試過把投入 / 退還整個從算術裡拿掉,結果就是上面那排錯的負數。
+ *
+ * 出資不均的債也因此**不會**被信封吸收掉:MIN 投 5 萬、Hsuan 投 0、
+ * 公費花掉 32,114 均分 → Hsuan 淨額 −16,057、MIN +33,943、公費 −17,886,
+ * recorded 是「Hsuan → MIN 16,057」(真的會寫進去),deferred 是
+ * 「公費 → MIN 17,886」(結束時退還)。兩筆加起來 MIN 收回 50,000 − 16,057 ✓
  *
  * ══ 結算回合(rounds)的兩個範圍 ═══════════════════════════════
  *
@@ -238,24 +243,44 @@ interface CurrencySection {
   maxAbs: number;
   /** 這個幣別淨額為 0(沒出現在 nets)的**真人**名字 */
   settledNames: string[];
-  /** 公費為這個幣別的共同花費先付掉多少。0 = 那一行不畫 */
-  potSpentMinor: number;
+  /**
+   * 這個幣別的公費現況。null = 沒設公費 / 這個幣別的公費從沒經手過錢
+   *   → 那一整塊不畫。
+   */
+  pot: PotLine | null;
   /** 這個幣別的結算預覽區塊。preview 還沒回來 / 抓失敗時是 null */
   preview: RoundPreviewBlock | null;
 }
 
+/** 卡片上方那一行公費要講的三個數字。 */
+interface PotLine {
+  /** 投入 − 付掉 − 已退還。>0 信封裡還有現金,<0 超支 */
+  remainingMinor: number;
+  contributedMinor: number;
+  spentMinor: number;
+}
+
 /**
- * 幣別 → 公費為這個幣別的共同花費付掉多少(最小單位)。
+ * 幣別 → 這個幣別的公費現況。
  *
- * 刻意讀 `pot.by_currency[].spentMinor` 而不是自己從 nets 反推:
- * 那個欄位總覽頁本來就在用(標題是「已支出」),兩頁指到同一個數字,
+ * 刻意讀 `pot.by_currency[]` 而不是從 nets 反推公費那一列:那幾個欄位
+ * 總覽頁本來就在用(標題是「投入 / 已支出 / 剩餘」),兩頁指到同一組數字,
  * 使用者跨頁對帳時不會看到兩個「差不多但不一樣」的金額。
- * 沒設公費 / 這個幣別公費沒付過錢 → 查不到 → 當 0 → 那一行不畫。
+ *
+ * 兩條路徑算出來的必須相等(`公費淨額 === −remainingMinor`,見 utils/ledger.ts)——
+ * 這裡選 potSummary 那條是因為它還多帶了投入與付掉,說明文字需要它們。
  */
-const potSpentByCurrency = computed<Record<string, number>>(() => {
-  const rows = balance.value?.pot?.by_currency ?? [];
-  const out: Record<string, number> = {};
-  for (const r of rows) out[r.currency] = r.spentMinor;
+const potByCurrency = computed<Record<string, PotLine>>(() => {
+  const out: Record<string, PotLine> = {};
+  for (const r of balance.value?.pot?.by_currency ?? []) {
+    // 三個數字全是 0 = 這個幣別的信封從來沒動過,那一塊不必畫。
+    if (!r.contributedMinor && !r.spentMinor && !r.refundedMinor) continue;
+    out[r.currency] = {
+      remainingMinor: r.remainingMinor,
+      contributedMinor: r.contributedMinor,
+      spentMinor: r.spentMinor,
+    };
+  }
   return out;
 });
 
@@ -279,10 +304,10 @@ const sections = computed<CurrencySection[]>(() => {
   return codes.map((code) => {
     const bucket = b.by_currency[code]!;
     /*
-      公費從「每人淨額」濾掉。新語意下它的值就是「公費付掉的錢」,
-      和真人那一欄的「應收 / 應付」是兩種完全不同意義的數字 ——
-      同一欄擺兩種意義正是使用者看不懂這頁的原因。
-      那個數字沒有被丟掉:它換成卡片上方「公費先付掉的」那一行。
+      公費從「每人淨額」濾掉。它的值是 −剩餘,和真人那一欄的「應收 / 應付」
+      是兩種完全不同意義的數字 —— 同一欄擺兩種意義正是使用者看不懂這頁的原因。
+      那個數字沒有被丟掉:它換成卡片上方「{公費}還剩 X」那一行,
+      而 X 剛好等於下面所有真人淨額的總和。
     */
     const nets = (bucket.nets ?? [])
       .filter(n => n.memberId !== potId.value)
@@ -291,10 +316,9 @@ const sections = computed<CurrencySection[]>(() => {
 
     /*
       ⚠️ 只渲染 recorded(兩端都是真人)這一堆。
-      公費的腿在這頁完全不出現 —— 它現在的意思是「大家還欠信封多少」,
-      而那件事由真人的淨額本身講,再畫一次只會變成第二種說法。
-      舊的鐵則也因此自動成立:沒有任何路徑能讓公費的腿長出寫入按鈕
-      (對公費按「標記已還款」等於把信封裡的現金全退出去,那筆錢明天還要用)。
+      公費的腿在這頁完全不出現:它的意思是「結束時信封退還多少 / 還要補多少」,
+      那是總覽頁的動作,而且**現在按下去是錯的** —— 信封裡的現金明天還要用。
+      鐵則也因此自動成立:沒有任何路徑能讓公費的腿長出寫入按鈕。
       server 的 balance 已經直接給 recorded;萬一是舊版沒有這個欄位,
       就用 potId 自己濾一次,不要退回「全部都能按」。
     */
@@ -313,7 +337,7 @@ const sections = computed<CurrencySection[]>(() => {
       // 不畫成一整列 ¥0,只在區塊底下列名字,免得洗掉真正要看的數字。
       // 公費不算在這裡面 —— 這張卡整張只講真人,公費出現在名單裡會讓人以為它是人。
       settledNames: people.value.filter(m => !withNet.has(m.id)).map(m => m.name),
-      potSpentMinor: potSpentByCurrency.value[code] ?? 0,
+      pot: potByCurrency.value[code] ?? null,
       preview: previewBlocks.value.find(p => p.currency === code) ?? null,
     };
   });
@@ -340,15 +364,16 @@ const allSettled = computed(() => hasCurrencies.value && openTransferCount.value
 /**
  * 「人跟人之間不用轉帳」底下那句話。
  *
- * 真人還有淨額、卻沒有任何人對人的轉帳建議 = 剩下的債都是對公費的
- * (新語意下投入 / 退還不算在淨額裡,所以只能在總覽處理)。
- * 這裡刻意**不寫金額** —— 剩餘的數字歸總覽;但完全不提會讓人以為公費的錢消失了,
- * 所以留一句不帶數字的指路。
+ * 真人還有淨額、卻沒有任何人對人的轉帳建議 = 剩下的全部是對信封的那一段
+ * (每個人都還有錢在裡面,或每個人都還要補)。金額不重複寫 ——
+ * 上面那一行已經講了剩多少;這裡只負責說「不是沒事了,是那部分不在這裡處理」。
  */
 function noTransferHint(s: CurrencySection): string {
   if (!s.nets.length) return `所有人在${s.label}的墊款都對得上了。`;
-  return `所有人在${s.label}的墊款彼此都對得上了 —— 剩下的是對${potName.value}的部分,`
-    + `到「總覽」用投入 / 退還處理。`;
+  const over = (s.pot?.remainingMinor ?? 0) < 0;
+  return `所有人在${s.label}的墊款彼此都對得上了 —— 剩下的是`
+    + (over ? `要補進${potName.value}的部分` : `還放在${potName.value}裡的部分`)
+    + `,到「總覽」用投入 / 退還處理。`;
 }
 
 // ── 每人這趟總花費(換算本位幣的估算值) ──────────────────────
@@ -706,16 +731,16 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
           每個幣別的墊款都對得上,沒有人需要再轉帳給誰。之後再記共同花費,這裡會重新算。
         </p>
         <!--
-          有設公費就留一句指路。「已全部結清」後面什麼都不說,
-          會讓人以為公費那筆錢消失了 —— 但這句刻意**不帶任何金額**,
-          剩多少現金只在「總覽」講(理由見檔頭)。
+          有設公費就留一句指路:人跟人之間清乾淨了不等於整趟結束了,
+          信封裡可能還有現金。金額不寫在這裡 —— 各幣別的那一行已經有了,
+          這裡只負責讓人知道還有一步要做。
         -->
         <p
           v-if="potId"
           class="mx-auto mt-2.5 max-w-sm text-xs leading-relaxed text-[var(--text-muted)]"
         >
-          {{ potName }}的投入與剩餘不在這頁 —— 到「總覽」看,
-          旅程結束也在那裡用「退還」把剩下的現金分回去。
+          {{ potName }}裡如果還有現金,旅程結束到「總覽」按「退還」分回去 ——
+          那一步不會出現在這頁的轉帳清單裡。
         </p>
       </section>
 
@@ -763,7 +788,7 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             <template v-if="s.transfers.length">
               已簡化為 <span class="tnum font-medium text-[var(--text)]">{{ s.transfers.length }}</span> 筆轉帳
             </template>
-            <!-- 還有淨額卻沒有轉帳建議 → 剩下的都是對公費的,不能說「已結清」 -->
+            <!-- 還有淨額卻沒有轉帳建議 → 剩下的都在信封那一段,不能說「已結清」 -->
             <template v-else-if="s.nets.length">人跟人之間不用轉帳</template>
             <template v-else>這個幣別已結清</template>
           </p>
@@ -806,19 +831,21 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
           <div class="row-head flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 px-4 py-2.5">
             <h4 class="text-xs font-semibold">每人淨額</h4>
             <p class="text-[0.6875rem] text-[var(--text-muted)]">
-              綠 + = 應收(別人還他)· 紅 − = 應付(他要還)
+              綠 + = 應收(還可以收回)· 紅 − = 應付(還要付出去)
             </p>
           </div>
 
           <!--
-            公費先付掉的。放在真人淨額的**上面**、而且刻意長得不像一列淨額 ——
-            它不是「應收 / 應付」,而是補上算術的缺口:下面一排全是負數的時候
-            使用者會問「錢去哪了」,答案就是這筆錢由公費的信封先墊了。
-            所以第二行必須把「加起來剛好是這個數的負值」講出來,
-            不然它只是一個孤零零的金額,反而更像另一筆看不懂的帳。
-            公費一毛都沒付的幣別不畫這一行(例如這趟的台幣)。
+            公費現況。放在真人淨額的**上面**、而且刻意長得不像一列淨額 ——
+            它不是某個人的「應收 / 應付」,而是下面那排數字的總和有個名字:
+            剩餘。使用者一定會把那排加起來(那是驗算這頁最自然的動作),
+            加出來的東西在畫面上必須找得到。
+
+            第二行要同時回答兩件事:這個數字是什麼、以及**現在不要去動它**。
+            少了後半句,看到一排綠色正數的人會直接開始跟朋友要錢,
+            而那筆現金明天還要買車票。
           -->
-          <div v-if="s.potSpentMinor" class="pot-spent">
+          <div v-if="s.pot" class="pot-line">
             <div class="flex items-baseline justify-between gap-3">
               <p class="flex items-center gap-1.5 text-xs font-semibold">
                 <Icon
@@ -827,15 +854,32 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
                   class="shrink-0"
                   style="color: var(--brand)"
                 />
-                {{ potName }}先付掉的
+                {{ potName }}{{ s.pot.remainingMinor < 0 ? '超支' : '還剩' }}
               </p>
-              <UiMoney :minor="s.potSpentMinor" :currency="s.code" />
+              <UiMoney
+                :minor="Math.abs(s.pot.remainingMinor)"
+                :currency="s.code"
+              />
             </div>
+
             <p class="mt-1.5 text-[0.6875rem] leading-relaxed text-[var(--text-muted)]">
-              這個幣別的共同花費有這麼多是{{ potName }}的信封先付的,
-              所以下面每個人的淨額加起來剛好是
-              <span class="tnum">−{{ formatMoney(s.potSpentMinor, s.code) }}</span> ——
-              那不是錢不見了,是大家還沒把這部分還給{{ potName }}。
+              <template v-if="s.pot.remainingMinor > 0">
+                投入 <span class="tnum">{{ formatMoney(s.pot.contributedMinor, s.code) }}</span>、
+                {{ potName }}付掉 <span class="tnum">{{ formatMoney(s.pot.spentMinor, s.code) }}</span>,
+                信封裡還有這些現金 —— 下面每個人的淨額加起來剛好是這個數。
+                <b>那筆錢明天還要用,不用現在轉帳</b>;旅程結束到「總覽」按「退還」分回去。
+              </template>
+              <template v-else-if="s.pot.remainingMinor < 0">
+                {{ potName }}付掉 <span class="tnum">{{ formatMoney(s.pot.spentMinor, s.code) }}</span>,
+                比大家投入的 <span class="tnum">{{ formatMoney(s.pot.contributedMinor, s.code) }}</span> 還多 ——
+                差額是還要補進信封的,下面每個人的淨額加起來剛好是
+                <span class="tnum">−{{ formatMoney(-s.pot.remainingMinor, s.code) }}</span>。
+                到「總覽」按「投入{{ potName }}」補上。
+              </template>
+              <template v-else>
+                投入 <span class="tnum">{{ formatMoney(s.pot.contributedMinor, s.code) }}</span> 全部用完了,
+                信封已經歸零 —— 下面剩下的都是人跟人之間的帳。
+              </template>
             </p>
           </div>
 
@@ -847,6 +891,7 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
               :net-minor="n.netMinor"
               :currency="s.code"
               :ratio="s.maxAbs ? Math.abs(n.netMinor) / s.maxAbs : 0"
+              :pot-label="s.pot ? potName : null"
             />
 
             <p
@@ -1039,13 +1084,16 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
           </li>
           <li>每個幣別各自結算。跨幣別的換算只用在上面的「這趟花費」參考數字,不會混進轉帳金額。</li>
           <li>
-            每人淨額 = 他為共同花費付掉的 − 他該分攤的 − 人跟人之間的還款。
+            每人淨額 = 他為共同花費付掉的 − 他該分攤的 + 他付出去的 − 他收到的。
           </li>
           <li v-if="potId">
-            <strong class="font-medium text-[var(--text)]">投入 / 退還{{ potName }}不算在淨額裡</strong>,
-            所以這頁只回答「誰要給誰多少」,{{ potName }}手上還剩多少現金請看「總覽」。
-            {{ potName }}先付掉的錢算在共同花費裡,因此每個幣別的「{{ potName }}先付掉的」
-            剛好等於所有人淨額加起來的相反數 —— 那不是另外一筆帳,是同一個數字的另一半。
+            <strong class="font-medium text-[var(--text)]">投入 / 退還{{ potName }}也算在淨額裡</strong> ——
+            那是他真的掏出去 / 收回來的錢,和刷卡墊一頓飯沒有差別。
+            所以每個幣別**所有真人的淨額加起來 = {{ potName }}還剩多少**,
+            也就是上面那一行的數字;那不是另外一筆帳,是同一個數字的另一半。
+            <br>
+            但「還剩多少」不代表現在可以去要 —— 那筆現金旅程還沒結束就還要用,
+            所以它不會出現在轉帳清單裡,結束時到「總覽」按「退還」分回去。
           </li>
           <li>
             結算的<strong class="font-medium text-[var(--text)]">明細</strong>只列還沒列入任何結算的那幾筆,
@@ -1255,9 +1303,9 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
             </span>
           </li>
           <!--
-            這裡刻意**不再列公費的腿**。新語意下淨額不含投入 / 退還,
-            公費那幾筆的意思只剩「大家還欠信封多少」—— 而那件事真人的淨額已經講了,
-            在「會寫下什麼」的清單裡再提一次,只會讓人以為結算會動到公費的現金。
+            這裡刻意**不列公費的腿**。它們的意思是「結束時退還多少 / 還要補多少」,
+            是總覽頁的動作 —— 出現在「這一步會寫下什麼」的清單裡,
+            只會讓人以為按下結算會動到信封裡的現金。
           -->
           <li class="flex items-start gap-2">
             <Icon name="lucide:undo-2" size="15" class="mt-0.5 shrink-0" />
@@ -1391,9 +1439,9 @@ onBeforeUnmount(() => clearTimeout(flashTimer));
   border-bottom: 1px solid var(--border);
 }
 
-/* 「公費先付掉的」那一行。底色刻意和下面的淨額列不同 ——
-   它是算式的另一半(Σ 真人淨額 = −這個數),不是某個人的應收 / 應付。 */
-.pot-spent {
+/* 公費現況那一行。底色刻意和下面的淨額列不同 ——
+   它是算式的另一半(Σ 真人淨額 = 這個數),不是某個人的應收 / 應付。 */
+.pot-line {
   padding: 0.75rem 1rem;
   background: color-mix(in oklab, var(--brand) 6%, transparent);
   border-bottom: 1px solid var(--border);

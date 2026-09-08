@@ -583,12 +583,12 @@ group('[8] 公費的三條規則,PATCH 同樣要守');
   const pot = ((bal.json.pot?.by_currency ?? []) as J[]).find((r) => r.currency === 'JPY');
   eq('公費付掉的金額跟著變成 3000', pot?.spentMinor, 3000);
   eq('公費剩餘 = −3000(還沒有人投入)', pot?.remainingMinor, -3000);
-  // 「公費淨額 = 公費花費」是這個 App 的核心不變量(取代了舊的「剩餘 = −淨額」——
-  // 淨額已經不含投入/退還,見 server/utils/ledger.ts 開頭),編輯之後也必須成立。
-  // ⚠️ 這一組剛好沒有人投入也沒有退還,所以舊的等式在數值上仍然成立;
-  // 改成盯 spentMinor 是為了讓它真的在守新語意,而不是碰巧綠著。
+  // 「公費淨額 = −公費剩餘」是這個 App 的核心不變量(見 server/utils/ledger.ts 開頭),
+  // 編輯支出之後也必須成立 —— 編輯改的是 spentMinor,剩餘與淨額要一起跟著動。
+  // ⚠️ 這一組沒有人投入也沒有退還,所以 剩餘 = −花費,兩種寫法在數值上相同。
+  // 盯的是 remainingMinor 那一條:它才是支點,而且它涵蓋投入 / 退還的情況。
   const potNet = (await netsOf(c.T, 'JPY')).get(potId) ?? 0;
-  eq('公費淨額 = 公費花費,不變量還在', potNet, pot?.spentMinor);
+  eq('公費淨額 = −剩餘,不變量還在', potNet, -(pot?.remainingMinor ?? 0));
   eq('編輯之後也是 3000', potNet, 3000);
   eq('兩人各分攤 1500', lines((await one(c.T, eid))?.shares, c), ['喧 1500', '民 1500']);
 }

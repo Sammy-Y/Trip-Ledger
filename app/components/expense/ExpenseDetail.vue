@@ -21,9 +21,12 @@ const props = withDefaults(defineProps<{
   baseCurrency?: string;
   /** 被蓋章的那次結算是第幾次(列表頁查結算歷史後傳進來)。null = 查不到 */
   roundSeq?: number | null;
+  /** 公費的 member_id。這趟沒設公費時是 null */
+  potId?: string | null;
 }>(), {
   baseCurrency: 'TWD',
   roundSeq: null,
+  potId: null,
 });
 
 defineEmits<{ edit: []; delete: [] }>();
@@ -35,25 +38,29 @@ function nameOf(id: string): string {
 const isPersonal = computed(() => props.expense.kind === 'personal');
 const amountMinor = computed(() => props.expense.amount_minor);
 
+/**
+ * 一列付款 / 分攤。
+ *
+ * 刻意**不帶百分比**:這裡的問題永遠是「我要付多少」,金額就是答案,
+ * 而 50% 是同一個數字換一種比較難用的講法。兩個數字並排的時候,
+ * 眼睛還得先挑出哪個才是要看的那個。合計對不對得上有下面的 mismatch 那行在守,
+ * 不需要靠百分比露出破綻。
+ */
 interface Line {
   key: string;
   /** 成員 id。分攤方式的回推要用它去比對均分的結果,不能只留名字 */
   id: string;
   name: string;
   minor: number;
-  /** 佔「支出金額」的比例。刻意用支出金額當分母,合計對不上時比例也會露出破綻 */
-  pct: number | null;
 }
 
 function toLines(list: Array<{ member_id: string; amount_minor: number }>): Line[] {
-  const total = amountMinor.value;
   return list
     .map((l, i) => ({
       key: `${l.member_id}:${i}`,
       id: l.member_id,
       name: nameOf(l.member_id),
       minor: l.amount_minor,
-      pct: total > 0 ? (l.amount_minor / total) * 100 : null,
     }))
     .sort((a, b) => b.minor - a.minor);
 }
@@ -70,6 +77,31 @@ const shareDiff = computed(() => shareTotal.value - amountMinor.value);
 const singlePayer = computed(() => payerLines.value.length === 1 && payerDiff.value === 0);
 
 /**
+ * 這筆是公費付的 —— 錢直接從信封扣掉。
+ *
+ * 分攤明細對這種帳沒有可以行動的資訊:公費的錢是大家一開始就先拿出來的,
+ * 這一筆花掉之後不是誰墊給誰,只有信封的剩餘變少。把「HSUAN 7,500 /
+ * MIN 7,500」列成一份清單,讀起來像兩個人各自欠了一筆,而那不是這筆帳的意思。
+ * 所以下面用一句話取代那份清單。
+ *
+ * ⚠️ 那句話**不能宣稱「沒有人要再付給誰」**。那只在「大家投入的比例和消耗的
+ * 比例一致」時才成立 —— 投入不均的時候,公費付掉的支出照樣會長出真的人對人
+ * 轉帳(MIN 投 5 萬、HSUAN 投 0、公費花 32,114 均分 → recorded 是
+ * 「HSUAN → MIN 16,057」,按下去會寫進 settlements)。而這個元件只拿得到
+ * **單筆支出**,沒有任何資訊可以下那個結論:它不知道誰投入了多少。
+ * 所以這句話只陳述這一筆做了什麼(從信封扣掉、剩餘變少),
+ * 「所以誰要給誰多少」交給結算頁 —— 那裡才看得到整趟。
+ *
+ * shares 本身沒有被刪掉,也不該刪:它就是每個人從公費消耗了多少,
+ * 直接進每個人的淨額(見 server/utils/ledger.ts)。這裡只是不把它畫成清單。
+ */
+const paidByPot = computed(() => (
+  !!props.potId
+  && payerLines.value.length === 1
+  && payerLines.value[0]!.id === props.potId
+));
+
+/**
  * 分攤方式沒有存在 DB 裡,只能從金額回推。
  *
  * 判定要和編輯表單用**同一條規則**(shared/split.ts 的 splitEqually),
@@ -79,7 +111,7 @@ const singlePayer = computed(() => payerLines.value.length === 1 && payerDiff.va
  */
 const splitHint = computed(() => {
   const lines = shareLines.value;
-  if (isPersonal.value || lines.length < 2) return '';
+  if (isPersonal.value || paidByPot.value || lines.length < 2) return '';
   const equal = splitEqually(amountMinor.value, lines.map((l) => l.id));
   if (!lines.every((l) => equal.get(l.id) === l.minor)) return '自訂金額';
   const values = lines.map((l) => l.minor);
@@ -90,11 +122,6 @@ const splitHint = computed(() => {
     ? `平均分攤,每人 ${formatMoney(min, cur)}`
     : `平均分攤,除不盡的餘數已分配(每人 ${formatMoney(min, cur)} 或 ${formatMoney(max, cur)})`;
 });
-
-function fmtPct(pct: number | null): string {
-  if (pct == null) return '';
-  return `${pct.toFixed(Number.isInteger(pct) ? 0 : 1)}%`;
-}
 
 // ── 匯率(可稽核的關鍵)───────────────────────────────────────
 const isBaseCurrency = computed(() => props.expense.currency === props.baseCurrency);
@@ -185,7 +212,6 @@ const createdText = computed(() => {
         <ul v-if="payerLines.length" class="lines">
           <li v-for="line in payerLines" :key="line.key">
             <span class="truncate">{{ line.name }}</span>
-            <span v-if="payerLines.length > 1" class="pct tnum">{{ fmtPct(line.pct) }}</span>
             <UiMoney :minor="line.minor" :currency="expense.currency" size="sm" />
           </li>
           <li v-if="!singlePayer" class="total">
@@ -205,34 +231,58 @@ const createdText = computed(() => {
         </p>
       </section>
 
-      <!-- ── 誰要分攤 ── -->
+      <!--
+        ── 誰要分攤 ──
+        公費付的那種不列名單:錢是大家一開始就拿出來放進信封的,
+        這一筆花掉之後沒有人要再付給誰,列出來只會讀成「兩個人各欠一筆」。
+      -->
       <section>
         <h4 class="sect-title">
-          <Icon :name="isPersonal ? 'lucide:user' : 'lucide:users'" size="13" />
-          <span>{{ isPersonal ? '記在誰身上' : '誰要分攤' }}</span>
-          <span v-if="!isPersonal && shareLines.length" class="sect-count">{{ shareLines.length }} 人</span>
+          <Icon :name="paidByPot ? 'lucide:piggy-bank' : (isPersonal ? 'lucide:user' : 'lucide:users')" size="13" />
+          <span>{{ paidByPot ? '怎麼算的' : (isPersonal ? '記在誰身上' : '誰要分攤') }}</span>
+          <span v-if="!paidByPot && !isPersonal && shareLines.length" class="sect-count">{{ shareLines.length }} 人</span>
         </h4>
 
-        <ul v-if="shareLines.length" class="lines">
-          <li v-for="line in shareLines" :key="line.key">
-            <span class="truncate">{{ line.name }}</span>
-            <span v-if="shareLines.length > 1" class="pct tnum">{{ fmtPct(line.pct) }}</span>
-            <UiMoney :minor="line.minor" :currency="expense.currency" size="sm" />
-          </li>
-          <li v-if="shareLines.length > 1" class="total">
-            <span>分攤合計</span>
-            <UiMoney :minor="shareTotal" :currency="expense.currency" size="sm" />
-          </li>
-        </ul>
-        <p v-else class="empty">
-          {{ isPersonal ? '沒有指定歸屬。' : '沒有分攤紀錄,這筆不會進結算。' }}
+        <!--
+          `&& shareLines.length` 是刻意的:完全沒有分攤紀錄的公費支出要落回
+          下面那句「沒有分攤紀錄,這筆不會進結算」,不能被這段話蓋掉。
+          (API 兩支端點都驗過合計,所以只有匯入腳本 / 手動 SQL 造得出這種列 ——
+           而那正是 findUnbalancedExpenses 存在的理由,畫面不能反而變成一片正常。)
+        -->
+        <p v-if="paidByPot && shareLines.length" class="text-sm leading-relaxed text-[var(--text-muted)]">
+          直接從{{ payerLines[0]?.name }}扣掉,不是誰先墊的 ——
+          這筆會讓{{ payerLines[0]?.name }}的剩餘少
+          <UiMoney :minor="amountMinor" :currency="expense.currency" size="sm" />,
+          由 {{ shareLines.length }} 個人一起用掉。
+          <span class="block mt-1">誰最後要付給誰,看「結算」—— 那要看整趟每個人投入多少。</span>
         </p>
+
+        <template v-else>
+          <ul v-if="shareLines.length" class="lines">
+            <li v-for="line in shareLines" :key="line.key">
+              <span class="truncate">{{ line.name }}</span>
+              <UiMoney :minor="line.minor" :currency="expense.currency" size="sm" />
+            </li>
+            <li v-if="shareLines.length > 1" class="total">
+              <span>分攤合計</span>
+              <UiMoney :minor="shareTotal" :currency="expense.currency" size="sm" />
+            </li>
+          </ul>
+          <p v-else class="empty">
+            {{ isPersonal ? '沒有指定歸屬。' : '沒有分攤紀錄,這筆不會進結算。' }}
+          </p>
+        </template>
 
         <p v-if="splitHint" class="mt-1.5 text-[0.6875rem] text-[var(--text-muted)]">
           {{ splitHint }}
         </p>
 
-        <p v-if="shareDiff !== 0 && shareLines.length" class="mismatch">
+        <!--
+          `|| paidByPot`:公費那條分支不畫清單,所以「沒有 shares」不再有
+          任何畫面說得出來,警告是唯一的線索。少了它,一筆壞掉的公費支出
+          在明細頁看起來會完全正常,而結算頁那邊已經被 blocked_reason 擋死了。
+        -->
+        <p v-if="shareDiff !== 0 && (shareLines.length || paidByPot)" class="mismatch">
           <Icon name="lucide:triangle-alert" size="13" class="mt-0.5 shrink-0" />
           <span>
             分攤合計比支出金額
@@ -400,11 +450,6 @@ const createdText = computed(() => {
 .lines > li > :last-child {
   margin-left: auto;
   text-align: right;
-}
-.pct {
-  flex-shrink: 0;
-  font-size: 0.6875rem;
-  color: var(--text-muted);
 }
 .lines > li.total {
   margin-top: 0.25rem;

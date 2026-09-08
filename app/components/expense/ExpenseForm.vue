@@ -95,18 +95,51 @@ const amountMinor = computed(() =>
  */
 const fromPot = ref(false);
 
+/**
+ * applyInitial 正在把既有支出灌回表單 —— 這段期間 fromPot 的連動要靜音。
+ *
+ * 用普通變數而不是 ref:它只在同一個同步區塊內被讀寫(設 true → 改 fromPot →
+ * 下面那個 watcher 以 flush:'pre' 在同一輪跑完 → nextTick 設回 false),
+ * 做成 ref 只會多一份沒有人訂閱的響應式依賴。
+ */
+let potSyncSuspended = false;
+
 /** 切到個人花費、或這趟根本沒設公費時,這個開關要自動關掉 */
 watch([kind, pot], () => {
   if (kind.value !== 'shared' || !pot.value) fromPot.value = false;
 });
 
 watch([fromPot, pot, people, kind], () => {
+  // applyInitial 開開關的那一拍要跳過:那筆帳的付款人與分攤已經是正確的值,
+  // 這裡再套一次會把它改寫成「全員均分」(見 applyInitial 的說明)。
+  if (potSyncSuspended) return;
   if (!fromPot.value || kind.value !== 'shared') return;
   const potId = pot.value?.id;
   if (!potId) return;
   payers.value = [{ member_id: potId, amount: null }];
   split.value = { ...split.value, mode: 'equal', members: people.value.map((m) => m.id) };
 });
+
+/**
+ * 「誰付的錢」可以挑誰 —— **只有真人**。
+ *
+ * 公費要付錢走下面那個「這筆從{公費}付」的開關,不在人名列裡挑。
+ * 兩個入口並存的時候,公費會以一顆和真人長得一模一樣的 chip 出現在付款人列中,
+ * 使用者只能從名字猜出它不是人;而且挑了它之後分攤欄仍然要自己填,
+ * 做出來的東西和開關做的並不一樣(開關會連分攤一起鎖成全員均分)。
+ * 同一件事有兩條會得到不同結果的路徑,那條沒有護欄的就是純粹的多餘。
+ *
+ * 唯一的例外是「這筆帳現在真的掛在公費名下、但開關沒開」——
+ * 也就是多人墊款其中一位是公費(只有直接打 API 造得出來)。名單裡不放它的話,
+ * PayerEditor 的成員 watcher 會把它從草稿裡默默刪掉,使用者一進編輯
+ * 就看到「還差 X 沒有人認」,而畫面上完全看不出少的是誰。
+ */
+const payerChoices = computed<Member[]>(() => {
+  const p = pot.value;
+  if (!p || fromPot.value) return people.value;
+  return payers.value.some((x) => x.member_id === p.id) ? props.members : people.value;
+});
+
 
 // ── 付款試算 ──
 const payerSummary = computed(() => {
@@ -192,6 +225,39 @@ function onSubmit() {
   emit('submit', buildPayload());
 }
 
+// ── 連續記帳 ────────────────────────────────────────────────
+const descriptionField = ref<{ focus: () => void } | null>(null);
+
+/**
+ * 記完一筆之後把表單準備好記下一筆。**呼叫端是「記一筆」那頁**(編輯不會用到)。
+ *
+ * 分成兩堆,判準是「這個欄位換一筆之後還會不會是同一個值」:
+ *
+ *   清掉  說明 / 金額 / 分類 / 備註 / 覆寫匯率
+ *         這些是「這一筆是什麼」。留著等於把上一筆的內容偷偷掛到下一筆上,
+ *         而使用者只會檢查自己剛打的那格。覆寫匯率尤其危險 —— 它是照著
+ *         某一張信用卡帳單填的,套到下一筆就是一個沒人會發現的錯誤匯率。
+ *
+ *   留著  幣別 / 日期 / 付款方式 / 共同或個人 / 付款人 / 分攤 / 公費開關 / 換匯加成
+ *         這些是「現在在什麼情境記帳」。在京都的居酒屋連記三筆,幣別、日期、
+ *         誰付的、幾個人分,三次都一樣 —— 每記一筆就重設一次,等於逼使用者
+ *         把同樣的東西再點三遍,那正是這個功能要解決的問題。
+ *
+ * (使用者明確要求過幣別不要跳回預設值;上面那條規則把它一起涵蓋了。)
+ */
+function startNextEntry(): void {
+  description.value = '';
+  amountInput.value = null;
+  category.value = '';
+  note.value = '';
+  fxOverride.value = null;
+  showAdvanced.value = false;
+  // 手機上點完送出鍵盤會收起來,focus 回說明欄可以直接接著打下一筆。
+  nextTick(() => descriptionField.value?.focus());
+}
+
+defineExpose({ startNextEntry });
+
 const isForeign = computed(() => currency.value !== props.baseCurrency);
 const amountStep = computed(() => (EXPONENT[currency.value] === 0 ? '1' : '0.01'));
 
@@ -275,8 +341,9 @@ const submitText = computed(() => props.submitLabel || '記下這筆');
  *
  * 兩個已知失真,**都是預期行為,不是 bug**:
  *
- *  1. 原本選「按份數」(2:1:1)的,進來會顯示成「指定金額」。
- *     份數本身沒有被存下來,救不回來。
+ *  1. 舊資料裡原本選「按份數」(2:1:1)的,進來會顯示成「指定金額」。
+ *     份數本身沒有被存下來,救不回來 —— 而且表單已經不再提供那個模式
+ *     (見 SplitEditor 的說明),所以這條只會發生在改動之前記的帳上。
  *  2. 原本用「指定金額」手動填出剛好等於均分的數字,進來會顯示成「均分」。
  *
  * 兩種情況下畫面顯示的每人金額都和 DB 一模一樣,直接按儲存也不會改動任何數字 ——
@@ -358,11 +425,29 @@ function applyInitial(src: Expense): void {
   split.value = inferSplit(src);
 
   /**
-   * 公費開關刻意保持關閉,即使這筆真的是公費付的。
-   * fromPot 會**鎖住**付款人與分攤並強制改寫成「公費付、全員均分」——
-   * 猜錯(例如公費付但只有兩個人分攤)就等於在使用者沒動手的情況下改掉他的帳。
-   * 資料本身已經正確帶進來了,要重新套用公費規則,自己勾一下就好。
+   * 公費開關:這筆真的是公費付的就打開它。
+   *
+   * 以前這裡刻意保持關閉,理由是 fromPot 會**改寫**付款人與分攤成
+   * 「公費付、全員均分」—— 猜錯(公費付但只有兩個人分攤)等於在使用者
+   * 沒動手的情況下改掉他的帳。那個顧慮是對的,但關掉開關的代價更大:
+   * 付款人選單現在只放真人(見 payerChoices),開關關著的話這筆帳的付款人
+   * 就變成一個選單裡不存在的選項,而畫面上還同時顯示「這筆從公費付」沒有勾。
+   *
+   * 所以改成「打開開關,但擋掉那一次改寫」——potSyncSuspended 讓連動的
+   * watcher 跳過這一拍,載進來的 payers / shares 原封不動。使用者不動手的話
+   * 送出去的還是同一筆數字;真的想重新套用公費規則,取消勾選再勾一次就會生效。
+   *
+   * 判定用「單一付款人而且就是公費」。多人墊款其中一位是公費(只有直接打 API
+   * 造得出來)不算 —— 那種形狀沒辦法用這個開關表達,交給 payerChoices 的
+   * 例外分支把公費留在選單裡。
    */
+  const potId = pot.value?.id;
+  const paidByPot = !!potId && paid.length === 1 && paid[0]!.member_id === potId;
+  if (fromPot.value !== paidByPot) {
+    potSyncSuspended = true;
+    fromPot.value = paidByPot;
+    nextTick(() => { potSyncSuspended = false; });
+  }
 }
 
 /**
@@ -393,7 +478,9 @@ watch(() => props.initial, (src) => {
     </div>
 
     <div class="card p-4 space-y-4">
-      <UiAppField v-model="description" label="說明" placeholder="例如:3/8 吃飯" required />
+      <UiAppField
+        ref="descriptionField"
+        v-model="description" label="說明" placeholder="例如:3/8 吃飯" required />
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <UiAppField
@@ -493,7 +580,7 @@ watch(() => props.initial, (src) => {
 
     <ExpensePayerEditor
       v-if="!fromPot"
-      v-model="payers" :members="members" :currency="currency"
+      v-model="payers" :members="payerChoices" :currency="currency"
       :amount-minor="amountMinor" :summary="payerSummary" />
 
     <ExpenseSplitEditor

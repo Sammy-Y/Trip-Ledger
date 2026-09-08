@@ -20,7 +20,8 @@
  * 各組尤其在盯:
  *
  *   ① 公費永遠不會被結算清空(deferred 絕不寫入)
- *   ② 公費先幫人墊過款之後,不會再叫另一個人付一次
+ *   ② 大家投進信封的錢算在他們自己頭上 —— 先付過錢的人不會被算成欠錢
+ *      (淨額含投入 / 退還,見 server/utils/ledger.ts)
  *   ③ 使用者自己記的還款會被吸收,不會吐出反方向的轉帳(付款/反轉無限來回)
  *   ④ 連續兩回合不會互相反轉
  *   ⑤ 撤銷是精確的反運算,而且不會消滅手動記的還款
@@ -254,13 +255,14 @@ group('[1] 沒有公費的正常流程:算對、蓋章、不能結第二次');
 group('[2] 公費永遠不會被結算清空(招牌案例)');
 // ═══════════════════════════════════════════════════════════════
 //
-// 淨額不含投入/退還(見 server/utils/ledger.ts 開頭),所以公費淨額 = +公費花費,
-// 它的腿長成「人 → 公費」= 「這個人還要投入多少」。照 minCashFlow 寫下去
-// 等於幫他記了一筆他沒付的投入 —— 信封裡憑空多出錢,總覽的剩餘就開始說謊。
-// 所以任一端是公費的轉帳一律是 deferred:只顯示,永遠不寫入。
+// 兩人各投 ¥10,000、公費花掉 ¥10,000 均分 —— 每個人先付了 1 萬、消費 5 千,
+// 所以信封裡還有 ¥10,000 是他們的。淨額含投入(見 server/utils/ledger.ts),
+// 於是公費淨額 = −剩餘 = −10,000,它的腿長成「公費 → 人」=「結束時退還多少」。
 //
-// (舊語意下這條腿是反方向的「公費 → 人」,寫下去等於第一晚就把信封清空退還。
-//  方向反了,結論一樣。這一組守的就是「不管方向,公費的腿都不寫」。)
+// 照 minCashFlow 寫下去等於**第一晚就把信封清空退還**,而那筆錢明天還要買門票。
+// 所以任一端是公費的轉帳一律是 deferred:只顯示,永遠不寫入。
+// (超支的時候腿會反過來變成「人 → 公費」,寫下去則是幫人記一筆他沒付的投入。
+//  方向相反,結論一樣 —— 這一組守的就是「不管方向,公費的腿都不寫」。)
 {
   const c = await mkTrip('R2 公費不可清空', ['民', '喧'], '公費');
   const moves = await potMoves(c.T, {
@@ -285,13 +287,13 @@ group('[2] 公費永遠不會被結算清空(招牌案例)');
   // 招牌斷言:公費的腿只出現在 deferred,recorded 必須是空的
   check('recorded 是一個陣列', Array.isArray(pv.b.recorded), JSON.stringify(pv.b.recorded));
   eq('recorded 是空的(沒有人需要互轉)', fmt(pv.b.recorded, c), []);
-  eq('deferred 是各人 → 公費 ¥5,000 兩筆(=「還要投入多少」)',
-    fmt(pv.b.deferred, c), ['喧→公費 5000', '民→公費 5000']);
+  eq('deferred 是公費 → 各人 ¥5,000 兩筆(=「結束時退還多少」)',
+    fmt(pv.b.deferred, c), ['公費→喧 5000', '公費→民 5000']);
 
   const before = await netsOf(c.T, 'JPY');
   const potBefore = JSON.stringify(potBlock(before.bal, 'JPY'));
-  eq('結算前 公費淨額 +10,000(= 公費花掉的錢,投入不算)', before.map.get(c.id['公費']), 10000);
-  eq('結算前 民 −5,000(他分攤了 5,000)', before.map.get(c.id['民']), -5000);
+  eq('結算前 公費淨額 −10,000(= −剩餘,信封裡還有這麼多)', before.map.get(c.id['公費']), -10000);
+  eq('結算前 民 +5,000(投入 10,000 − 分攤 5,000)', before.map.get(c.id['民']), 5000);
   eq('結算前 settlements 只有兩筆投入', countSettlements(c.tripId), 2);
 
   const closed = await post(`/api/trips/${c.T}/rounds`, { currency: 'JPY' });
@@ -311,12 +313,13 @@ group('[2] 公費永遠不會被結算清空(招牌案例)');
   eq('投入 ¥20,000', pb?.contributedMinor, 20000);
   eq('已支出 ¥10,000', pb?.spentMinor, 10000);
   eq('已退還 ¥0', pb?.refundedMinor, 0);
-  eq('剩餘 ¥10,000(錢還在信封裡 —— 這個數字只在總覽頁)', pb?.remainingMinor, 10000);
-  eq('公費淨額還是 +10,000', after.map.get(c.id['公費']), 10000);
-  eq('公費淨額 = 公費花費', after.map.get(c.id['公費']), pb?.spentMinor);
-  eq('Σ(真人淨額) = −公費花費',
+  eq('剩餘 ¥10,000(錢還在信封裡)', pb?.remainingMinor, 10000);
+  eq('公費淨額還是 −10,000', after.map.get(c.id['公費']), -10000);
+  // 支點不變量,兩條獨立路徑算同一個數字(potSummary 的三個 SUM vs netBalances)
+  eq('公費淨額 = −剩餘', after.map.get(c.id['公費']), -(pb?.remainingMinor ?? 0));
+  eq('Σ(真人淨額) = 剩餘',
     after.rows.filter((n) => n.memberId !== c.id['公費']).reduce((s, n) => s + n.netMinor, 0),
-    -(pb?.spentMinor ?? 0));
+    pb?.remainingMinor ?? 0);
 
   // 蓋章照樣要蓋 —— 明細已經看過了,下次預覽不該再列出來
   const stamps = await stampMap(c.T);
@@ -328,15 +331,18 @@ group('[2] 公費永遠不會被結算清空(招牌案例)');
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[3] 出資不平均:債改走公費,不再是人對人');
+group('[3] 出資不平均:債留在人跟人之間,信封只退它手上的');
 // ═══════════════════════════════════════════════════════════════
 //
 // 民出了全部的公費、喧一毛沒出,兩人卻平均花掉。
 //
-// ⚠️ 這一組的期望值因為新語意**整組換掉了**,而且換的方向最容易被誤判成 bug:
-// 舊語意 recorded = 喧→民 ¥5,000(人對人);新語意 recorded 是**空的**,
-// 喧那 ¥5,000 變成他對公費的欠款(deferred)—— 他去總覽投入,公費再退給民。
-// 債沒有消失,只是路由改成經過信封。下面把整條路徑的錢算完,證明分毫對得上。
+// 這一組是整套語意的重點:公費花的錢由信封吸收,**但出資不均的債不會被吸收掉**。
+// 民 投 ¥20,000、公費花 ¥10,000 均分 → 民 +15,000 / 喧 −5,000 / 公費 −10,000。
+// recorded 是「喧 → 民 ¥5,000」(真的會寫進 settlements),
+// deferred 是「公費 → 民 ¥10,000」(結束時退還,永遠不寫)。
+//
+// 少算投入的話這一組會變成 民 −5,000 / 喧 −5,000 —— 出了全部錢的那個人
+// 被算成欠錢,而且 recorded 空了、喧 一毛都不用付。那是這次改動要修掉的症狀。
 {
   const c = await mkTrip('R3 出資不平均', ['民', '喧'], '公費');
   eq('民投入 ¥20,000 → 201',
@@ -352,58 +358,44 @@ group('[3] 出資不平均:債改走公費,不再是人對人');
   })).status, 201);
 
   const pv = await preview(c.T, 'JPY');
-  // 民 投入的 ¥20,000 不進淨額,所以他和喧看起來一樣:各分攤了 ¥5,000 還沒付。
-  eq('淨額:民 −5,000', pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, -5000);
+  // 民:投入 20,000 − 分攤 5,000 = +15,000。喧:只分攤了 5,000 → −5,000。
+  eq('淨額:民 +15,000', pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, 15000);
   eq('淨額:喧 −5,000', pv.b.nets?.find((n: J) => n.memberId === c.id['喧'])?.netMinor, -5000);
-  eq('淨額:公費 +10,000(= 它花掉的錢)',
-    pv.b.nets?.find((n: J) => n.memberId === c.id['公費'])?.netMinor, 10000);
+  eq('淨額:公費 −10,000(= −剩餘)',
+    pv.b.nets?.find((n: J) => n.memberId === c.id['公費'])?.netMinor, -10000);
   eq('淨額總和 0', (pv.b.nets ?? []).reduce((s: number, n: J) => s + n.netMinor, 0), 0);
 
   const closed = await post(`/api/trips/${c.T}/rounds`, { currency: 'JPY' });
   eq('關閉回合 → 201', closed.status, 201);
-  // 核心斷言:回合不再寫人對人的轉帳,而且**一列 settlement 都不寫**。
-  eq('recorded 是空的(喧的債改走公費)', fmt(closed.json.recorded, c), []);
-  eq('公費的腿留在 deferred:兩人各還要投入 ¥5,000',
-    fmt(closed.json.deferred, c), ['喧→公費 5000', '民→公費 5000']);
-  eq('一列 source=round 都沒寫', countSettlements(c.tripId, 'round'), 0);
+  // 核心斷言:喧 欠的是**民**,不是信封 —— 這一筆會真的被寫下去。
+  eq('recorded:喧→民 ¥5,000', fmt(closed.json.recorded, c), ['喧→民 5000']);
+  eq('deferred:公費 → 民 ¥10,000(結束時退還,永遠不寫)',
+    fmt(closed.json.deferred, c), ['公費→民 10000']);
+  eq('寫了 1 列 source=round', countSettlements(c.tripId, 'round'), 1);
 
   const after = await netsOf(c.T, 'JPY');
   const pb = potBlock(after.bal, 'JPY');
   eq('公費投入還是 ¥20,000', pb?.contributedMinor, 20000);
   eq('公費已退還 ¥0', pb?.refundedMinor, 0);
-  eq('公費剩餘還是 ¥10,000', pb?.remainingMinor, 10000);
-  eq('結算後 民 還是 −5,000(他投入的 20,000 在總覽頁,不在這裡)',
-    after.map.get(c.id['民']), -5000);
-  eq('結算後 喧 還是 −5,000', after.map.get(c.id['喧']), -5000);
-  eq('結算後 公費 還是 +10,000', after.map.get(c.id['公費']), 10000);
+  eq('公費剩餘還是 ¥10,000(結算沒碰信封)', pb?.remainingMinor, 10000);
+  eq('結算後 民 +10,000(收了喧 5,000,剩下的在信封裡)', after.map.get(c.id['民']), 10000);
+  eq('結算後 喧 歸零', after.map.get(c.id['喧']) ?? 0, 0);
+  eq('結算後 公費 還是 −10,000', after.map.get(c.id['公費']), -10000);
 
-  // ── 債沒有消失:把喧的欠款照新語意走完,錢要對得上 ──────────
-  // 喧 照他的淨額投入 ¥5,000 → 信封 10,000 + 5,000 = 15,000 → 全額退還給民。
-  eq('喧 投入 ¥5,000 → 201', (await potMoves(c.T, {
-    direction: 'in', currency: 'JPY',
-    entries: [{ member_id: c.id['喧'], amount_minor: 5000 }],
-  })).status, 201);
-  const mid = potBlock((await get(`/api/trips/${c.T}/balance`)).json, 'JPY');
-  eq('信封現在有 ¥15,000', mid?.remainingMinor, 15000);
-  eq('喧 投入之後淨額**沒變**(投入不是還款)',
-    (await netsOf(c.T, 'JPY')).map.get(c.id['喧']), -5000);
-
-  eq('公費退還民 ¥15,000 → 201', (await potMoves(c.T, {
+  // ── 旅程結束:信封把手上的 ¥10,000 退還給民,全部歸零 ──────────
+  eq('公費退還民 ¥10,000 → 201', (await potMoves(c.T, {
     direction: 'out', currency: 'JPY',
-    entries: [{ member_id: c.id['民'], amount_minor: 15000 }],
+    entries: [{ member_id: c.id['民'], amount_minor: 10000 }],
   })).status, 201);
   const end = potBlock((await get(`/api/trips/${c.T}/balance`)).json, 'JPY');
   eq('信封清空', end?.remainingMinor, 0);
-  eq('投入合計 ¥25,000(民 20,000 + 喧 5,000)', end?.contributedMinor, 25000);
-  eq('退還合計 ¥15,000(全部給民)', end?.refundedMinor, 15000);
-  // 民 實際掏出 20,000 − 15,000 = 5,000;喧 實際掏出 5,000 —— 各自剛好是他該分攤的。
-  eq('民 實際掏出 ¥5,000', 20000 - 15000, 5000);
-  eq('兩人實付合計 = 公費花費', (20000 - 15000) + 5000, end?.spentMinor);
-  // 淨額完全沒被這兩筆金流動到 —— 這是新語意的定義,也是這一組最後的守門。
+
   const final = await netsOf(c.T, 'JPY');
-  eq('走完整條路徑後淨額依然是 −5000 / −5000 / +10000',
-    [c.id['民'], c.id['喧'], c.id['公費']].map((m) => final.map.get(m) ?? 0),
-    [-5000, -5000, 10000]);
+  eq('全部歸零', final.rows.filter((n) => n.netMinor !== 0).length, 0);
+  // 民:掏 20,000 − 收喧 5,000 − 領回 10,000 = 5,000;喧:付民 5,000。各自剛好是他該分攤的。
+  eq('民 實際掏出 ¥5,000', 20000 - 5000 - 10000, 5000);
+  eq('喧 實際掏出 ¥5,000', 5000, 5000);
+  eq('兩人實付合計 = 公費花費', (20000 - 5000 - 10000) + 5000, end?.spentMinor);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -412,19 +404,13 @@ group('[4] 公費補過墊款之後,兩本帳各自結、加起來不多不少')
 //
 // 民先自己墊晚餐 ¥6,000,公費隨後把 ¥6,000 還給民。
 //
-// ⚠️ 這一組的期望值也因為新語意換掉了,而且它的**原本用途消失了**:
-// 舊版這組叫「殺掉子集算術」—— 舊語意下公費的退還會抵掉人對人的債,
-// 所以 recorded 是空的,而子集算術會錯誤地開出 喧→民 ¥3,000。
-// 新語意下退還不進淨額,所以正確答案**就是** 喧→民 ¥3,000 ——
-// 這個場景再也分不出「整趟」和「子集」的差別了。
-// (子集算術的守門改由 [5] 吸收手動還款、[6] 連續兩回合負責:
-//  那兩組用的是人對人的還款,而人對人的還款仍然在算術範圍裡。)
-//
-// 所以這組現在守的是另一件更難的事:**新語意把一本帳拆成兩本**
-//   ① 人的帳(nets)   誰為共同花費多墊了錢
-//   ② 信封的帳(pot)  誰投入多少、拿回多少
-// 兩本各自結完,每個人實際掏出的錢必須剛好等於他該分攤的。
-// 「喧 是不是被多收了一次」的答案在這裡:不是 —— 他多付的那筆從信封拿回來。
+// 這一組守的是**兩本帳合起來的結果**:
+//   ① 人的帳(nets)   誰為共同花費多墊了錢、誰多投了錢進信封
+//   ② 信封的帳(pot)  投入 − 花掉 − 退還 = 手上還有多少
+// 兩人各投 5,000、晚餐 6,000 均分、民 從信封領回他墊的 6,000 ——
+// 走完之後兩個人都還有 2,000 卡在信封裡,而且**彼此不欠**。
+// 「喧 是不是被多收了一次」的答案在這裡:不是 —— recorded 是空的,
+// 他多付的那筆會從信封拿回來。
 {
   const c = await mkTrip('R4 公費墊款', ['民', '喧'], '公費');
   eq('兩人各投入 ¥5,000 → 201', (await potMoves(c.T, {
@@ -446,57 +432,54 @@ group('[4] 公費補過墊款之後,兩本帳各自結、加起來不多不少')
 
   const pv = await preview(c.T, 'JPY');
   eq('明細還是列著那筆晚餐', pv.b.item_count, 1);
-  // 民:墊 6,000 − 分攤 3,000 = +3,000(投入 5,000 與收到的 6,000 退還都不算)
-  // 喧:分攤 3,000,沒墊過 → −3,000。公費:一毛都沒付過 shared 支出 → 0 → 不在 nets 裡。
-  eq('淨額:民 +3,000', pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, 3000);
-  eq('淨額:喧 −3,000', pv.b.nets?.find((n: J) => n.memberId === c.id['喧'])?.netMinor, -3000);
-  check('公費不在淨額裡(它沒有付過任何共同支出)',
-    !(pv.b.nets ?? []).some((n: J) => n.memberId === c.id['公費']), JSON.stringify(pv.b.nets));
+  // 民:墊 6,000 − 分攤 3,000 + 投入 5,000 − 領回 6,000 = +2,000
+  // 喧:− 分攤 3,000 + 投入 5,000 = +2,000
+  // 公費:退還 6,000 − 收到投入 10,000 = −4,000(= −剩餘)
+  eq('淨額:民 +2,000', pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, 2000);
+  eq('淨額:喧 +2,000', pv.b.nets?.find((n: J) => n.memberId === c.id['喧'])?.netMinor, 2000);
+  eq('淨額:公費 −4,000', pv.b.nets?.find((n: J) => n.memberId === c.id['公費'])?.netMinor, -4000);
 
   const closed = await post(`/api/trips/${c.T}/rounds`, { currency: 'JPY' });
   eq('關閉回合 → 201', closed.status, 201);
-  const rec = (closed.json.recorded ?? []) as J[];
   check('回合有回傳 recorded 陣列', Array.isArray(closed.json.recorded), JSON.stringify(closed.json.recorded));
-  eq('人的帳:喧→民 ¥3,000(他分攤的那一半)', fmt(rec, c), ['喧→民 3000']);
-  eq('寫了 1 列 source=round', countSettlements(c.tripId, 'round'), 1);
-  eq('沒有公費的腿(公費一毛共同支出都沒付)', fmt(closed.json.deferred, c), []);
+  // 兩個人都是債權人,誰也不欠誰 —— 錢全在信封那邊。
+  eq('人的帳:沒有人要轉帳給誰', fmt(closed.json.recorded, c), []);
+  eq('一列 source=round 都沒寫', countSettlements(c.tripId, 'round'), 0);
+  eq('deferred:信封各退 ¥2,000', fmt(closed.json.deferred, c),
+    ['公費→喧 2000', '公費→民 2000']);
 
   const after = await netsOf(c.T, 'JPY');
   const pb = potBlock(after.bal, 'JPY');
   eq('公費花費 ¥0', pb?.spentMinor, 0);
   eq('公費剩餘 ¥4,000(10,000 投入 − 6,000 退還)', pb?.remainingMinor, 4000);
-  eq('人的帳結清了(淨額全歸零)', after.rows.filter((n) => n.netMinor !== 0).length, 0);
+  eq('公費淨額 = −剩餘', after.map.get(c.id['公費']), -4000);
+  eq('Σ(真人淨額) = 剩餘',
+    after.rows.filter((n) => n.memberId !== c.id['公費']).reduce((s, n) => s + n.netMinor, 0), 4000);
   eq('晚餐蓋章了', (await stampMap(c.T)).get('晚餐'), closed.json.id);
 
   // ── 信封的帳:誰投入多少、拿回多少 ──────────────────────────
-  // 民 投 5,000 卻拿回 6,000 → 他從信封多領了 1,000;喧 投 5,000 一毛沒拿。
-  // 信封手上剩 4,000,而喧 應得 5,000 —— 差的 1,000 就是民 多領的那筆。
   eq('投入:各 ¥5,000',
     (pb?.contributions ?? []).map((x: J) => `${c.name(x.memberId)} ${x.amountMinor}`).sort(),
     ['喧 5000', '民 5000']);
   eq('退還:民 ¥6,000', (pb?.refunds ?? []).map((x: J) => `${c.name(x.memberId)} ${x.amountMinor}`),
     ['民 6000']);
 
-  eq('民 把多領的 ¥1,000 放回信封 → 201', (await potMoves(c.T, {
-    direction: 'in', currency: 'JPY',
-    entries: [{ member_id: c.id['民'], amount_minor: 1000 }],
-  })).status, 201);
-  eq('公費退還喧 ¥5,000 → 201', (await potMoves(c.T, {
+  // ── 旅程結束:照 deferred 各退 ¥2,000 ────────────────────────
+  eq('公費各退 ¥2,000 → 201', (await potMoves(c.T, {
     direction: 'out', currency: 'JPY',
-    entries: [{ member_id: c.id['喧'], amount_minor: 5000 }],
+    entries: [{ member_id: c.id['民'], amount_minor: 2000 }, { member_id: c.id['喧'], amount_minor: 2000 }],
   })).status, 201);
   const end = potBlock((await get(`/api/trips/${c.T}/balance`)).json, 'JPY');
   eq('信封清空', end?.remainingMinor, 0);
 
   // ── 兩本帳加起來:每個人實際掏出的錢 = 他該分攤的 ¥3,000 ──────
-  // 民:投 5,000 + 補 1,000 + 墊晚餐 6,000 − 領回 6,000 − 收喧 3,000 = 3,000
-  // 喧:投 5,000 + 付民 3,000 − 領回 5,000 = 3,000
-  eq('民 實際掏出 ¥3,000', 5000 + 1000 + 6000 - 6000 - 3000, 3000);
-  eq('喧 實際掏出 ¥3,000', 5000 + 3000 - 5000, 3000);
+  // 民:投 5,000 + 墊晚餐 6,000 − 領回 6,000 − 領回 2,000 = 3,000
+  // 喧:投 5,000 − 領回 2,000 = 3,000
+  eq('民 實際掏出 ¥3,000', 5000 + 6000 - 6000 - 2000, 3000);
+  eq('喧 實際掏出 ¥3,000', 5000 - 2000, 3000);
   eq('兩人合計 = 晚餐 ¥6,000', 3000 + 3000, 6000);
   // 「喧 被多收一次」會長成他實際掏出 6,000 —— 上面那條就是這件事的守門。
-  eq('淨額仍然全歸零(退還沒有把已結的帳弄回來)',
-    (await netsOf(c.T, 'JPY')).rows.filter((n) => n.netMinor !== 0).length, 0);
+  eq('淨額全歸零', (await netsOf(c.T, 'JPY')).rows.filter((n) => n.netMinor !== 0).length, 0);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -600,10 +583,9 @@ group('[7] 撤銷是精確的反運算');
     payers: [{ member_id: c.id['公費'] }],
     split: { mode: 'equal', members: [c.id['民'], c.id['喧']] },
   })).status, 201);
-  // ⚠️ 計程車刻意是 ¥8,000(舊版是 ¥2,000)。新語意下投入不進淨額,所以
-  // 「民 投了 10,000」不再讓他變債權人 —— 金額太小的話兩個人都是債務人、
-  // recorded 會是空的,這一組就測不到「撤銷會刪掉轉帳」那半邊了。
-  // 要有人對人的轉帳可撤,就得真的有人自掏腰包超過他該分攤的。
+  // ⚠️ 計程車是 ¥8,000 而不是隨手一個小數字:這一組要測「撤銷會刪掉轉帳」,
+  // 所以 recorded 不能是空的。喧 一毛沒出、民 又投了 10,000 又墊了車錢,
+  // 兩個人的淨額必須落在相反的號誌上才會長出人對人的那條腿。
   eq('民墊計程車 ¥8,000 → 201', (await shared(c.T, {
     description: '計程車', currency: 'JPY', amount: 8000,
     payers: [{ member_id: c.id['民'] }],
@@ -616,9 +598,10 @@ group('[7] 撤銷是精確的反運算');
 
   const closed = await post(`/api/trips/${c.T}/rounds`, { currency: 'JPY' });
   eq('關閉回合 → 201', closed.status, 201);
-  // 民 墊 8,000 − 分攤 7,000 = +1,000;喧 −7,000;公費 +6,000(它花掉的錢)。
-  eq('寫下 喧→民 ¥1,000', fmt(closed.json.recorded, c), ['喧→民 1000']);
-  eq('公費的腿:喧 還要投入 ¥6,000', fmt(closed.json.deferred, c), ['喧→公費 6000']);
+  // 民:墊 8,000 − 分攤 7,000 + 投入 10,000 = +11,000
+  // 喧:− 分攤 7,000 = −7,000。公費:付掉 6,000 − 收到 10,000 = −4,000(= −剩餘)。
+  eq('寫下 喧→民 ¥7,000', fmt(closed.json.recorded, c), ['喧→民 7000']);
+  eq('公費的腿:結束時退還民 ¥4,000', fmt(closed.json.deferred, c), ['公費→民 4000']);
   eq('結算後多了一列', settlementIds(c.tripId)?.length, 2);
   const stampedNow = await stampMap(c.T);
   eq('晚餐蓋章', stampedNow.get('晚餐'), closed.json.id);
@@ -639,7 +622,7 @@ group('[7] 撤銷是精確的反運算');
   eq('計程車的章拆掉了', stampsAfter.get('計程車'), null);
   const pvAfter = await preview(c.T, 'JPY');
   eq('撤銷後兩筆明細又回到未結清單', pvAfter.b.item_count, 2);
-  eq('撤銷後又建議 喧→民 ¥1,000', fmt(pvAfter.b.recorded, c), ['喧→民 1000']);
+  eq('撤銷後又建議 喧→民 ¥7,000', fmt(pvAfter.b.recorded, c), ['喧→民 7000']);
 
   const twice = await del(`/api/trips/${c.T}/rounds/${closed.json.id}`);
   eq('撤銷第二次 → 409', twice.status, 409);
@@ -657,7 +640,7 @@ group('[7] 撤銷是精確的反運算');
   const again = await post(`/api/trips/${c.T}/rounds`, { currency: 'JPY' });
   eq('撤銷後重新結算 → 201', again.status, 201);
   eq('seq 前進到 2(撤銷不回收序號)', again.json.seq, 2);
-  eq('重結的金額一樣是 喧→民 ¥1,000', fmt(again.json.recorded, c), ['喧→民 1000']);
+  eq('重結的金額一樣是 喧→民 ¥7,000', fmt(again.json.recorded, c), ['喧→民 7000']);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -916,7 +899,7 @@ group('[13] 寫入時的成員驗證(以前三種輸入都會回 201 然後靜�
 // ═══════════════════════════════════════════════════════════════
 //
 //  1. 公費當個人花費的付款人 → 公費付了錢卻沒人分攤,
-//     「公費淨額 = 公費花費」直接破掉(差額等於該筆全額)——
+//     「公費淨額 = −剩餘」直接破掉(差額等於該筆全額)——
 //     剩餘說公費花掉了,卻沒有任何人的淨額欠著它。
 //  2. 公費出現在分攤名單 → 它自己欠自己,結算會冒出莫名的公費轉帳。
 //  3. 付款人/分攤人是**別的旅程**的成員 id → 那些列進得去,
@@ -1002,7 +985,7 @@ group('[13] 寫入時的成員驗證(以前三種輸入都會回 201 然後靜�
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[14] GET /rounds/:id 明細:「這 ¥5,500 是怎麼算出來的」');
+group('[14] GET /rounds/:id 明細:「這 ¥15,500 是怎麼算出來的」');
 // ═══════════════════════════════════════════════════════════════
 //
 // nets 是**快照**而不是即時重算 —— 之後有人補登支出、改名字、刪帳,
@@ -1023,10 +1006,8 @@ group('[14] GET /rounds/:id 明細:「這 ¥5,500 是怎麼算出來的」');
     payers: [{ member_id: c.id['民'] }],
     split: { mode: 'exact', amounts: { [c.id['民']]: 300, [c.id['喧']]: 500 } },
   })).status, 201);
-  // ⚠️ 這筆住宿是為了新語意加的。舊語意下「民 投入 20,000」就讓他成為債權人,
-  // 光靠咖啡就能算出 喧→民 ¥5,500;新語意投入不進淨額,他得真的自掏腰包才會是債權人。
-  // 金額選 ¥20,000 兩人均分,是為了讓招牌數字仍然剛好是 ¥5,500 ——
-  // 這一組要問的是「這 ¥5,500 是怎麼算出來的」,換個數字就要重寫整段敘述。
+  // 這一組刻意把四種來源湊齊:公費付的、自己墊的均分、自己墊的自訂金額、
+  // 還有一筆投入 —— 「這個數字是怎麼算出來的」要問得夠難才有意義。
   eq('民墊住宿 ¥20,000 → 201', (await shared(c.T, {
     description: '住宿', currency: 'JPY', amount: 20000,
     payers: [{ member_id: c.id['民'] }],
@@ -1066,16 +1047,17 @@ group('[14] GET /rounds/:id 明細:「這 ¥5,500 是怎麼算出來的」');
   const netMap = new Map<string, number>(nets.map((n) => [n.memberId, n.netMinor]));
   eq('快照淨額總和 0', nets.reduce((s, n) => s + n.netMinor, 0), 0);
   check('快照裡有公費', netMap.has(c.id['公費']), JSON.stringify(nets.map((n) => c.name(n.memberId))));
-  // 民:墊 800 + 20,000 − 分攤 15,300 = +5,500。**投入的 20,000 不算**
-  // (舊語意會把它算進來,得到 +15,500 —— 那個 10,000 的差就是信封裡的現金)。
-  eq('民 +5,500', netMap.get(c.id['民']), 5500);
+  // 民:墊 800 + 20,000 − 分攤 15,300 + 投入 20,000 = +25,500
+  eq('民 +25,500', netMap.get(c.id['民']), 25500);
   eq('喧 −15,500(包車 5,000 + 咖啡 500 + 住宿 10,000)', netMap.get(c.id['喧']), -15500);
-  // 公費:付掉 10,000,沒有分攤 → 淨額就是它花掉的錢
-  eq('公費 +10,000 = 它花掉的錢', netMap.get(c.id['公費']), 10000);
+  // 公費:付掉 10,000 − 收到投入 20,000 = −10,000(= −剩餘)
+  eq('公費 −10,000 = −剩餘', netMap.get(c.id['公費']), -10000);
 
   const transfers = (detail.json.transfers ?? []) as J[];
-  eq('記下來的轉帳:喧→民 ¥5,500(公費的腿不寫)',
-    transfers.map((t) => `${c.name(t.from_member)}→${c.name(t.to_member)} ${t.amount_minor}`), ['喧→民 5500']);
+  // 喧 欠 15,500,而 民 的債權有 25,500 —— 喧 那筆全部給民,
+  // 民 剩下的 10,000 由信封在旅程結束時退還(公費的腿不寫)。
+  eq('記下來的轉帳:喧→民 ¥15,500(公費的腿不寫)',
+    transfers.map((t) => `${c.name(t.from_member)}→${c.name(t.to_member)} ${t.amount_minor}`), ['喧→民 15500']);
   check('轉帳都標成這一回合的', transfers.every((t) => !!t.id), JSON.stringify(transfers));
 
   eq('找不到的回合 id → 404',
@@ -1124,14 +1106,21 @@ group('[15] 公費批次金流 POST /pot/moves');
   eq('退還對象是華', (pb2?.refunds ?? []).map((x: J) => `${c.name(x.memberId)} ${x.amountMinor}`),
     ['華 1000']);
   eq('剩餘降到 ¥9,000', pb2?.remainingMinor, 9000);
-  // 這一組完全沒有支出,只有投入與退還 —— 新語意下這兩種都不進淨額,
-  // 所以公費(和所有人)根本不會出現在 nets 裡,而剩餘照樣是 ¥9,000。
-  // 「剩餘只住在總覽頁」在這裡是最極端的樣子:結算頁的算術是空的。
+  // 這一組完全沒有支出,只有投入與退還。淨額含這兩者,所以帳本長成
+  // 「三個人各自把錢放進信封、信封欠他們」—— 這正是還沒開始花錢的第一天。
   const netsNow = await netsOf(c.T, 'JPY');
   eq('公費花費 ¥0', pb2?.spentMinor, 0);
-  eq('公費不在淨額裡(它沒付過任何共同支出)', netsNow.map.get(c.id['公費']) ?? 0, 0);
-  eq('淨額整個是空的(投入/退還都不進算術)', netsNow.rows.length, 0);
-  eq('剩餘仍然是 ¥9,000 —— 和淨額無關', pb2?.remainingMinor, 9000);
+  eq('公費淨額 −9,000(= −剩餘)', netsNow.map.get(c.id['公費']), -9000);
+  eq('民 +5,000 / 喧 +3,000 / 華 +1,000(投入 2,000 − 領回 1,000)',
+    [c.id['民'], c.id['喧'], c.id['華']].map((m) => netsNow.map.get(m) ?? 0), [5000, 3000, 1000]);
+  eq('Σ(真人淨額) = 剩餘 ¥9,000',
+    netsNow.rows.filter((n) => n.memberId !== c.id['公費']).reduce((s, n) => s + n.netMinor, 0),
+    pb2?.remainingMinor);
+  // 沒有人欠任何人 —— 三條腿全部是信封要退還的,而且都不會被寫進去。
+  const pv15 = await preview(c.T, 'JPY');
+  eq('recorded 是空的(人跟人之間沒有帳)', fmt(pv15.b.recorded, c), []);
+  eq('deferred 是三筆退還', fmt(pv15.b.deferred, c).sort(),
+    ['公費→喧 3000', '公費→民 5000', '公費→華 1000']);
 
   const baseCount = countSettlements(c.tripId);
   eq('目前 4 列', baseCount, 4);
@@ -1205,34 +1194,42 @@ group('[15] 公費批次金流 POST /pot/moves');
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[16] 「標記已還款」的上限必須用新語意算(JS 檢查與 SQL 前提是同一個 owes)');
+group('[16] 「標記已還款」的上限:JS 檢查與 SQL 前提必須是同一個 owes');
 // ═══════════════════════════════════════════════════════════════
 //
 // settlements.post.ts 有兩道一樣的上限:一道在 JS(為了給帶數字的錯誤訊息)、
 // 一道寫進 `INSERT ... SELECT ... WHERE`(那才是擋得住併發的那道)。
-// 淨額改成不含投入/退還之後,**兩道都必須跟著改**,否則就是這個 repo
-// 最怕的那一類 bug:JS 用新語意放行、SQL 用舊語意擋掉。
+// 淨額的語意每動一次,**兩道都必須跟著動**,否則就是這個 repo 反覆踩到的
+// 那一類 bug:一邊用新語意、一邊用舊語意,而症狀只在特定資料形狀才出現。
 //
-// 這一組就是那個縫的最小重現:民 投了公費 ¥10,000,同時欠 喧 ¥5,000。
-//   新語意 owes(民) = 5,000 → 結算頁就是這樣建議的
-//   舊算法 owes(民) = 5,000 − 10,000 = −5,000 → 一列都插不進去
-//     → 照著畫面按下「標記已還款」永遠回 409「這筆已經結清了」
+// 這一組是那個縫的最小重現:民 投了公費 ¥10,000,同時因為 喧 墊了晚餐而欠他錢。
+//   淨額含投入 → owes(民) = 5,000 → 結算頁就是這樣建議的
+//   SQL 若還排掉公費那幾列 → owes(民) = 15,000 → 送 15,000 進來 JS 擋、SQL 放
+//     → 繞過 UI 直接打 API 就能寫出一筆超過債權的還款
+//
+// 晚餐刻意是 ¥30,000:淨額含投入之後,金額太小的話 民 會變成債權人,
+// 這一組就沒有人對人的債可以測了。
 {
   const c = await mkTrip('R16 還款上限', ['民', '喧'], '公費');
   eq('民投入公費 ¥10,000 → 201', (await potMoves(c.T, {
     direction: 'in', currency: 'JPY',
     entries: [{ member_id: c.id['民'], amount_minor: 10000 }],
   })).status, 201);
-  eq('喧墊晚餐 ¥10,000 → 201', (await shared(c.T, {
-    description: '晚餐', currency: 'JPY', amount: 10000,
+  eq('喧墊晚餐 ¥30,000 → 201', (await shared(c.T, {
+    description: '晚餐', currency: 'JPY', amount: 30000,
     payers: [{ member_id: c.id['喧'] }],
     split: { mode: 'equal', members: [c.id['民'], c.id['喧']] },
   })).status, 201);
 
   const pv = await preview(c.T, 'JPY');
-  eq('淨額:民 −5,000(投入不抵這筆人對人的債)',
+  // 民:− 分攤 15,000 + 投入 10,000 = −5,000。喧:+30,000 − 15,000 = +15,000。
+  // 公費:− 收到投入 10,000 = −10,000。
+  eq('淨額:民 −5,000(投入抵掉了一部分,但沒抵完)',
     pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, -5000);
+  eq('淨額:喧 +15,000', pv.b.nets?.find((n: J) => n.memberId === c.id['喧'])?.netMinor, 15000);
+  eq('淨額:公費 −10,000', pv.b.nets?.find((n: J) => n.memberId === c.id['公費'])?.netMinor, -10000);
   eq('預覽建議 民→喧 ¥5,000', fmt(pv.b.recorded, c), ['民→喧 5000']);
+  eq('信封那 ¥10,000 是要退給民的(deferred)', fmt(pv.b.deferred, c), ['公費→喧 10000']);
 
   // 先確認超額還是擋得住 —— 不然「放行」可能只是把上限整個拿掉。
   const over = await post(`/api/trips/${c.T}/settlements`, {
@@ -1256,7 +1253,11 @@ group('[16] 「標記已還款」的上限必須用新語意算(JS 檢查與 SQL
   eq('手動那筆真的寫進去了', countSettlements(c.tripId, 'manual'), 2);   // 投入 + 這筆
 
   const after = await netsOf(c.T, 'JPY');
-  eq('還完之後淨額全歸零', after.rows.filter((n) => n.netMinor !== 0).length, 0);
+  // 人對人的部分清乾淨了,剩下的只有信封欠大家的那 ¥10,000。
+  eq('民 歸零', after.map.get(c.id['民']) ?? 0, 0);
+  eq('喧 +10,000(信封還欠他)', after.map.get(c.id['喧']), 10000);
+  eq('公費 −10,000', after.map.get(c.id['公費']), -10000);
+  eq('沒有人對人的建議了', fmt((await preview(c.T, 'JPY')).b.recorded, c), []);
   eq('公費剩餘沒被動到(還款不是退還)',
     potBlock(after.bal, 'JPY')?.remainingMinor, 10000);
 
@@ -1276,8 +1277,8 @@ group('[17] 還款上限是 min(付款人欠款, 收款人債權) —— 只看�
 // **確實**是同一個數字,但那個數字只有付款人那一側 —— 收款人被欠多少沒人看。
 //
 // 為什麼只看付款人會不夠:欠款說的是「這個人總共還欠多少」,而債權會分散在
-// 多個人身上。公費一旦付過共同支出就必然如此(新語意下公費淨額 = +公費花費,
-// 它恆為債權人之一)。稽核者的實測:
+// 多個人身上。公費**超支**的時候就是這樣(公費淨額 = −剩餘,剩餘為負時它是債權人)。
+// 稽核者的實測(沒有人投入過公費,所以信封是超支的):
 //
 //   公費付 ¥6,000 兩人均分、民 墊 ¥20,000 兩人均分
 //   → 淨額 民 +7,000 / 喧 −13,000 / 公費 +6,000,建議只有 喧→民 ¥7,000
@@ -1306,7 +1307,7 @@ group('[17] 還款上限是 min(付款人欠款, 收款人債權) —— 只看�
   const pv = await preview(c.T, 'JPY');
   eq('淨額:民 +7,000', pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, 7000);
   eq('淨額:喧 −13,000', pv.b.nets?.find((n: J) => n.memberId === c.id['喧'])?.netMinor, -13000);
-  eq('淨額:公費 +6,000(= 它付掉的共同支出)',
+  eq('淨額:公費 +6,000(沒有人投入過,信封超支這麼多)',
     pv.b.nets?.find((n: J) => n.memberId === c.id['公費'])?.netMinor, 6000);
   // 這兩條就是整組的前提:喧 欠 13,000,但只有 7,000 是欠民的。
   eq('建議只有 喧→民 ¥7,000', fmt(pv.b.recorded, c), ['喧→民 7000']);
@@ -1421,15 +1422,18 @@ group('[17] 還款上限是 min(付款人欠款, 收款人債權) —— 只看�
 // ── 上限只看人對人的部分:投入與退還都不能污染它 ────────────────
 //
 // 收款人那一側的兩個還款加總必須排掉「另一端是公費」的列,理由和付款人那側一樣
-// (淨額不含投入/退還,見 server/utils/ledger.ts 開頭)。這一組把兩個方向都放進來:
+// (淨額含投入 / 退還,見 server/utils/ledger.ts 開頭)。這一組把兩個方向都放進來,
+// 而它守的正是「JS 檢查與 SQL 前提用的是同一套算術」:
 //
-//   投入(民→公費 50,000)少排 → credit(民) 被撐大到 57,000 → 超額的 13,000 過關
-//   退還(公費→民 10,000)少排 → credit(民) 被壓成 −3,000 → 照建議的 7,000 永遠 409
+//   民 投入 50,000、公費付早餐 6,000 均分、民 墊晚餐 20,000 均分、公費退還民 10,000
+//   → 民 +47,000 / 喧 −13,000 / 公費 −34,000,建議 喧→民 ¥13,000
 //
-// 後者是 JS/SQL 分岔那一類 bug 的樣子:JS 算 7,000 放行、SQL 算 −3,000 擋掉,
-// 使用者拿到一句「已經結清了」而其實沒有。
+// 送出那筆 13,000 就是探針:
+//   SQL 若還排掉公費那幾列 → credit(民) 只剩 7,000 → 照建議按下去回 409
+//     「已經結清了」,而其實一毛都沒還 —— 這是 JS/SQL 分岔那一類 bug 的樣子。
+//   兩邊都照算 → credit(民) = 47,000 → 201,而且 13,001 還是要被擋下來。
 {
-  const c = await mkTrip('R17 投入退還不污染上限', ['民', '喧'], '公費');
+  const c = await mkTrip('R17 投入退還與上限', ['民', '喧'], '公費');
   eq('民投入公費 ¥50,000 → 201', (await potMoves(c.T, {
     direction: 'in', currency: 'JPY',
     entries: [{ member_id: c.id['民'], amount_minor: 50000 }],
@@ -1450,28 +1454,37 @@ group('[17] 還款上限是 min(付款人欠款, 收款人債權) —— 只看�
   })).status, 201);
 
   const pv = await preview(c.T, 'JPY');
-  eq('民的淨額還是 +7,000(投入 50,000 與退還 10,000 都不進算術)',
-    pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, 7000);
-  eq('建議還是只有 喧→民 ¥7,000', fmt(pv.b.recorded, c), ['喧→民 7000']);
+  // 民:墊 20,000 − 分攤 13,000 + 投入 50,000 − 領回 10,000 = +47,000
+  eq('民 +47,000', pv.b.nets?.find((n: J) => n.memberId === c.id['民'])?.netMinor, 47000);
+  eq('喧 −13,000', pv.b.nets?.find((n: J) => n.memberId === c.id['喧'])?.netMinor, -13000);
+  eq('公費 −34,000(= −剩餘)',
+    pv.b.nets?.find((n: J) => n.memberId === c.id['公費'])?.netMinor, -34000);
+  eq('建議 喧→民 ¥13,000(他欠的全部)', fmt(pv.b.recorded, c), ['喧→民 13000']);
+  eq('deferred:信封結束時退還民 ¥34,000', fmt(pv.b.deferred, c), ['公費→民 34000']);
   eq('目前 2 列(投入 + 退還)', countSettlements(c.tripId), 2);
 
+  // 上限還是咬得住:喧 只欠 13,000。
   const over = await post(`/api/trips/${c.T}/settlements`, {
-    from_member: c.id['喧'], to_member: c.id['民'], currency: 'JPY', amount_minor: 13000,
+    from_member: c.id['喧'], to_member: c.id['民'], currency: 'JPY', amount_minor: 13001,
   });
-  eq('投入 50,000 撐不出更高的上限:13,000 → 409', over.status, 409);
+  eq('超過付款人的欠款 1 元 → 409', over.status, 409);
   eq('一列都沒多寫', countSettlements(c.tripId), 2);
 
+  // 核心探針:照畫面建議的金額按下去必須成功。SQL 少算投入的話這裡會 409。
   const ok = await post(`/api/trips/${c.T}/settlements`, {
-    from_member: c.id['喧'], to_member: c.id['民'], currency: 'JPY', amount_minor: 7000,
+    from_member: c.id['喧'], to_member: c.id['民'], currency: 'JPY', amount_minor: 13000,
   });
-  eq('退還 10,000 也壓不小上限:照建議的 7,000 → 201', ok.status, 201);
+  eq('照建議的 13,000 → 201(SQL 也把投入算進 credit)', ok.status, 201);
   eq('手動那筆真的寫進去了(投入 + 退還 + 這筆)', countSettlements(c.tripId, 'manual'), 3);
 
   const after = await netsOf(c.T, 'JPY');
-  eq('民歸零', after.map.get(c.id['民']) ?? 0, 0);
-  eq('喧剩下欠公費的 6,000', after.map.get(c.id['喧']), -6000);
+  eq('喧歸零', after.map.get(c.id['喧']) ?? 0, 0);
+  eq('民 +34,000 —— 剩下的全在信封裡', after.map.get(c.id['民']), 34000);
+  eq('公費 −34,000', after.map.get(c.id['公費']), -34000);
+  eq('人對人的建議清空', fmt((await preview(c.T, 'JPY')).b.recorded, c), []);
   eq('公費剩餘 50,000 − 6,000 − 10,000 = 34,000(還款沒碰到信封)',
     potBlock(after.bal, 'JPY')?.remainingMinor, 34000);
+  eq('公費淨額 = −剩餘', after.map.get(c.id['公費']), -34000);
 }
 
 process.exit(summary() > 0 ? 1 : 0);

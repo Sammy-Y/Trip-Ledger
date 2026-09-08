@@ -108,6 +108,20 @@ const selectModel = computed<string | number>({
     model.value = v as T;
   },
 });
+
+/**
+ * 讓外面可以把游標放進來(記一筆的「再記一筆」要 focus 說明欄)。
+ *
+ * 走 fieldId 而不是 template ref:三種控件(input / textarea / select)
+ * 是三個互斥的 v-if 分支,ref 要掛三次再判斷哪個活著;而 id 本來就三個分支
+ * 都綁了,查一次就好。`autofocus` prop 只在初次掛載有用,重複 focus 要靠這個。
+ */
+function focus(): void {
+  if (!import.meta.client) return;
+  const el = document.getElementById(fieldId);
+  if (el instanceof HTMLElement) el.focus();
+}
+defineExpose({ focus });
 </script>
 
 <template>

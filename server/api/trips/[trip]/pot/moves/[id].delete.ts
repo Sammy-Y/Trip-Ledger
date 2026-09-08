@@ -1,6 +1,7 @@
 import { db } from '../../../../../utils/cf';
 import { requireTrip } from '../../../../../utils/trip';
-import { readPotMove, remainingAfter, potMoveNotFound, potRemainingError } from '../../../../../utils/pot';
+import { readPotMove, remainingAfter, blocksPotEdit, potMoveNotFound, potRemainingError } from '../../../../../utils/pot';
+import { formatMoney } from '../../../../../utils/money';
 
 /**
  * 刪掉一筆公費金流。
@@ -34,7 +35,13 @@ export default defineEventHandler(async (event) => {
   // 第一道:帶數字的錯誤訊息。投入 10,000、公費已經花掉 9,000 → 刪掉它
   // 剩餘會變成 −9,000,那是「信封裡的錢比實際有的多」,沒有現實對應。
   // 這種時候使用者要的通常是「改小」而不是「刪掉」,所以訊息會說最少能改到多少。
-  if (remainingAfter(before, 0) < 0) throw potRemainingError(before, 0);
+  //
+  // 判準是**變化量**(見 utils/pot.ts 的 blocksPotEdit):刪**退還**的變化量
+  // 恆為正,所以這一行對退還永遠放行 —— 那正是檔頭那句
+  // 「刪退還只會讓剩餘變大(永遠安全)」宣告的行為。用絕對值判的話,
+  // 公費一旦超支就沒有任何合法輸入動得了那一列(刪除比任何正數 PATCH 都寬鬆,
+  // 而刪除都被擋),那一列會被永久凍結。
+  if (blocksPotEdit(before, 0)) throw potRemainingError(before, 0);
 
   /**
    * 第二道,也是真正擋併發的那道:把前提寫進 DELETE 的 WHERE。
@@ -54,6 +61,12 @@ export default defineEventHandler(async (event) => {
      WHERE id = ?1 AND trip_id = ?2 AND source = 'manual'
        AND (from_member = ?3 OR to_member = ?3)
        AND (
+         -- ① 變化量 ≥ 0 → 放行。刪**退還**的變化量恆為 +amount_minor,
+         --    所以這一條讓「刪退還永遠安全」在 SQL 這一層也成立
+         --    (見 utils/pot.ts 的 blocksPotEdit;JS 那道是同一個判準)。
+         (CASE WHEN to_member = ?3 THEN -amount_minor ELSE amount_minor END) >= 0
+         -- ② 刪投入(讓信封變少):刪完之後剩餘不可以是負的。
+         OR (
          COALESCE((SELECT SUM(i.amount_minor) FROM settlements i
                     WHERE i.trip_id = ?2 AND i.currency = settlements.currency
                       AND i.to_member = ?3), 0)
@@ -64,8 +77,9 @@ export default defineEventHandler(async (event) => {
          - COALESCE((SELECT SUM(o.amount_minor) FROM settlements o
                       WHERE o.trip_id = ?2 AND o.currency = settlements.currency
                         AND o.from_member = ?3), 0)
-         + (CASE WHEN to_member = ?3 THEN -amount_minor ELSE amount_minor END)
-       ) >= 0`,
+           + (CASE WHEN to_member = ?3 THEN -amount_minor ELSE amount_minor END)
+         ) >= 0
+       )`,
   ).bind(id, trip.id, before.pot_id).run();
 
   if (!res.meta?.changes) {
@@ -82,8 +96,11 @@ export default defineEventHandler(async (event) => {
       statusCode: 409,
       statusMessage: `${now.pot_name}的錢在你按下的這一瞬間被別人動了,這筆沒有被刪掉。${why}`,
     });
-    if (remainingAfter(now, 0) < 0) {
-      throw raced(`現在刪掉它,${now.currency}剩餘會變成 ${remainingAfter(now, 0)}。`
+    // ⚠️ formatMoney,理由同 patch 那支:overview.vue 原樣顯示這句,
+    // 裸內插的話 TWD 會差 100 倍。
+    if (blocksPotEdit(now, 0)) {
+      throw raced(`現在刪掉它,${now.currency}剩餘會變成 `
+        + `${formatMoney(remainingAfter(now, 0), now.currency)}。`
         + '請重新整理看最新的剩餘再試一次。');
     }
     throw raced('請重新整理再試一次。');

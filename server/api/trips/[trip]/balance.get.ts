@@ -11,15 +11,16 @@ import type { PotCurrency, PotSummary } from '../../../../shared/types';
  *
  * 剩餘 = 投入 − 公費付掉的 − 已退還。
  *
- * ⚠️ 這裡是「剩餘」唯一的計算來源 —— 總覽頁就靠 remainingMinor 顯示。
- * 以前它有第二條路徑可以對照(剩餘 = −公費淨額),但淨額改成不含投入/退還之後
- * 那條等式**不再成立**(見 utils/ledger.ts 開頭)。剩餘從此只住在這裡,
- * 那正是這次改動要的結果:結算頁的算術裡不該再有「信封裡還剩多少」。
+ * ⚠️ 這裡是「剩餘」的**第一條**計算來源 —— 總覽頁就靠 remainingMinor 顯示。
  *
- * 換上來的對照是另一條,同樣是兩條路徑算同一個數字:
- *   公費淨額 === spentMinor
- * 一邊從 expense_payers 直接加總,一邊經過 netBalances 的加減 ——
- * 對不上就代表公費替自己分攤了一份(或有人把有帳的成員改標成公費)。
+ * 第二條在 utils/ledger.ts:淨額含投入 / 退還之後,
+ *
+ *   公費淨額 === −remainingMinor
+ *
+ * 一邊是這裡三個 SUM 直接相減,一邊是那裡經過 netBalances 的一堆加減。
+ * 兩條路徑互不相干卻必須給出同一個數字,對不上就代表有東西記錯了 ——
+ * 最常見的是公費替自己分攤了一份,或有人把已經有帳的成員改標成公費。
+ * (test/ledger.test.ts 的定理一把這條當成不變量在守。)
  */
 async function potSummary(dbh: D1Database, tripId: string): Promise<PotSummary | null> {
   const pot = await dbh.prepare(
@@ -43,7 +44,7 @@ async function potSummary(dbh: D1Database, tripId: string): Promise<PotSummary |
     // 公費付掉的支出。
     //
     // ⚠️ `kind = 'shared'` 不能省。utils/ledger.ts 的淨額只算 shared,
-    // 這裡如果連 personal 一起算,`公費淨額 = spentMinor` 這條對照就會差掉
+    // 這裡如果連 personal 一起算,`公費淨額 = −剩餘` 這條對照就會差掉
     // 那筆個人花費的金額,而且那筆錢會卡在沒有任何畫面能解決的地方:
     // 剩餘說公費花掉了 5,000,卻沒有任何人的淨額欠著這 5,000(實測出來的)。
     //
@@ -121,7 +122,7 @@ export default defineEventHandler(async (event) => {
   // 對外的形狀保持不變(nets / transfers),recorded / deferred 額外附上 ——
   // 結算頁要能把「公費的腿」標成唯讀,不要讓人以為那筆現在就該轉。
   //
-  // 公費仍然出現在 nets 裡(值 = 公費花掉的錢),由前端自己決定要不要顯示 ——
+  // 公費仍然出現在 nets 裡(值 = −公費剩餘),由前端自己決定要不要顯示 ——
   // 少了它淨額就不是零和,而 minCashFlow 對非零和輸入會靜靜少算一筆錢。
   const byCurrency: Record<string, {
     nets: Net[]; transfers: Transfer[]; recorded: Transfer[]; deferred: Transfer[];

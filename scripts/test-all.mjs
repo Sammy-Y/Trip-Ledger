@@ -14,6 +14,7 @@ const SUITES = [
   ['settle', 'test/settle.test.ts'],
   ['money', 'test/money.test.ts'],
   ['split-preview', 'test/split-preview.test.ts'],
+  ['expense-form-reset', 'test/expense-form-reset.test.ts'],
   ['ledger', 'test/ledger.test.ts'],
   ['sql-safety', 'test/sql-safety.test.ts'],
   ['schema-types', 'test/schema-types.test.ts'],

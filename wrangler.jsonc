@@ -8,14 +8,23 @@
 	"assets": {
 		"directory": ".output/public"
 	},
-	// 自訂網域。trip-ledger.com 要先加進同一個 Cloudflare 帳號(Domains),
-	// deploy 時 wrangler 會自動建 DNS 記錄與憑證。
-	// 換網域後記得重設 secret NUXT_PUBLIC_ORIGIN(排程 self-fetch 用),
-	// 而且推播訂閱綁 origin,使用者要重新訂閱。
-	"routes": [
-		{ "pattern": "trip-ledger.com", "custom_domain": true },
-		{ "pattern": "www.trip-ledger.com", "custom_domain": true }
-	],
+	// 目前沒有自訂網域,部署後的位址是 trip-ledger.<你的子網域>.workers.dev。
+	//
+	// 之前這裡綁過 "trip-ledger.com" —— 那個網域**不是我們的**
+	// (GoDaddy 註冊、NS1 nameserver、Netlify 代管,內容是維吉尼亞州一家
+	// 長照接送公司,只是撞名)。custom_domain 要求 zone 就在同一個 Cloudflare
+	// 帳號底下且 nameserver 已指過來,查不到 zone 時 wrangler 不是跳過那一步,
+	// 而是**整包 deploy 中止** —— worker 本體、cron、D1 binding 全部沒上。
+	//
+	// 真的要綁自訂網域時:先把網域加進 Cloudflare(改 NS、等 zone active),
+	// 再加回這一段,並且
+	//   1. 重設 secret NUXT_PUBLIC_ORIGIN(排程 self-fetch 靠它,見 server/utils/cf.ts)
+	//   2. 推播訂閱綁 origin,換網域等於全部失效,使用者要重新訂閱
+	//
+	// "routes": [
+	//   { "pattern": "你的網域.com", "custom_domain": true },
+	//   { "pattern": "www.你的網域.com", "custom_domain": true }
+	// ],
 	// ⚠️ 只能有**一個** trip-ledger 的 binding。
 	//
 	// `wrangler d1 execute trip-ledger` 是用 database_name 去找的,兩筆同名時它拿第一筆的

@@ -5,20 +5,32 @@ import type { SplitMode } from '~~/shared/types';
  * 分攤(誰受益 / 誰要出這筆錢)。自動註冊名稱是 <ExpenseSplitEditor>,
  * 不過 ExpenseForm 是用相對路徑明確 import 的,不依賴自動註冊。
  *
- * 三種模式對應 server 的 split payload:
+ * 兩種模式對應 server 的 split payload:
  *   均分      → { mode:'equal',  members:[...] }        只列實際參與的人
- *   按份數    → { mode:'shares', shares:{ id: 份數 } }   2:1:1 或百分比都可以
  *   指定金額  → { mode:'exact',  amounts:{ id: 金額 } }  每人直接填
  *
- * 三種模式的 draft 各自獨立保存 —— 切模式回來時剛剛填的東西還在,
+ * 兩種模式的 draft 各自獨立保存 —— 切模式回來時剛剛填的東西還在,
  * 不會被清掉(在店門口單手操作時最怕手滑切模式,一切就白填)。
+ *
+ * ⚠️ 「按份數」(mode:'shares')**刻意不出現在這裡**。它在真實使用裡從來沒被用過,
+ * 卻要多養一整組輸入欄與百分比顯示,而它能表達的任何拆法「指定金額」都做得到。
+ * server 與 shared/split.ts 仍然接受 shares(API 相容,而且 splitByShares
+ * 有自己的測試),只是記帳表單不再提供這個入口。
  *
  * 每人分到多少(preview)、合計、差額都由 ExpenseForm 算好傳進來:
  * 送出按鈕的啟用條件必須和畫面上顯示的數字是同一份計算,不能各算一次。
  */
 // 型別本體在 shared/split.ts —— 和 previewShares() 放一起,
 // 才不會出現「draft 的形狀改了但算分攤的那份沒跟著改」。
-export type { SplitDraft } from '~~/shared/split';
+//
+// ⚠️ 先 import 再 export,不能寫成 `export type { SplitDraft } from '...'`。
+// 那種轉出寫法**不會建立本地繫結**(ES 模組的語意),於是下面 <script setup>
+// 的 `defineModel<SplitDraft>()` 找不到這個名字 → model 退化成 any
+// → 整個檔案的 model.mode / model.members 全部失去型別。
+// 這個檔案就是這樣壞了很久而沒人發現的:`pnpm typecheck` 跑不起來
+// (vue-tsc 需要 TypeScript 5.x,而 pnpm 解到了 7.x),所以 4 個型別錯誤一直沒露出來。
+import type { SplitDraft } from '~~/shared/split';
+export type { SplitDraft };
 </script>
 
 <script setup lang="ts">
@@ -42,13 +54,15 @@ const model = defineModel<SplitDraft>({ required: true });
 
 const MODES: Array<{ value: SplitMode; label: string; icon: string }> = [
   { value: 'equal', label: '均分', icon: 'lucide:equal' },
-  { value: 'shares', label: '按份數', icon: 'lucide:chart-pie' },
   { value: 'exact', label: '指定金額', icon: 'lucide:pencil' },
 ];
 
-const MODE_HINT: Record<SplitMode, string> = {
+/**
+ * Partial 是刻意的:SplitMode 還有 'shares',但這個編輯器不提供那個模式,
+ * 所以這裡沒有它的文案。讀的時候一律走 modeHint(),不要直接索引。
+ */
+const MODE_HINT: Partial<Record<SplitMode, string>> = {
   equal: '勾選一起分攤的人,預設全選。',
-  shares: '填份數,例如 2:1:1。填百分比(50/25/25)也可以,系統按比例換算。',
   exact: '每人直接填實際金額。留空的人不列入這筆分攤。',
 };
 
@@ -105,30 +119,6 @@ const equalRemainder = computed<{ names: string[]; unit: string } | null>(() => 
   return { names: extras.map(nameOf), unit: formatMoney(1, props.currency) };
 });
 
-// ── 按份數 ──────────────────────────────────────────────────
-function shareOf(id: string): number | null {
-  return model.value.shares[id] ?? null;
-}
-function setShare(id: string, value: number | null): void {
-  model.value = { ...model.value, shares: { ...model.value.shares, [id]: value } };
-}
-/** 份數合計,用來算每人的百分比 */
-const shareTotal = computed(() =>
-  props.members.reduce((sum, m) => sum + Math.max(0, shareOf(m.id) ?? 0), 0));
-
-function sharePercent(id: string): string | null {
-  const total = shareTotal.value;
-  const value = shareOf(id) ?? 0;
-  if (total <= 0 || value <= 0) return null;
-  const pct = (value / total) * 100;
-  return `${pct.toLocaleString('zh-TW', { maximumFractionDigits: 1 })}%`;
-}
-function setAllShares(value: number | null): void {
-  const next: Record<string, number | null> = {};
-  for (const m of props.members) next[m.id] = value;
-  model.value = { ...model.value, shares: next };
-}
-
 // ── 指定金額 ────────────────────────────────────────────────
 function amountOf(id: string): number | null {
   return model.value.amounts[id] ?? null;
@@ -167,13 +157,11 @@ const exponent = computed(() => (props.currency === 'JPY' ? 0 : 2));
 
 // ── 合計 / 差額 ─────────────────────────────────────────────
 /** 參與人數(依模式各自判定) */
-const joinedCount = computed(() => {
-  if (model.value.mode === 'equal') return model.value.members.length;
-  if (model.value.mode === 'shares') {
-    return props.members.filter(m => (shareOf(m.id) ?? 0) > 0).length;
-  }
-  return props.members.filter(m => amountOf(m.id) != null).length;
-});
+const joinedCount = computed(() => (
+  model.value.mode === 'equal'
+    ? model.value.members.length
+    : props.members.filter(m => amountOf(m.id) != null).length
+));
 
 const diffState = computed<{ tone: string; icon: string; text: string }>(() => {
   if (props.diffMinor === 0) {
@@ -240,7 +228,7 @@ const seen = ref(new Set(props.members.map(m => m.id)));
       </button>
     </div>
     <p class="mt-2 text-xs leading-relaxed text-[var(--text-muted)]">
-      {{ MODE_HINT[model.mode] }}
+      {{ MODE_HINT[model.mode] ?? MODE_HINT.exact }}
     </p>
 
     <!-- ── 均分 ── -->
@@ -288,53 +276,8 @@ const seen = ref(new Set(props.members.map(m => m.id)));
       </p>
     </div>
 
-    <!-- ── 按份數 ── -->
-    <div v-else-if="model.mode === 'shares'" class="mt-3">
-      <div class="mb-1.5 flex items-center justify-end gap-1">
-        <button type="button" class="link-btn" @click="setAllShares(1)">
-          每人 1 份
-        </button>
-        <button type="button" class="link-btn" @click="setAllShares(null)">
-          全部清空
-        </button>
-      </div>
-      <div class="space-y-1.5">
-        <div
-          v-for="m in members"
-          :key="m.id"
-          class="row"
-          :class="{ 'is-on': (shareOf(m.id) ?? 0) > 0 }"
-        >
-          <span class="row-label">{{ m.name }}</span>
-          <span
-            v-if="hasAmount && (shareOf(m.id) ?? 0) > 0"
-            class="shrink-0 text-xs text-[var(--text-muted)]"
-          >
-            {{ sharePercent(m.id) }}
-          </span>
-          <span v-if="hasAmount && (shareOf(m.id) ?? 0) > 0" class="shrink-0">
-            <UiMoney :minor="preview[m.id] ?? 0" :currency="currency" size="sm" />
-          </span>
-          <div class="amount-cell shares-cell">
-            <input
-              class="cell-input tnum"
-              type="number"
-              inputmode="decimal"
-              step="0.5"
-              min="0"
-              placeholder="0"
-              :value="shareOf(m.id) ?? ''"
-              :aria-label="`${m.name} 的份數`"
-              @input="setShare(m.id, readNumber($event))"
-            >
-            <span class="cur">份</span>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <!-- ── 指定金額 ── -->
-    <div v-else class="mt-3">
+    <div v-else-if="model.mode === 'exact'" class="mt-3">
       <div class="mb-1.5 flex items-center justify-end gap-1">
         <button type="button" class="link-btn" :disabled="!hasAmount" @click="prefillFromEqual">
           <Icon name="lucide:equal" size="14" />
@@ -513,9 +456,6 @@ const seen = ref(new Set(props.members.map(m => m.id)));
 }
 .amount-cell:focus-within {
   border-color: var(--brand);
-}
-.shares-cell {
-  width: 5.5rem;
 }
 .cur {
   flex-shrink: 0;

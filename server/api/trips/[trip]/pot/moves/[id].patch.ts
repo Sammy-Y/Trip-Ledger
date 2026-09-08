@@ -1,6 +1,7 @@
 import { db } from '../../../../../utils/cf';
 import { requireTrip } from '../../../../../utils/trip';
-import { readPotMove, remainingAfter, potMoveNotFound, potRemainingError } from '../../../../../utils/pot';
+import { readPotMove, remainingAfter, blocksPotEdit, potMoveNotFound, potRemainingError } from '../../../../../utils/pot';
+import { formatMoney } from '../../../../../utils/money';
 
 /**
  * 改一筆公費金流的金額。
@@ -52,16 +53,20 @@ export default defineEventHandler(async (event) => {
     });
   }
 
-  // ── 剩餘不可為負,第一道:給出帶數字的錯誤訊息 ────────────────
+  // ── 不可以讓剩餘變得更差,第一道:給出帶數字的錯誤訊息 ──────────
   //
   // 投入 10,000、公費已經花掉 9,000,把投入改成 8,000 → 剩餘 −1,000。
   // 那是「信封裡的錢比實際有的多」,沒有現實對應:總覽會據此叫人再退還,
   // 而退出去的那 1,000 是憑空生出來的。
   //
+  // 判準是**變化量**而不是「剩餘不可為負」—— 公費超支是合法狀態,
+  // 用絕對值判會把「改大投入」這個唯一能修正帳的方向鎖死。完整推導見
+  // utils/pot.ts 的 blocksPotEdit。
+  //
   // 這一道**擋不住併發**(讀完到寫入之間隔著一次往返),真正的防線是下面
   // 那個 UPDATE 的 WHERE。留著它是為了訊息:SQL 那道只能告訴我們「不成立」,
   // 說不出「現在剩多少、最少能改到多少」。
-  if (remainingAfter(before, b.amount_minor) < 0) {
+  if (blocksPotEdit(before, b.amount_minor)) {
     throw potRemainingError(before, b.amount_minor);
   }
 
@@ -92,6 +97,12 @@ export default defineEventHandler(async (event) => {
      WHERE id = ?1 AND trip_id = ?2 AND source = 'manual'
        AND (from_member = ?3 OR to_member = ?3)
        AND (
+         -- ① 變化量 ≥ 0:這次改動讓信封變多或不變 → 一律放行,即使目前是超支的。
+         --    公費超支是合法狀態,而「改大投入」是唯一能把帳修回事實的方向,
+         --    用絕對值判會把它鎖死(完整推導見 utils/pot.ts 的 blocksPotEdit)。
+         (CASE WHEN to_member = ?3 THEN ?4 - amount_minor ELSE amount_minor - ?4 END) >= 0
+         -- ② 讓信封變少的方向:改完之後剩餘不可以是負的。
+         OR (
          COALESCE((SELECT SUM(i.amount_minor) FROM settlements i
                     WHERE i.trip_id = ?2 AND i.currency = settlements.currency
                       AND i.to_member = ?3), 0)
@@ -102,8 +113,9 @@ export default defineEventHandler(async (event) => {
          - COALESCE((SELECT SUM(o.amount_minor) FROM settlements o
                       WHERE o.trip_id = ?2 AND o.currency = settlements.currency
                         AND o.from_member = ?3), 0)
-         + (CASE WHEN to_member = ?3 THEN ?4 - amount_minor ELSE amount_minor - ?4 END)
-       ) >= 0`,
+           + (CASE WHEN to_member = ?3 THEN ?4 - amount_minor ELSE amount_minor - ?4 END)
+         ) >= 0
+       )`,
   ).bind(id, trip.id, before.pot_id, b.amount_minor).run();
 
   if (!res.meta?.changes) {
@@ -121,9 +133,13 @@ export default defineEventHandler(async (event) => {
       statusCode: 409,
       statusMessage: `${now.pot_name}的錢在你按下的這一瞬間被別人動了,這筆一個字都沒有改到。${why}`,
     });
-    if (remainingAfter(now, b.amount_minor) < 0) {
-      throw raced(`現在改成 ${b.amount_minor} 會讓${now.currency}剩餘變成 `
-        + `${remainingAfter(now, b.amount_minor)}。請重新整理看最新的剩餘再改。`);
+    // ⚠️ 這裡的金額一定要 formatMoney。它們是最小單位整數,而 TWD 的 exponent 是 2 ——
+    // 直接內插的話 NT$1,000.01 會印成 100001,而 overview.vue 是**原樣**顯示這句的
+    // (同 utils/pot.ts 的 potRemainingError 那段警告)。
+    const money = (minor: number) => formatMoney(minor, now.currency);
+    if (blocksPotEdit(now, b.amount_minor)) {
+      throw raced(`現在改成 ${money(b.amount_minor)} 會讓${now.currency}剩餘變成 `
+        + `${money(remainingAfter(now, b.amount_minor))}。請重新整理看最新的剩餘再改。`);
     }
     throw raced('請重新整理再試一次。');
   }

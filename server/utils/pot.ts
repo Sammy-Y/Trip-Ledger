@@ -108,8 +108,56 @@ export const remainingOf = (m: PotMove) => m.contributed - m.spent - m.refunded;
  * 「只改了一邊」的機會。
  */
 export function remainingAfter(m: PotMove, newAmountMinor: number): number {
+  return remainingOf(m) + potEditDelta(m, newAmountMinor);
+}
+
+/**
+ * 這次編輯讓剩餘**變動多少**。> 0 = 信封變多,< 0 = 信封變少。
+ *
+ *   in  : 新 − 舊      投入變多 → 信封變多
+ *   out : −(新 − 舊)   退還變多 → 信封變少
+ *
+ * 抽出來是因為下面的 blocksPotEdit 要單獨問「方向」這件事,
+ * 而它的 SQL 雙胞胎(兩支端點 WHERE 裡那段 CASE)也是獨立的一項。
+ */
+export function potEditDelta(m: PotMove, newAmountMinor: number): number {
   const delta = newAmountMinor - m.amount_minor;
-  return remainingOf(m) + (m.direction === 'in' ? delta : -delta);
+  return m.direction === 'in' ? delta : -delta;
+}
+
+/**
+ * 這次編輯該不該被擋下來。
+ *
+ * 判準是「**不可以讓剩餘變得更差**」,而不是「剩餘不可為負」。這個差別很重要:
+ *
+ * 公費**超支**(剩餘 < 0)是一個合法而且到得了的狀態 —— server 沒有任何一支
+ * 端點擋「公費付掉的共同支出 > 投入」(expenses.post 只擋公費當個人花費付款人、
+ * 以及公費出現在分攤名單),README 也明講那個差額是由當時付錢的人先墊著。
+ *
+ * 而「剩餘不可為負」這個判準一旦進到超支狀態就會把帳鎖死,擋掉的正好是
+ * **唯一能把帳修回事實的那些編輯**:
+ *
+ *   投入記太少(漏記了一筆)→ 想改大 → 改完剩餘仍是負的 → 被擋
+ *   誤記了一筆從沒發生的退還 → 想刪掉 → 刪完剩餘仍是負的 → 被擋
+ *
+ * 後者更硬:刪除 = 改成 0,而退還方向「改成 0」比任何正數都讓剩餘更大,
+ * 所以刪除被擋的時候,沒有任何合法輸入動得了那一列 —— 它被永久凍結。
+ * 而淨額現在含投入 / 退還(見 utils/ledger.ts),凍結的那一列等於在那個人
+ * 身上掛一筆永遠拔不掉的假債務。
+ *
+ * 改成看**變化量**之後:
+ *   剩餘 ≥ 0 時行為完全不變(after < 0 必然 < before,兩個判準等價)
+ *   剩餘 < 0 時只擋「讓它更負」的方向,修正帳的方向一律放行
+ *
+ * ⚠️ 這條規則有一個 SQL 雙胞胎:兩支端點 WHERE 裡那段
+ * `(CASE ...) >= 0 OR (三個 COALESCE 相減 + CASE) >= 0`。
+ * 前半就是「變化量 ≥ 0」,後半就是「改完不是負的」。兩邊必須一起改。
+ */
+export function blocksPotEdit(m: PotMove, newAmountMinor: number): boolean {
+  // 變化量 ≥ 0 = 這次編輯讓信封變多或不變 —— 永遠安全,即使現在是超支的。
+  if (potEditDelta(m, newAmountMinor) >= 0) return false;
+  // 讓信封變少:改完不可以是負的。
+  return remainingAfter(m, newAmountMinor) < 0;
 }
 
 /** 找不到 / 不屬於這趟 / 不是公費金流 —— 一律同一句,不透露那個 id 存不存在。 */
@@ -129,9 +177,24 @@ export function potMoveNotFound() {
 export function potRemainingError(m: PotMove, next: number) {
   const remaining = remainingOf(m);
   const after = remainingAfter(m, next);
-  // 投入:最少只能改到「舊金額 − 剩餘」;退還:最多只能改到「舊金額 + 剩餘」。
-  // 兩個都是 remainingAfter() = 0 的那個解,不是另外推導出來的第二條算式。
-  const bound = m.direction === 'in' ? m.amount_minor - remaining : m.amount_minor + remaining;
+  /*
+    可以改到哪裡。合法集合是「變化量 ≥ 0」和「改完剩餘 ≥ 0」的**聯集**
+    (見 blocksPotEdit),所以邊界是兩者中比較寬鬆的那個:
+
+      in  : next ≥ 舊金額 − 剩餘   或   next ≥ 舊金額
+      out : next ≤ 舊金額 + 剩餘   或   next ≤ 舊金額
+
+    剩餘 ≥ 0 時前者比較寬,邊界就是舊的那條算式(行為完全沒變);
+    剩餘 < 0 時後者比較寬,邊界是舊金額本身。兩種情況合起來就是
+    把算式裡的「剩餘」換成 max(剩餘, 0) —— 不是兩段 if。
+
+    ⚠️ 超支時**一定要 clamp**。不 clamp 的話 in 方向會印出一個比舊金額還大的
+    「最少只能改到」(照著填就是把一筆假的投入寫進帳裡,而投入現在直接進淨額,
+    那筆錢會變成他真的可以跟別人收的錢),out 方向更會印出一個**負數**,
+    而 patch 端點要求 amount_minor > 0 —— 訊息指的路根本走不通。
+  */
+  const headroom = Math.max(remaining, 0);
+  const bound = m.direction === 'in' ? m.amount_minor - headroom : m.amount_minor + headroom;
   const what = m.direction === 'in' ? '投入' : '退還';
 
   /*
@@ -145,14 +208,24 @@ export function potRemainingError(m: PotMove, next: number) {
   const money = (minor: number) => formatMoney(minor, m.currency);
   const how = next === 0 ? '刪掉' : `改成 ${money(next)} `;
 
+  // 超支狀態下被擋,講「剩餘不能是負的」會很奇怪 —— 它現在就是負的。
+  // 那種情況被擋的理由是「這次改動會讓它**更**負」,訊息要照實說。
+  const worse = remaining < 0;
+
   return createError({
     statusCode: 409,
     statusMessage: `把這筆 ${money(m.amount_minor)} 的${what}${how}之後,`
       + `${m.pot_name}的${m.currency}剩餘會變成 ${money(after)}(現在是 ${money(remaining)})。`
-      + '剩餘不能是負的 —— 那代表信封裡的錢比公費實際有的還多,'
-      + `而${m.pot_name}已經花掉 ${money(m.spent)}、退還 ${money(m.refunded)}。`
-      + (m.direction === 'in'
-        ? `這筆最少只能改到 ${money(bound)}。要再往下的話,請先確認公費的花費或退還是不是也記錯了。`
-        : `這筆最多只能改到 ${money(bound)}。`),
+      + (worse
+        ? `${m.pot_name}已經超支了(花掉 ${money(m.spent)}、投入只有 ${money(m.contributed)}),`
+          + '這一步會讓缺口更大。'
+          + (m.direction === 'in'
+            ? `這筆只能往上改(最少 ${money(bound)})—— 要往下的話,請先確認公費的花費是不是記多了。`
+            : `這筆只能往下改或直接刪掉(最多 ${money(bound)})。`)
+        : '剩餘不能是負的 —— 那代表信封裡的錢比公費實際有的還多,'
+          + `而${m.pot_name}已經花掉 ${money(m.spent)}、退還 ${money(m.refunded)}。`
+          + (m.direction === 'in'
+            ? `這筆最少只能改到 ${money(bound)}。要再往下的話,請先確認公費的花費或退還是不是也記錯了。`
+            : `這筆最多只能改到 ${money(bound)}。`)),
   });
 }

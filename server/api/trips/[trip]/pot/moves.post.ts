@@ -1,5 +1,6 @@
 import { db } from '../../../../utils/cf';
 import { requireTrip, uid } from '../../../../utils/trip';
+import { formatMoney } from '../../../../utils/money';
 
 /**
  * 一次記錄多筆公費金流(投入 / 退還)。
@@ -108,12 +109,22 @@ export default defineEventHandler(async (event) => {
 
     const remaining = (flow?.contributed ?? 0) - (flow?.spent ?? 0) - (flow?.refunded ?? 0);
     if (total > remaining) {
+      /*
+        ⚠️ 這幾個數字一定要 formatMoney,不能直接內插。
+        它們是最小單位整數,而 TWD 的 exponent 是 2 —— NT$7,000 存的是 700000,
+        直接印出來就是差 100 倍的另一個數字。而 overview.vue 的 potError
+        是把這句 statusMessage **原樣**顯示給使用者的:他剛剛才在同一頁上方
+        看到「剩餘 NT$7,000.00」,這裡卻告訴他信封裡有 700000。
+        同一個上限在 settlements.post.ts 與 utils/pot.ts 都有 formatMoney,
+        三處同源的訊息只有這一支漏掉過。
+      */
+      const fmt = (minor: number) => formatMoney(minor, b.currency);
       throw createError({
         statusCode: 400,
         statusMessage: remaining <= 0
-          ? `${pot.name}目前沒有可退還的${b.currency}(剩餘 ${remaining})。`
+          ? `${pot.name}目前沒有可退還的${b.currency}(剩餘 ${fmt(remaining)})。`
             + '要先有人投入、或先把公費付掉的支出記進來。'
-          : `退還金額 ${total} 超過${pot.name}剩下的 ${remaining} ${b.currency}。`
+          : `退還金額 ${fmt(total)} 超過${pot.name}剩下的 ${fmt(remaining)}。`
             + '退還不能超過公費手上的錢 —— 否則會憑空生出一筆債務。',
       });
     }

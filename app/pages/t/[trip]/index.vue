@@ -18,7 +18,7 @@ import ExpenseDetail from '~/components/expense/ExpenseDetail.vue';
  */
 const tripId = useTripId();
 const api = useApi();
-const { trip, members, memberMap, memberName, fxDefaults } = useTrip(tripId);
+const { trip, members, memberMap, memberName, fxDefaults, pot } = useTrip(tripId);
 
 const baseCurrency = computed(() => trip.value?.base_currency ?? 'TWD');
 const baseLabel = computed(() => CURRENCY_LABEL[baseCurrency.value] ?? baseCurrency.value);
@@ -748,6 +748,7 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
                       :names="memberMap"
                       :base-currency="baseCurrency"
                       :round-seq="roundSeqOf(expense)"
+                      :pot-id="pot?.id ?? null"
                       @edit="askEdit(expense)"
                       @delete="askDelete(expense)"
                     />
@@ -811,6 +812,7 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
                     :names="memberMap"
                     :base-currency="baseCurrency"
                     :round-seq="roundSeqOf(expense)"
+                    :pot-id="pot?.id ?? null"
                     @edit="askEdit(expense)"
                     @delete="askDelete(expense)"
                   />

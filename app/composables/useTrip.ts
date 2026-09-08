@@ -23,10 +23,27 @@ export interface FxDefaults {
   card_fee_pct: number;
 }
 
+/**
+ * GET /api/trips/:trip 的回應形狀。
+ *
+ * ⚠️ 這裡漏一個欄位不會有任何人抱怨 —— 讀取端寫 `state.data.value?.role` 時
+ * TS 會說「TripPayload 沒有 role」,但整個專案的 typecheck 跑不起來
+ * (vue-tsc 需要 TypeScript 5.x,pnpm 卻解到 7.x),所以那四個錯誤一直沒露出來。
+ * 下面四個欄位 server 從一開始就在回(見 server/api/trips/[trip]/index.get.ts),
+ * 只是這個介面沒跟上。
+ */
 export interface TripPayload {
   trip: Trip;
   members: Member[];
   fx_defaults?: FxDefaults;
+  /** 'owner' | 'editor'。owner 才能刪除旅程、看得到分享連結。 */
+  role?: 'owner' | 'editor';
+  /** 還沒有任何帳號擁有這趟。登入的人可以按「認領」。 */
+  orphan?: boolean;
+  /** 只有 owner 拿得到;editor 一律是 null —— 鑰匙不該再被轉發出去。 */
+  share_token?: string | null;
+  /** 沒登入的人在這趟記的帳,換瀏覽器就找不回來,前端要提醒。 */
+  anonymous?: boolean;
 }
 
 /** server 還沒回來之前先用這組,畫面不會閃一下空白 */

@@ -107,7 +107,7 @@ interface Row {
   note: string | null;
   payers: Chip[];
   shares: Chip[];
-  /** 單一付款人而且就是全額 —— 最常見的情況,文案可以簡化成「○○ 全額墊付」 */
+  /** 單一付款人而且就是全額 —— 最常見的情況,只寫名字就夠,不必再標金額 */
   singlePayer: boolean;
   /** 付款合計 − 支出金額。不為 0 就是這筆有問題 */
   payerDiff: number;
@@ -191,7 +191,6 @@ const showTotal = computed(() => groups.value.length > 1);
               <template v-if="row.singlePayer">
                 <span class="chip" :class="{ 'chip-pot': row.payers[0]?.isPot }">
                   {{ row.payers[0]?.name }}
-                  <span class="chip-note">全額墊付</span>
                 </span>
               </template>
               <template v-else-if="row.payers.length">
@@ -343,17 +342,12 @@ const showTotal = computed(() => groups.value.length > 1);
 .chip-amount {
   color: var(--text-muted);
 }
-.chip-note {
-  font-size: 0.6875rem;
-  color: var(--text-muted);
-}
 /* 公費不是人。付款人是公費時要看得出來,不然使用者會問「這筆誰墊的」 */
 .chip-pot {
   background: color-mix(in oklab, var(--brand) 12%, transparent);
   color: var(--brand);
 }
-.chip-pot .chip-amount,
-.chip-pot .chip-note {
+.chip-pot .chip-amount {
   color: color-mix(in oklab, var(--brand) 78%, var(--text-muted));
 }
 .chip-missing {

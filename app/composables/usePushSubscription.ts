@@ -81,7 +81,14 @@ function firstString(...values: unknown[]): string {
 }
 
 /** VAPID public key 是 base64url,subscribe() 要的是位元組。 */
-function decodeVapidKey(base64Url: string): Uint8Array {
+/*
+  回傳型別要寫成 `Uint8Array<ArrayBuffer>`,不能只寫 `Uint8Array`。
+  TypeScript 5.7 起 Uint8Array 對 buffer 型別泛型化,裸寫等於 `Uint8Array<ArrayBufferLike>`,
+  而 ArrayBufferLike 含 SharedArrayBuffer —— 那不是合法的 BufferSource,
+  於是 `pushManager.subscribe({ applicationServerKey })` 兩個多載都對不上。
+  `new Uint8Array(length)` 實際產生的就是 ArrayBuffer 版本,所以這只是把事實寫出來。
+*/
+function decodeVapidKey(base64Url: string): Uint8Array<ArrayBuffer> {
   const padded = base64Url + '='.repeat((4 - (base64Url.length % 4)) % 4);
   const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
   const bytes = new Uint8Array(raw.length);

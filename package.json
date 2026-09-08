@@ -34,6 +34,7 @@
     "@vueuse/nuxt": "14.4.0",
     "nitro-cloudflare-dev": "^0.2.2",
     "tailwindcss": "4.3.3",
+    "typescript": "~5.9.3",
     "vue-tsc": "^3.3.11",
     "workbox-precaching": "^7.4.1",
     "wrangler": "^4.129.0",
