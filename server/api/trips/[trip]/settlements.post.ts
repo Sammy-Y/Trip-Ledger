@@ -1,6 +1,9 @@
 import { db } from '../../../utils/cf';
 import { requireTrip, uid } from '../../../utils/trip';
 import { tripLedger } from '../../../utils/ledger';
+// 金額一律用 formatMoney 印給使用者看:內插 amount_minor 的話 TWD 會差 100 倍
+// (NT$1,000.01 存的是 100001)。這幾句訊息帶的數字是使用者要照著改的。
+import { formatMoney } from '../../../utils/money';
 
 type Body = {
   from_member: string;
@@ -50,6 +53,9 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: `不支援的幣別 ${b.currency}` });
   }
 
+  /** 給使用者看的金額。幣別已經驗過,所以 exponent 一定查得到。 */
+  const fmt = (minor: number) => formatMoney(minor, b.currency);
+
   // ── 公費退還的上限,這裡也要守 ────────────────────────────────
   //
   // pot/moves.post.ts 有這個檢查,但**這一支寫的是完全一樣的那一列**。
@@ -81,8 +87,8 @@ export default defineEventHandler(async (event) => {
       throw createError({
         statusCode: 400,
         statusMessage: remaining <= 0
-          ? `${pot.name}目前沒有可退還的${b.currency}(剩餘 ${remaining})。`
-          : `退還金額 ${b.amount_minor} 超過${pot.name}剩下的 ${remaining} ${b.currency}。`
+          ? `${pot.name}目前沒有可退還的${b.currency}(剩餘 ${fmt(remaining)})。`
+          : `退還金額 ${fmt(b.amount_minor)} 超過${pot.name}剩下的 ${fmt(remaining)}。`
             + '退還不能超過公費手上的錢 —— 否則會憑空生出一筆債務。',
       });
     }
@@ -151,8 +157,8 @@ export default defineEventHandler(async (event) => {
       throw createError({
         statusCode: 409,
         statusMessage: (credit === 0
-          ? `${nameOf(b.to_member)}的帳已經結清了(淨額 0 ${b.currency}),他沒有債權可以被還。`
-          : `${nameOf(b.to_member)}現在也是欠錢的一方(淨額 ${credit} ${b.currency}),`
+          ? `${nameOf(b.to_member)}的帳已經結清了(淨額 ${fmt(0)}),他沒有債權可以被還。`
+          : `${nameOf(b.to_member)}現在也是欠錢的一方(淨額 ${fmt(credit)}),`
             + '不該還錢給一個同樣欠錢的人。')
           + `記下去只會在他身上生出一筆反方向的假債務,而${nameOf(b.from_member)}`
           + '欠的錢其實一分都沒有清掉 —— 他剩下的欠款是欠別人的。'
@@ -162,8 +168,8 @@ export default defineEventHandler(async (event) => {
     if (b.amount_minor > cap) {
       throw createError({
         statusCode: 409,
-        statusMessage: `還款金額 ${b.amount_minor} 超過上限 ${cap} ${b.currency}`
-          + `(${nameOf(b.from_member)}還欠 ${owes},${nameOf(b.to_member)}還被欠 ${credit},`
+        statusMessage: `還款金額 ${fmt(b.amount_minor)} 超過上限 ${fmt(cap)}`
+          + `(${nameOf(b.from_member)}還欠 ${fmt(owes)},${nameOf(b.to_member)}還被欠 ${fmt(credit)},`
           + '上限取兩者較小的那個)。'
           + '多記的話會在收款人身上生出一筆反方向的假債務。請重新整理看最新金額。',
       });

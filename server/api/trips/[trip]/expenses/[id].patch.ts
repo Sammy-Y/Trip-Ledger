@@ -1,7 +1,7 @@
 import { db } from '../../../../utils/cf';
 import { requireTrip } from '../../../../utils/trip';
 import { rateOn } from '../../../../utils/fx';
-import { toMinor } from '../../../../utils/money';
+import { toMinor, formatMoney } from '../../../../utils/money';
 import { splitEqually, splitByShares } from '../../../../utils/settle';
 
 /**
@@ -178,14 +178,16 @@ export default defineEventHandler(async (event) => {
 
   const shareSum = [...shares.values()].reduce((a, x) => a + x, 0);
   if (shareSum !== amountMinor) {
-    throw createError({ statusCode: 400, statusMessage: `分攤合計 ${shareSum} 與支出金額 ${amountMinor} 不符` });
+    throw createError({ statusCode: 400, statusMessage: `分攤合計 ${formatMoney(shareSum, b.currency)} `
+      + `與支出金額 ${formatMoney(amountMinor, b.currency)} 不符` });
   }
 
   const payerSum = b.payers.length === 1 && b.payers[0].amount == null
     ? amountMinor
     : b.payers.reduce((s, p) => s + toMinor(p.amount ?? 0, b.currency), 0);
   if (payerSum !== amountMinor) {
-    throw createError({ statusCode: 400, statusMessage: `付款合計 ${payerSum} 與支出金額 ${amountMinor} 不符` });
+    throw createError({ statusCode: 400, statusMessage: `付款合計 ${formatMoney(payerSum, b.currency)} `
+      + `與支出金額 ${formatMoney(amountMinor, b.currency)} 不符` });
   }
 
   // 成員驗證。跨旅程的成員 id、公費當個人花費的付款人、公費出現在分攤名單裡 ——

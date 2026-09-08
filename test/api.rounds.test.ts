@@ -1245,8 +1245,12 @@ group('[16] 「標記已還款」的上限必須用新語意算(JS 檢查與 SQL
     from_member: c.id['民'], to_member: c.id['喧'], currency: 'JPY', amount_minor: 5001,
   });
   eq('多還 1 元 → 409', over.status, 409);
-  check('訊息帶得出目前的欠款 5000',
-    String(over.json.statusMessage ?? '').includes('5000'), String(over.json.statusMessage));
+  // 斷言的是**使用者看到的字串**,所以要含幣別符號與千分位 ——
+  // 這一條同時在守「訊息裡的金額有經過 formatMoney」:直接內插 amount_minor
+  // 的話 TWD 會差 100 倍(NT$1,000.01 存的是 100001),而這幾句訊息帶的數字
+  // 正是使用者要照著改的。
+  check('訊息帶得出目前的欠款 JP¥5,000',
+    String(over.json.statusMessage ?? '').includes('JP¥5,000'), String(over.json.statusMessage));
   eq('被擋掉就是一列都沒寫', countSettlements(c.tripId), 1);
 
   // 核心斷言:照著畫面的金額按下去必須成功。
@@ -1319,8 +1323,8 @@ group('[17] 還款上限是 min(付款人欠款, 收款人債權) —— 只看�
     from_member: c.id['喧'], to_member: c.id['民'], currency: 'JPY', amount_minor: 13000,
   });
   eq('送 owes(喧) = 13,000(超過民的債權 7,000)→ 409', exploit.status, 409);
-  check('訊息說得出上限 7000 與付款人的欠款 13000',
-    ['7000', '13000'].every((s) => String(exploit.json.statusMessage ?? '').includes(s)),
+  check('訊息說得出上限 JP¥7,000 與付款人的欠款 JP¥13,000',
+    ['JP¥7,000', 'JP¥13,000'].every((s) => String(exploit.json.statusMessage ?? '').includes(s)),
     String(exploit.json.statusMessage));
   eq('被擋掉就是一列都沒寫', countSettlements(c.tripId), 0);
 

@@ -11,7 +11,8 @@
  * 只有「換算本位幣」那一欄是估算的參考值,而且必須標明。
  */
 import type { Balance, Expense, Kind } from '~~/shared/types';
-import { CURRENCY_LABEL, formatMoney } from '~~/shared/money';
+import { CURRENCY_LABEL, EXPONENT, formatMoney, fromMinor, toMinor } from '~~/shared/money';
+import { splitEqually } from '~~/shared/split';
 
 const tripId = useTripId();
 const api = useApi();
@@ -128,13 +129,13 @@ const netsByMember = computed(() => {
  * 而不是每個人開一次對話框填一次(兩個人就要開兩次,四個人四次)。
  *
  * 但資料模型仍然是逐人一筆金額 —— 因為「每人一樣」是常見情況而不是規則
- * (有人先墊多一點、有人身上剛好沒零錢)。所以留一個「每人金額不同」的開關,
+ * (有人先墊多一點、有人身上剛好沒零錢)。所以留一個「自訂金額」的開關,
  * 打開後可以逐人微調。常見情況一次搞定,例外情況也表達得出來。
  */
 const potSheetOpen = ref(false);
 const potDirection = ref<'in' | 'out'>('in');
 const potCurrency = ref('JPY');
-/** 共用金額(人類單位)。每人金額不同時當成各人的預設值。 */
+/** 共用金額(人類單位)。切到自訂金額時當成各人的預設值。 */
 const potAmount = ref<number | null>(null);
 /** 勾選的成員 id */
 const potPicked = ref<string[]>([]);
@@ -147,11 +148,14 @@ const potError = ref('');
 
 const CURRENCIES = ['JPY', 'TWD'];
 
-const potExponent = computed(() => (potCurrency.value === 'JPY' ? 0 : 2));
-const potStep = computed(() => (potExponent.value === 0 ? '1' : '0.01'));
+/** 輸入框的 step。日幣沒有輔幣,給 0.01 會讓瀏覽器允許打出 0.5 圓這種不存在的金額。 */
+function stepFor(currency: string): string {
+  return (EXPONENT[currency] ?? 2) === 0 ? '1' : '0.01';
+}
+const potStep = computed(() => stepFor(potCurrency.value));
 function toMinorPot(v: number | null | undefined): number {
   if (v == null || !Number.isFinite(v)) return 0;
-  return Math.round(v * 10 ** potExponent.value);
+  return toMinor(v, potCurrency.value);
 }
 
 function openPotSheet(direction: 'in' | 'out') {
@@ -177,24 +181,89 @@ function togglePicked(id: string) {
 function pickAll() { potPicked.value = people.value.map(m => m.id); }
 function pickNone() { potPicked.value = []; }
 
-/** 切到逐人模式時,把共用金額帶進每個人 —— 從零開始填太慢 */
-watch(potPerPerson, (on) => {
-  if (!on) return;
+/**
+ * 切到逐人模式時,把共用金額帶進每個人 —— 從零開始填太慢。
+ *
+ * 刻意做成一個明確的函式,而不是 watch(potPerPerson):下面的「平分」也要打開
+ * 這個開關,但它自己已經把每個人的金額算好了。watch 是延後才跑的,
+ * 會在平分寫完之後才把共用金額蓋回去,平分的結果就這樣無聲消失。
+ */
+function seedPerPersonFromShared() {
   const next: Record<string, number | null> = {};
   for (const m of people.value) next[m.id] = potAmount.value;
   potAmounts.value = next;
-});
+}
+function togglePerPerson() {
+  if (!potPerPerson.value) seedPerPersonFromShared();
+  potPerPerson.value = !potPerPerson.value;
+}
 
+/**
+ * 兩個金額欄位**互斥**:勾了「自訂金額」就只認下面每個人的欄位,
+ * 沒勾就只認上面那個共用的。畫面上停用的那一個一定不參與計算。
+ *
+ * 舊版在逐人模式下會 fallback 回共用金額(還沒個別改過的人跟著上面走)。
+ * 拿掉的理由:那讓一個**畫面上已經停用**的欄位繼續在背後決定金額 ——
+ * 使用者看到的和送出去的不是同一件事,而「為什麼這個人是 5,000」
+ * 在畫面上完全找不到出處。
+ *
+ * 舊註解擔心的是「先打開開關、共用欄位還是空的」會變成一個算不出總額
+ * 又不解釋的死畫面。現在那條路徑是這樣講清楚的:
+ *  1. 上面的欄位真的 disabled 並在 hint 說明金額改到下面填(不是壞掉);
+ *  2. 下面每個人的欄位在逐人模式下是唯一可以打字的地方,而且長得像可輸入的;
+ *  3. 全部都空的時候,問題區直接說「金額欄位換到下面了,請逐人填」,
+ *     而不是列出一長串名字的「還沒填金額」。
+ */
 function amountOf(id: string): number | null {
   if (!potPerPerson.value) return potAmount.value;
-  // 逐人模式下,還沒被個別改過的人仍然跟著上面那個共用金額走。
-  // 否則「先打開逐人開關、才輸入金額」的順序會讓上面的欄位變成死的:
-  // 打了數字合計還是 0,畫面只說「還沒填金額」而不解釋為什麼。
-  const own = potAmounts.value[id];
-  return own == null ? potAmount.value : own;
+  return potAmounts.value[id] ?? null;
 }
 function setAmountOf(id: string, v: number | null) {
   potAmounts.value = { ...potAmounts.value, [id]: v };
+}
+
+// ── 退還:平分剩餘 ───────────────────────────────────────────
+/** 目前幣別的公費剩餘 —— 「平分」要分的就是這個數字。 */
+const potRemainingMinor = computed(() => remainingOf(potCurrency.value));
+
+/** 不能平分的原因。有值就 disabled,而且要把原因講出來。 */
+const splitBlockedReason = computed<string>(() => {
+  const label = CURRENCY_LABEL[potCurrency.value] ?? potCurrency.value;
+  if (potRemainingMinor.value < 0) return `${label}的公費是超支的,沒有現金可以退還。`;
+  if (potRemainingMinor.value === 0) return `${label}的公費剩餘是 0,沒有東西可以分。`;
+  if (!potPicked.value.length) return '先勾選要退給誰,才知道這筆要分給幾個人。';
+  return '';
+});
+
+/**
+ * 把剩餘平分給勾選的人。旅程結束把剩下的現金分回去,最常見的就是這個動作。
+ *
+ * 一定要用 shared/split.ts 的 splitEqually():它用最大餘數法,保證
+ * sum(每個人) **精確等於**剩餘。自己寫除法的話 JP¥67,885 分給 2 個人會變成
+ * 33,942 × 2 = 67,884,少的那 1 圓會永遠卡在公費裡,剩餘再也歸不了零。
+ *
+ * 順手打開「自訂金額」—— 有餘數時每個人的數字本來就不一樣(33,943 / 33,942),
+ * 一個共用欄位表達不出來。
+ */
+function splitRemainingEqually() {
+  if (splitBlockedReason.value) return;
+  const shares = splitEqually(potRemainingMinor.value, potPicked.value);
+  const next: Record<string, number | null> = {};
+  // 沒勾的人要清成 null,否則上一次平分的殘值會在重新勾選他之後突然冒出來
+  for (const m of people.value) next[m.id] = null;
+  for (const [id, minor] of shares) next[id] = fromMinor(minor, potCurrency.value);
+  potAmounts.value = next;
+  potPerPerson.value = true;
+
+  /*
+    分不到錢的人要取消勾選,不能留著一個 0。
+    剩餘比人數還少的時候會走到這裡(JP¥1 分給 3 個人 = 1 / 0 / 0),
+    而勾選的語意是「這個人會拿到錢」—— 留著 0 的話那兩個人既在名單上、
+    金額又是 0,potMissing 會把他們當成「還沒填金額」,於是畫面一邊顯示著 0、
+    一邊說你沒填,而且「記下來」是鎖住的,使用者完全不知道該做什麼。
+    (退還 0 元本來就不該寫成一筆金流,server 端也會擋。)
+  */
+  potPicked.value = potPicked.value.filter(id => (shares.get(id) ?? 0) > 0);
 }
 
 /** 送給 API 的 entries。只含勾選、且金額 > 0 的人。 */
@@ -212,6 +281,11 @@ const potMissing = computed(() =>
 const potProblems = computed<string[]>(() => {
   const out: string[] = [];
   if (!potPicked.value.length) out.push('請至少勾選一個人');
+  // 「先打開逐人開關、共用欄位還是空的」就是這條路徑。列出每一個人的名字
+  // 在這裡沒有幫助 —— 要講的是「可以打字的欄位換到下面去了」。
+  else if (potPerPerson.value && potMissing.value.length === potPicked.value.length) {
+    out.push('已改成逐人填金額 —— 上面的共用欄位停用了,請在下面每個人自己的欄位填。');
+  }
   else if (potMissing.value.length) {
     const names = potMissing.value.map(id => memberName(id)).join('、');
     out.push(`還沒填金額:${names}`);
@@ -235,10 +309,187 @@ async function submitPot() {
     });
     potSheetOpen.value = false;
     await refreshAll();
+    // 紀錄展開著的話一起更新,不然剛記的那幾筆不在列表裡,看起來像沒寫進去
+    if (movesOpen.value) await loadMoves();
   } catch (e) {
     potError.value = api.errorMessage(e);
   } finally {
     potSaving.value = false;
+  }
+}
+
+// ── 逐筆金流:改金額 / 刪除 ──────────────────────────────────
+/**
+ * 為什麼要逐筆,而不是讓人改上面那個「誰投入的」合計:
+ *
+ * 那是**每人合計**。MIN 第一天投 5,000、第二天再投 5,000,合計顯示 10,000,
+ * 這時候說「把它改成 8,000」是沒有指涉的 —— 要改哪一天那一筆? 所以修改一律
+ * 以單筆為單位,而且列表要帶時間,人才分得出來是哪一筆。
+ *
+ * 在這之前唯一的更正手段是「記一筆反向的退還去沖銷」:剩餘會對,
+ * 但帳面上留下兩筆從來沒發生過的金流 —— 數字對了,歷史是假的。
+ */
+interface PotMove {
+  id: string;
+  /** in = 人投入公費;out = 公費退還給人 */
+  direction: 'in' | 'out';
+  member_id: string;
+  currency: string;
+  amount_minor: number;
+  settled_at: string;
+  note: string | null;
+}
+
+const movesOpen = ref(false);
+/** null = 還沒抓過 / 抓失敗(再展開一次會重抓);[] = 抓到了但沒有紀錄 */
+const moves = ref<PotMove[] | null>(null);
+const movesLoading = ref(false);
+const movesError = ref('');
+
+async function loadMoves() {
+  movesLoading.value = true;
+  movesError.value = '';
+  try {
+    const r = await api.get<{ moves: PotMove[] }>(
+      `/api/trips/${encodeURIComponent(tripId.value)}/pot/moves`);
+    moves.value = r?.moves ?? [];
+  }
+  catch (e) {
+    if (isAbortError(e)) return;
+    movesError.value = api.errorMessage(e);
+    moves.value = null;
+  }
+  finally {
+    movesLoading.value = false;
+  }
+}
+
+function toggleMoves() {
+  movesOpen.value = !movesOpen.value;
+  cancelEdit();
+  // 只在第一次展開時抓 —— 這頁進來就抓的話,多數人根本不會打開這一區
+  if (movesOpen.value && moves.value == null && !movesLoading.value) void loadMoves();
+}
+
+/**
+ * settled_at 來自 SQLite 的 datetime('now'):'2026-09-07 04:12:33'(UTC 但沒有 Z)。
+ * 沒有時區標記時部分瀏覽器會當成當地時間,差 8 小時 —— 自己補上 Z。
+ */
+function moveTimeText(raw: string): string {
+  if (!raw) return '';
+  const t = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const iso = /([Zz]|[+-]\d{2}:?\d{2})$/.test(t) ? t : `${t}Z`;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return raw;
+  return d.toLocaleString('zh-TW', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+/** 某幣別現在的公費剩餘。那個幣別還沒有任何金流時就是 0。 */
+function remainingOf(currency: string): number {
+  return potInfo.value?.by_currency.find(r => r.currency === currency)?.remainingMinor ?? 0;
+}
+
+/**
+ * 把這一筆改成 nextMinor(刪除就是 0)之後,那個幣別的剩餘會變成多少。
+ *
+ * 確認文案一定要講得出這個數字 —— 「確定刪除?」沒有告訴使用者他會失去什麼,
+ * 而公費的剩餘正是他唯一在乎的那個數。
+ * 投入的一筆變小 → 剩餘跟著變小;退還的一筆變小 → 錢沒退出去,剩餘反而變大。
+ */
+function remainingAfter(m: PotMove, nextMinor: number): number {
+  const delta = nextMinor - m.amount_minor;
+  return remainingOf(m.currency) + (m.direction === 'in' ? delta : -delta);
+}
+
+const editingId = ref<string | null>(null);
+/** 編輯中的金額(人類單位) */
+const editAmount = ref<number | null>(null);
+const moveSaving = ref(false);
+/**
+ * 單筆操作的錯誤。**409(改完剩餘會變負)的原文要原封不動顯示** ——
+ * 那句話帶著數字,是使用者唯一能理解「為什麼被擋下來」的線索,
+ * 換成「操作失敗」等於把它吞掉。
+ */
+const moveError = ref('');
+
+const editing = computed<PotMove | null>(
+  () => moves.value?.find(m => m.id === editingId.value) ?? null);
+
+const editMinor = computed(() => {
+  const m = editing.value;
+  if (!m || editAmount.value == null || !Number.isFinite(editAmount.value)) return 0;
+  return toMinor(editAmount.value, m.currency);
+});
+
+function startEdit(m: PotMove) {
+  editingId.value = m.id;
+  editAmount.value = fromMinor(m.amount_minor, m.currency);
+  moveError.value = '';
+}
+function cancelEdit() {
+  editingId.value = null;
+  editAmount.value = null;
+  moveError.value = '';
+}
+
+async function saveEdit() {
+  const m = editing.value;
+  if (!m || moveSaving.value) return;
+  if (editMinor.value <= 0) {
+    moveError.value = '金額要大於 0。想把這筆整個拿掉請用「刪除」。';
+    return;
+  }
+  // 沒改就當成取消,不要為了同一個數字打一次 API
+  if (editMinor.value === m.amount_minor) { cancelEdit(); return; }
+
+  moveSaving.value = true;
+  moveError.value = '';
+  try {
+    await api.patch(
+      `/api/trips/${encodeURIComponent(tripId.value)}/pot/moves/${encodeURIComponent(m.id)}`,
+      { amount_minor: editMinor.value });
+    editingId.value = null;
+    editAmount.value = null;
+    // 兩邊都要重抓:列表是這一筆的新金額,balance 是上面那塊的剩餘
+    await Promise.all([loadMoves(), refreshAll()]);
+  }
+  catch (e) {
+    moveError.value = api.errorMessage(e);
+  }
+  finally {
+    moveSaving.value = false;
+  }
+}
+
+/** 刪除確認走 UiAppSheet,不用 window.confirm —— 那裡塞不進「剩餘會變成多少」。 */
+const deleteTarget = ref<PotMove | null>(null);
+const deletingMove = ref(false);
+const deleteError = ref('');
+
+function askDeleteMove(m: PotMove) {
+  deleteTarget.value = m;
+  deleteError.value = '';
+}
+
+async function confirmDeleteMove() {
+  const m = deleteTarget.value;
+  if (!m || deletingMove.value) return;
+  deletingMove.value = true;
+  deleteError.value = '';
+  try {
+    await api.del(
+      `/api/trips/${encodeURIComponent(tripId.value)}/pot/moves/${encodeURIComponent(m.id)}`);
+    deleteTarget.value = null;
+    if (editingId.value === m.id) cancelEdit();
+    await Promise.all([loadMoves(), refreshAll()]);
+  }
+  catch (e) {
+    deleteError.value = api.errorMessage(e);
+  }
+  finally {
+    deletingMove.value = false;
   }
 }
 </script>
@@ -356,6 +607,126 @@ async function submitPot() {
                 <UiMoney :minor="r.amountMinor" :currency="row.currency" size="sm" />
               </li>
             </ul>
+          </div>
+        </div>
+
+        <!--
+          ── 逐筆金流 ──
+          上面那兩份是**每人合計**,合計沒辦法指認「是哪一天那一筆」,
+          所以改錯 / 刪掉一律從這裡進去。摘要留著,這只是多一層可展開的細節。
+        -->
+        <div v-if="potInfo?.by_currency.length" class="mt-3">
+          <button
+            type="button" class="moves-toggle"
+            :aria-expanded="movesOpen"
+            @click="toggleMoves"
+          >
+            <Icon name="lucide:receipt-text" size="15" class="shrink-0" style="color: var(--text-muted)" />
+            <span class="min-w-0 flex-1 text-left text-sm font-medium">金流紀錄</span>
+            <span class="shrink-0 text-xs" style="color: var(--text-muted)">記錯了可以改或刪</span>
+            <Icon
+              :name="movesOpen ? 'lucide:chevron-up' : 'lucide:chevron-down'"
+              size="16" class="shrink-0" style="color: var(--text-muted)"
+            />
+          </button>
+
+          <div v-if="movesOpen" class="card mt-2 overflow-hidden">
+            <div class="row-head px-3 py-2 text-[0.6875rem] leading-relaxed" style="color: var(--text-muted)">
+              逐筆列出,新的在最上面。改金額或刪除都只動被指定的那一筆。
+            </div>
+
+            <UiLoadingBlock v-if="movesLoading && moves == null" :rows="3" variant="plain" class="p-3" />
+
+            <div v-else-if="movesError" class="p-3">
+              <p class="text-sm leading-relaxed" style="color: var(--debit)">
+                {{ movesError }}
+              </p>
+              <UiAppButton variant="ghost" class="mt-2" :loading="movesLoading" @click="loadMoves">
+                再試一次
+              </UiAppButton>
+            </div>
+
+            <p v-else-if="!moves?.length" class="p-3 text-sm leading-relaxed" style="color: var(--text-muted)">
+              還沒有任何公費金流。
+            </p>
+
+            <div v-else class="divided">
+              <div v-for="m in moves" :key="m.id" class="px-3 py-2.5">
+                <div class="flex items-center gap-2">
+                  <span
+                    class="move-dir"
+                    :style="m.direction === 'in'
+                      ? { background: 'color-mix(in oklab, var(--credit) 15%, transparent)', color: 'var(--credit)' }
+                      : { background: 'color-mix(in oklab, var(--warn) 18%, transparent)', color: 'var(--warn)' }"
+                  >
+                    {{ m.direction === 'in' ? '投入' : '退還' }}
+                  </span>
+                  <span class="min-w-0 flex-1 truncate text-sm">{{ memberName(m.member_id) }}</span>
+
+                  <div v-if="editingId === m.id" class="pick-amount">
+                    <input
+                      class="cell-input tnum" type="number" :step="stepFor(m.currency)"
+                      min="0" inputmode="decimal" placeholder="0"
+                      :value="editAmount ?? ''"
+                      :aria-label="`${memberName(m.member_id)} 這筆的金額`"
+                      @input="editAmount = ($event.target as HTMLInputElement).value === ''
+                        ? null : Number(($event.target as HTMLInputElement).value)"
+                    >
+                  </div>
+                  <UiMoney v-else :minor="m.amount_minor" :currency="m.currency" size="sm" />
+                </div>
+
+                <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.6875rem]"
+                     style="color: var(--text-muted)">
+                  <span class="tnum shrink-0">{{ moveTimeText(m.settled_at) }}</span>
+                  <span class="shrink-0">{{ CURRENCY_LABEL[m.currency] ?? m.currency }}</span>
+                  <span v-if="m.note" class="min-w-0 truncate">{{ m.note }}</span>
+                  <span class="flex-1" />
+                  <!-- 兩顆動作綁成一組:窄版換行時要一起換,不能「刪除」自己掉到下一行 -->
+                  <span class="flex shrink-0 items-center gap-1">
+                    <template v-if="editingId === m.id">
+                      <button type="button" class="link-btn" :disabled="moveSaving" @click="cancelEdit">
+                        取消
+                      </button>
+                      <button type="button" class="link-btn" :disabled="moveSaving" @click="saveEdit">
+                        <Icon v-if="moveSaving" name="lucide:loader-circle" size="13" class="animate-spin" />
+                        <Icon v-else name="lucide:check" size="13" />
+                        儲存
+                      </button>
+                    </template>
+                    <template v-else>
+                      <button type="button" class="link-btn" @click="startEdit(m)">
+                        <Icon name="lucide:pencil" size="13" /> 改金額
+                      </button>
+                      <button type="button" class="link-btn link-danger" @click="askDeleteMove(m)">
+                        <Icon name="lucide:trash-2" size="13" /> 刪除
+                      </button>
+                    </template>
+                  </span>
+                </div>
+
+                <!-- 改完剩餘會變成多少 —— 送出前的人眼檢查,和刪除確認講的是同一件事 -->
+                <p v-if="editingId === m.id" class="mt-1.5 text-[0.6875rem] leading-relaxed"
+                   style="color: var(--text-muted)">
+                  <template v-if="editMinor > 0">
+                    改成 {{ formatMoney(editMinor, m.currency) }} 之後,{{ CURRENCY_LABEL[m.currency] ?? m.currency }}剩餘會從
+                    <span class="tnum">{{ formatMoney(remainingOf(m.currency), m.currency) }}</span>
+                    變成
+                    <span
+                      class="tnum font-semibold"
+                      :style="{ color: remainingAfter(m, editMinor) < 0 ? 'var(--warn)' : 'var(--text)' }"
+                    >{{ formatMoney(remainingAfter(m, editMinor), m.currency) }}</span>。
+                  </template>
+                  <template v-else>
+                    金額要大於 0。想把這筆整個拿掉請用「刪除」。
+                  </template>
+                </p>
+                <p v-if="editingId === m.id && moveError" class="mt-1.5 text-xs leading-relaxed"
+                   role="alert" style="color: var(--debit)">
+                  {{ moveError }}
+                </p>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -514,7 +885,11 @@ async function submitPot() {
           </template>
         </p>
 
-        <!-- 幣別 + 共用金額。金額填一次,套用到所有勾選的人。 -->
+        <!--
+          幣別 + 共用金額。金額填一次,套用到所有勾選的人。
+          打開「自訂金額」之後這個欄位會停用 —— 兩個金額欄位任何時候
+          只有一個是活的,停用的那個不參與計算(見 amountOf 的說明)。
+        -->
         <div class="grid grid-cols-2 gap-3">
           <UiAppField
             v-model="potCurrency" label="幣別" type="select"
@@ -522,8 +897,10 @@ async function submitPot() {
           />
           <UiAppField
             v-model.number="potAmount"
-            :label="potPerPerson ? '金額(預設值)' : '每人金額'"
+            :label="potPerPerson ? '每人金額(停用中)' : '每人金額'"
             type="number" :step="potStep" inputmode="decimal" placeholder="0"
+            :disabled="potPerPerson"
+            :hint="potPerPerson ? '金額改到下面每個人自己的欄位填' : undefined"
           />
         </div>
 
@@ -557,22 +934,48 @@ async function submitPot() {
                 <span class="truncate">{{ m.name }}</span>
               </button>
 
-              <!-- 逐人模式:每個人自己一個金額欄 -->
-              <div v-if="potPerPerson && isPicked(m.id)" class="pick-amount">
+              <!--
+                每個人的金額欄一直在,只是共用模式下停用 —— 它那時顯示的是
+                上面那個共用金額(他會被記多少,不用心算)。
+                欄位不隨模式消失才看得出來:開關切的是「哪一邊可以打字」。
+              -->
+              <div v-if="isPicked(m.id)" class="pick-amount" :class="{ 'is-off': !potPerPerson }">
                 <input
                   class="cell-input tnum" type="number" :step="potStep"
                   min="0" inputmode="decimal" placeholder="0"
                   :value="amountOf(m.id) ?? ''"
+                  :disabled="!potPerPerson"
                   :aria-label="`${m.name} 的金額`"
                   @input="setAmountOf(m.id, ($event.target as HTMLInputElement).value === ''
                     ? null : Number(($event.target as HTMLInputElement).value))"
                 >
               </div>
-              <!-- 共用模式:顯示他會被記多少,不用心算 -->
-              <span v-else-if="isPicked(m.id) && potTotalMinor > 0" class="shrink-0 pr-2">
-                <UiMoney :minor="toMinorPot(potAmount)" :currency="potCurrency" size="sm" />
-              </span>
             </div>
+          </div>
+
+          <!--
+            平分只在退還時出現 —— 投入是「大家說好各拿多少」,沒有一個既有的
+            總額可以分;退還則相反,要分的就是公費現在剩下的現金。
+          -->
+          <div v-if="potDirection === 'out'" class="mt-2.5">
+            <UiAppButton
+              variant="ghost" block
+              :disabled="!!splitBlockedReason"
+              @click="splitRemainingEqually"
+            >
+              <Icon name="lucide:split" />
+              平分剩餘 {{ formatMoney(Math.max(potRemainingMinor, 0), potCurrency) }}
+            </UiAppButton>
+            <p
+              class="mt-1.5 text-xs leading-relaxed"
+              :style="{ color: splitBlockedReason ? 'var(--warn)' : 'var(--text-muted)' }"
+            >
+              <template v-if="splitBlockedReason">{{ splitBlockedReason }}</template>
+              <template v-else>
+                分給勾選的 {{ potPicked.length }} 個人。除不盡的餘數會分給前面幾個人,
+                所以加起來精確等於剩餘 —— 不會有 1 塊錢卡在公費裡歸不了零。
+              </template>
+            </p>
           </div>
 
           <p v-if="!people.length" class="mt-2 text-xs" style="color: var(--warn)">
@@ -586,15 +989,21 @@ async function submitPot() {
           class="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left"
           style="background: var(--bg-sunken)"
           :aria-pressed="potPerPerson"
-          @click="potPerPerson = !potPerPerson"
+          @click="togglePerPerson"
         >
           <span class="pick-box" :class="{ 'is-on': potPerPerson }">
             <Icon v-if="potPerPerson" name="lucide:check" size="14" />
           </span>
           <span class="min-w-0 flex-1">
-            <span class="block text-sm">每人金額不同</span>
+            <span class="block text-sm">自訂金額</span>
             <span class="block text-xs" style="color: var(--text-muted)">
-              有人先墊多一點、或身上沒零錢的時候打開,可以逐人微調。
+              <template v-if="potPerPerson">
+                金額改由每個人自己的欄位決定,上面那個共用欄位停用中。
+              </template>
+              <template v-else>
+                有人先墊多一點、或身上沒零錢的時候打開,可以逐人微調
+                (上面填好的金額會先帶進每個人)。
+              </template>
             </span>
           </span>
         </button>
@@ -633,6 +1042,67 @@ async function submitPot() {
         </UiAppButton>
       </div>
     </UiAppSheet>
+
+    <!--
+      ── 刪除單筆金流的確認 ──
+      文案必須說出後果:剩餘會從多少變成多少。只問「確定刪除?」等於要使用者
+      自己心算公費還剩多少 —— 而那正是他刪這筆的原因。
+    -->
+    <UiAppSheet
+      :open="!!deleteTarget"
+      title="刪掉這筆公費金流?"
+      :dismissible="!deletingMove"
+      @update:open="(v) => !v && (deleteTarget = null)"
+    >
+      <div v-if="deleteTarget" class="space-y-3">
+        <div class="rounded-xl px-3 py-2.5" style="background: var(--bg-sunken)">
+          <div class="flex items-center gap-2">
+            <span
+              class="move-dir"
+              :style="deleteTarget.direction === 'in'
+                ? { background: 'color-mix(in oklab, var(--credit) 15%, transparent)', color: 'var(--credit)' }
+                : { background: 'color-mix(in oklab, var(--warn) 18%, transparent)', color: 'var(--warn)' }"
+            >
+              {{ deleteTarget.direction === 'in' ? '投入' : '退還' }}
+            </span>
+            <span class="min-w-0 flex-1 truncate text-sm">{{ memberName(deleteTarget.member_id) }}</span>
+            <UiMoney :minor="deleteTarget.amount_minor" :currency="deleteTarget.currency" size="sm" />
+          </div>
+          <p class="mt-1 text-[0.6875rem]" style="color: var(--text-muted)">
+            <span class="tnum">{{ moveTimeText(deleteTarget.settled_at) }}</span>
+            <span class="mx-1">·</span>
+            <span>{{ CURRENCY_LABEL[deleteTarget.currency] ?? deleteTarget.currency }}</span>
+          </p>
+        </div>
+
+        <p class="text-sm leading-relaxed">
+          刪掉之後,{{ CURRENCY_LABEL[deleteTarget.currency] ?? deleteTarget.currency }}的{{ pot?.name ?? '公費' }}剩餘會從
+          <span class="tnum font-semibold">{{ formatMoney(remainingOf(deleteTarget.currency), deleteTarget.currency) }}</span>
+          變成
+          <span class="tnum font-semibold">{{ formatMoney(remainingAfter(deleteTarget, 0), deleteTarget.currency) }}</span>。
+          這筆會從歷史裡整個消失,無法復原。
+        </p>
+
+        <p v-if="remainingAfter(deleteTarget, 0) < 0" class="flex items-start gap-1.5 text-xs leading-relaxed"
+           style="color: var(--warn)">
+          <Icon name="lucide:circle-alert" size="14" class="mt-px shrink-0" />
+          <span>這會讓剩餘變成負的(公費付出去的比手上的多),伺服器會擋下來。</span>
+        </p>
+
+        <p v-if="deleteError" class="text-sm leading-relaxed" role="alert" style="color: var(--debit)">
+          {{ deleteError }}
+        </p>
+      </div>
+
+      <template #footer>
+        <UiAppButton variant="ghost" block :disabled="deletingMove" @click="deleteTarget = null">
+          取消
+        </UiAppButton>
+        <UiAppButton variant="primary" block :loading="deletingMove" @click="confirmDeleteMove">
+          刪除
+        </UiAppButton>
+      </template>
+    </UiAppSheet>
   </div>
 </template>
 
@@ -655,6 +1125,55 @@ async function submitPot() {
   .link-btn:hover {
     background: color-mix(in oklab, var(--brand) 10%, transparent);
   }
+  .link-danger:hover {
+    background: color-mix(in oklab, var(--debit) 10%, transparent);
+  }
+}
+.link-btn:disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+/* 刪除是唯一不可復原的動作,顏色要和「改金額」分得開 */
+.link-danger {
+  color: var(--debit);
+}
+
+/* 卡片內的列表分隔線 / 欄名列。和結算頁用同一組名字,不另外發明。 */
+.divided > * + * {
+  border-top: 1px solid var(--border);
+}
+.row-head {
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 金流紀錄的展開入口。做成一整條可按的列,手指好按。 */
+.moves-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  padding-inline: 0.75rem;
+  border-radius: 0.75rem;
+  background: var(--bg-sunken);
+  color: var(--text);
+  transition: background-color 0.15s ease;
+}
+@media (hover: hover) {
+  .moves-toggle:hover {
+    background: color-mix(in oklab, var(--brand) 8%, var(--bg-sunken));
+  }
+}
+
+/* 投入 / 退還的方向標。逐筆列表裡這是第一眼要分辨的東西。 */
+.move-dir {
+  flex-shrink: 0;
+  padding: 0.125rem 0.4rem;
+  border-radius: 0.375rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .pick-row {
@@ -714,6 +1233,15 @@ async function submitPot() {
 .pick-amount:focus-within {
   border-color: var(--brand);
 }
+/* 共用模式下這一欄是唯讀的鏡子(顯示上面填的金額),要看得出來不能打字 */
+.pick-amount.is-off {
+  background: transparent;
+  border-color: transparent;
+}
+.cell-input:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
 .cell-input {
   flex: 1 1 0;
   min-width: 0;
@@ -736,7 +1264,8 @@ async function submitPot() {
   .link-btn,
   .pick-row,
   .pick-box,
-  .pick-amount {
+  .pick-amount,
+  .moves-toggle {
     transition: none;
   }
 }
