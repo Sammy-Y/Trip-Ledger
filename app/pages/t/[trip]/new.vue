@@ -12,9 +12,16 @@
  *
  * 所以現在:送出成功 → 留在這頁、清掉「這一筆是什麼」、保留「現在在什麼
  * 情境記帳」(幣別、日期、付款人、分攤…見 ExpenseForm.startNextEntry),
- * 游標回到說明欄。上方出現一條可以點回列表的確認訊息。
+ * 游標回到說明欄。
  *
- * 要離開的人照舊有下面的導覽列,以及那條訊息裡的「看支出列表」。
+ * 確認訊息是**浮起來一下就消失的 toast**,不是卡片。試過卡片版本
+ * (帶邊框、匯率、「看支出列表」連結固定在表單上方)—— 那東西太重了:
+ * 它把整張表單往下推,而且一直留在畫面上,連續記三筆就看三次同一塊東西。
+ * 使用者要的只是「有沒有存進去」這一個訊號,那用一句話兩秒鐘就夠。
+ *
+ * 匯率沒有因此消失 —— 它在支出明細裡(ExpenseDetail 的「換算匯率」那節),
+ * 那裡才是回頭稽核的地方;記帳當下沒有人在核匯率。
+ * 「記了幾筆」留在標題旁邊,那是 toast 消失之後唯一還看得到的證據。
  */
 const route = useRoute();
 const tripId = computed(() => String(route.params.trip ?? ''));
@@ -24,18 +31,21 @@ const api = useApi();
 const submitting = ref(false);
 const errorMessage = ref<string | null>(null);
 
-interface SavedEntry {
-  id: string;
-  description: string;
-  fx_rate: number | null;
-  fx_rate_date: string | null;
-  fx_rate_source?: string | null;
-}
-
-/** 最近成功記下的那一筆。顯示到下一次送出為止 —— 匯率是可稽核性的一部分。 */
-const saved = ref<SavedEntry | null>(null);
-/** 這一輪連續記了幾筆。讓使用者知道自己真的記進去了幾筆,而不用切去列表數。 */
+/** 這一輪連續記了幾筆。toast 消失之後,這是唯一還看得到的「有記進去」的證據。 */
 const savedCount = ref(0);
+
+/** toast 的文字。null = 不顯示。 */
+const toast = ref<string | null>(null);
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+
+function showToast(text: string): void {
+  toast.value = text;
+  // 連按兩次的話重新計時,不要讓第一次的 timer 把第二次的訊息提早收掉。
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.value = null; }, 2600);
+}
+// 元件卸載時要清掉 —— 否則 timer 會在頁面已經不在的時候寫一個死掉的 ref。
+onBeforeUnmount(() => clearTimeout(toastTimer));
 
 const form = useTemplateRef<{ startNextEntry: () => void }>('form');
 
@@ -43,10 +53,11 @@ async function onSubmit(payload: Record<string, unknown>) {
   submitting.value = true;
   errorMessage.value = null;
   try {
-    const res = await api.post<SavedEntry>(
+    await api.post<{ id: string }>(
       `/api/trips/${encodeURIComponent(tripId.value)}/expenses`, payload);
-    saved.value = { ...res, description: String(payload.description ?? '') };
     savedCount.value += 1;
+    const what = String(payload.description ?? '').trim();
+    showToast(what ? `已記下「${what}」` : '已記下');
     form.value?.startNextEntry();
   }
   catch (e) {
@@ -83,31 +94,6 @@ async function onSubmit(payload: Record<string, unknown>) {
     </UiEmptyState>
 
     <template v-else>
-      <!--
-        確認訊息留在表單**上方**而不是取代表單:取代的話畫面會閃一下、
-        使用者的手要重新找輸入框,而連續記帳最在意的就是那幾秒。
-        它一直留到下一次送出 —— 匯率(用了哪一天、是不是近似值)是這個 App
-        的可稽核性承諾,一秒就消失的話等於沒說。
-      -->
-      <div
-        v-if="saved"
-        class="card mb-4 flex flex-wrap items-center gap-x-3 gap-y-1.5 p-3"
-        style="border-color: color-mix(in oklab, var(--credit) 40%, var(--border))"
-        role="status"
-      >
-        <Icon name="lucide:check-circle" size="18" class="shrink-0" style="color: var(--credit)" />
-        <p class="min-w-0 flex-1 text-sm">
-          已記下<span class="font-semibold">{{ saved.description || '這筆' }}</span>
-          <span v-if="saved.fx_rate" class="ml-1 text-xs" style="color: var(--text-muted)">
-            · 套用 {{ saved.fx_rate_date }} 的匯率 {{ saved.fx_rate.toFixed(6) }}
-            <span v-if="saved.fx_rate_source?.includes('fallback')" style="color: var(--warn)">(近似值)</span>
-          </span>
-        </p>
-        <NuxtLink :to="`/t/${tripId}`" class="shrink-0 text-xs font-medium" style="color: var(--brand)">
-          看支出列表
-        </NuxtLink>
-      </div>
-
       <ExpenseForm
         ref="form"
         :members="members"
@@ -118,5 +104,70 @@ async function onSubmit(payload: Record<string, unknown>) {
         @submit="onSubmit"
       />
     </template>
+
+    <!--
+      浮起來一下就消失的確認訊息。
+
+      fixed 而不是塞進版面裡:塞進去會把整張表單往下推,而使用者剛按完送出、
+      手正要打下一筆的說明 —— 那一推會讓輸入框跑掉。
+      pointer-events-none 讓它不擋任何點擊(它沒有可以按的東西)。
+      bottom 要閃開手機的 tab bar 與 iOS 的 home indicator。
+    -->
+    <Transition name="toast">
+      <p v-if="toast" class="toast" role="status">
+        <Icon name="lucide:check" size="15" class="shrink-0" />
+        <span class="truncate">{{ toast }}</span>
+      </p>
+    </Transition>
   </div>
 </template>
+
+<style scoped>
+.toast {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  /* 手機:tab bar(約 56px)+ 安全區之上。桌機沒有 tab bar,靠底就好 */
+  bottom: calc(4.75rem + var(--safe-b, 0px));
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: min(22rem, calc(100vw - 2rem));
+  padding: 0.5rem 0.875rem;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--credit) 16%, var(--bg-elevated));
+  border: 1px solid color-mix(in oklab, var(--credit) 35%, transparent);
+  color: var(--text);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.18);
+  pointer-events: none;
+}
+@media (min-width: 768px) {
+  .toast {
+    bottom: 1.5rem;
+  }
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(0.5rem);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-enter-active,
+  .toast-leave-active {
+    transition: opacity 0.18s ease;
+  }
+  .toast-enter-from,
+  .toast-leave-to {
+    transform: translateX(-50%);
+  }
+}
+</style>
