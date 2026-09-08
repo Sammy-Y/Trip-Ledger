@@ -14,8 +14,9 @@ import { tripLedger, assertZeroSum, findUnbalancedExpenses } from '../../../util
  * ── 三個刻意的決定 ──────────────────────────────────────────
  *
  * **只寫 recorded,不寫 deferred。** deferred 是任一端為公費的轉帳。
- * 第一天晚上公費淨額 = −(手上剩的現金),照著寫下去等於把公費清空退還,
- * 而那筆錢明天還要用。公費的結算在旅程結束用「退還」處理。
+ * 淨額不含投入/退還(見 utils/ledger.ts 開頭),所以公費淨額 = +公費花費,
+ * 它的腿長成「人 → 公費」= 「這個人還要投入多少」—— 照著寫進 settlements
+ * 等於幫他記了一筆他沒付的投入,信封裡憑空多出錢。投入與退還一律走總覽頁。
  *
  * **關閉回合等於宣告「這些錢已經付了」**(單階段,沒有 paid_at)。
  * 兩階段(先產生待付清單、之後逐筆勾)會讓同一筆債同時出現在回合裡
@@ -53,7 +54,7 @@ export default defineEventHandler(async (event) => {
   if (!known) throw createError({ statusCode: 400, statusMessage: `不支援的幣別 ${currency}` });
 
   // ── 寫錢之前的所有檢查 ──────────────────────────────────────
-  const [ledger, unbalanced, itemRows, seqRow, fpRow] = await Promise.all([
+  const [ledger, unbalanced, itemRows, seqRow, fpRow, fpExp] = await Promise.all([
     tripLedger(dbh, trip.id, currency),
     findUnbalancedExpenses(dbh, trip.id, currency),
     dbh.prepare(
@@ -69,6 +70,44 @@ export default defineEventHandler(async (event) => {
       `SELECT COUNT(*) AS n, COALESCE(SUM(amount_minor), 0) AS total
        FROM settlements WHERE trip_id = ? AND currency = ?`,
     ).bind(trip.id, currency).first<{ n: number; total: number }>(),
+    // 支出內容的指紋:未結總額,加上付款/分攤兩張子表的加權校驗和。
+    // 同樣是寫入時再核對一次 —— 見下面的樂觀鎖說明。
+    //
+    // ⚠️ 子表**不能直接加總**。付款合計與分攤合計恆等於支出金額
+    // (寫入時驗過,findUnbalancedExpenses 也再驗一次),所以兩個加總永遠是
+    // 同一個數字,看不到「同一筆錢在人之間搬家」——「三人均分改成一個人吃下」
+    // 一分錢都沒動,卻會把每個人的淨額整個換掉。所以要乘上一個跟人有關的權重。
+    //
+    // 權重是 n(1000n + 1),n = 成員在這趟裡的名次(照 id 排,穩定且不必外傳)。
+    // 為什麼不是單純的 n:純線性權重的盲區剛好就是最常見的那種改法 ——
+    // 三人均分改成中間那個人全吃,差量是 (1, −2, 1) 的倍數,加權後剛好抵銷,
+    // 指紋一模一樣。補上二次項之後,三個人要撞上就得讓差量剛好是
+    // (5001, −8002, 3001) 的倍數(NT$50.01 / −NT$80.02 / NT$30.01)—— 手改改不出來。
+    // 權重上限很小(十個人也才十萬),乘上金額仍遠在 2^53 以內 ——
+    // 這很重要,因為這個值要原封不動經過 JS 再送回 SQL 比對,精度掉了就會誤擋。
+    //
+    // 範圍是這個幣別的**全部**共同支出、不限未結的那些,因為回合的算術
+    // 本來就是整趟(見 utils/ledger.ts:算術範圍 vs 明細範圍)。
+    // 只改描述、改分類不會動到這兩張子表 → 指紋不變 → 不會誤擋。
+    dbh.prepare(
+      `SELECT
+         (SELECT COALESCE(SUM(amount_minor), 0) FROM expenses
+           WHERE trip_id = ?1 AND kind = 'shared' AND currency = ?2
+             AND settlement_round_id IS NULL) AS unsettled_total,
+         (SELECT COALESCE(SUM(p.amount_minor * r.n * (1000 * r.n + 1)), 0)
+          FROM expense_payers p
+          JOIN expenses e ON e.id = p.expense_id
+          JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS n
+                FROM members WHERE trip_id = ?1) r ON r.id = p.member_id
+          WHERE e.trip_id = ?1 AND e.kind = 'shared' AND e.currency = ?2) AS paid_fp,
+         (SELECT COALESCE(SUM(s.amount_minor * r.n * (1000 * r.n + 1)), 0)
+          FROM expense_shares s
+          JOIN expenses e ON e.id = s.expense_id
+          JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS n
+                FROM members WHERE trip_id = ?1) r ON r.id = s.member_id
+          WHERE e.trip_id = ?1 AND e.kind = 'shared' AND e.currency = ?2) AS owed_fp`,
+    ).bind(trip.id, currency)
+      .first<{ unsettled_total: number; paid_fp: number; owed_fp: number }>(),
   ]);
 
   if (unbalanced.length) {
@@ -139,8 +178,34 @@ export default defineEventHandler(async (event) => {
      * 外鍵指向這個 round_id → FOREIGN KEY constraint failed → **整個 batch 回滾**。
      * (D1 的 batch 是單一交易,而且 D1 預設開啟外鍵 —— 兩件事都實測確認過。)
      *
-     * 前提包含三件事:未結明細筆數、這個幣別的還款筆數、還款總額。
-     * 加總額是因為筆數相同但金額不同也會讓算術結果不一樣。
+     * 前提包含六件事:未結明細筆數、這個幣別的還款筆數、還款總額,
+     * 以及支出內容的三個指紋(未結總額 + 付款/分攤兩張子表的加權校驗和)。
+     * 加還款總額是因為筆數相同但金額不同也會讓算術結果不一樣。
+     *
+     * ── 「還款筆數 / 還款總額」要不要跟著新語意排掉投入/退還? ──
+     *
+     * **不要,照舊全部數。** 淨額已經不含投入/退還了(見 utils/ledger.ts 開頭),
+     * 所以有人在空窗期投入公費並不會改變這個回合要寫的轉帳金額。
+     * 但指紋的職責不是重現淨額,是回答「我讀完到我寫入之間,這個幣別的帳有沒有變」——
+     * 而投入/退還**確實把帳改了**:總覽的剩餘動了,結算頁那幾條公費的腿
+     * (deferred,它顯示「還要投入多少」)也跟著動。使用者看到的畫面變了。
+     *
+     * 把它們濾掉的唯一好處是「別人正在投入公費時我還能關回合」,代價是
+     * 這句 SQL 要多帶 pot id 去比對兩端 —— 買到的是把鎖弄鬆,而且多一個縫。
+     * 所以維持現狀:偏保守的一側。方向錯了頂多多按一次重新整理;
+     * 反過來錯了是照著過期的畫面寫下真實的轉帳,那才是修不回來的。
+     *
+     * 而**內容指紋是給編輯支出用的**(PATCH expenses/[id])。前三個量它一個都不動:
+     * 改金額不改 kind 也不改 currency → 未結筆數還是一樣;settlements 一列都沒碰
+     * → 筆數與總額也一樣。於是「A 打開預覽 → B 把 ¥10,000 改成 ¥20,000 → A 按下結算」
+     * 三個前提全部成立,回合照樣成立:快照寫的是 ¥10,000 那一版的淨額、
+     * 轉帳照著它付出去,而 E 已經蓋章 —— 不撤銷就修不了。
+     * (下一回合的算術會自己補回差額,錢不會永久消失,但這一輪照錯數字付出去的現金補不回來。)
+     * POST 會讓未結筆數 +1、DELETE 會讓它 −1,兩者都撞得到前三個量;
+     * PATCH 是第一個「改錢卻不改任何筆數」的操作,所以指紋必須看得到支出內容本身。
+     *
+     * 成員名單本身也在指紋裡(名次來自 members)—— 併發新增/刪除成員也會擋下來。
+     * 那是保守的一側:成員動了,淨額該算給誰本來就要重看一次。
      */
     dbh.prepare(
       `INSERT INTO settlement_rounds (id, trip_id, currency, seq, label, note)
@@ -151,10 +216,26 @@ export default defineEventHandler(async (event) => {
          AND (SELECT COUNT(*) FROM settlements
                WHERE trip_id = ?2 AND currency = ?3) = ?8
          AND (SELECT COALESCE(SUM(amount_minor), 0) FROM settlements
-               WHERE trip_id = ?2 AND currency = ?3) = ?9`,
+               WHERE trip_id = ?2 AND currency = ?3) = ?9
+         AND (SELECT COALESCE(SUM(amount_minor), 0) FROM expenses
+               WHERE trip_id = ?2 AND kind = 'shared' AND currency = ?3
+                 AND settlement_round_id IS NULL) = ?10
+         AND (SELECT COALESCE(SUM(p.amount_minor * r.n * (1000 * r.n + 1)), 0)
+              FROM expense_payers p
+              JOIN expenses e ON e.id = p.expense_id
+              JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS n
+                    FROM members WHERE trip_id = ?2) r ON r.id = p.member_id
+              WHERE e.trip_id = ?2 AND e.kind = 'shared' AND e.currency = ?3) = ?11
+         AND (SELECT COALESCE(SUM(s.amount_minor * r.n * (1000 * r.n + 1)), 0)
+              FROM expense_shares s
+              JOIN expenses e ON e.id = s.expense_id
+              JOIN (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS n
+                    FROM members WHERE trip_id = ?2) r ON r.id = s.member_id
+              WHERE e.trip_id = ?2 AND e.kind = 'shared' AND e.currency = ?3) = ?12`,
     ).bind(
       roundId, trip.id, currency, seq, b.label?.trim() || null, b.note?.trim() || null,
       itemCount, fpRow?.n ?? 0, fpRow?.total ?? 0,
+      fpExp?.unsettled_total ?? 0, fpExp?.paid_fp ?? 0, fpExp?.owed_fp ?? 0,
     ),
 
     // 淨額快照(含公費)。之後資料變了也還原得出當時是照什麼數字付的。
@@ -194,7 +275,7 @@ export default defineEventHandler(async (event) => {
       throw createError({
         statusCode: 409,
         statusMessage: '這個幣別的帳在你按下結算的這一瞬間被改動了'
-          + '(有人記了一筆帳、或標記了還款)。什麼都沒有寫入,請重新整理再結算。',
+          + '(有人記了一筆帳、改了某一筆、或標記了還款)。什麼都沒有寫入,請重新整理再結算。',
       });
     }
     // UNIQUE(trip_id, currency, seq) 撞到 = 另一支手機剛剛結完同一輪

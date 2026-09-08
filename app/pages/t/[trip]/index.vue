@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Balance, Expense, Kind } from '~~/shared/types';
+import type { Balance, Expense, Kind, SettlementRound } from '~~/shared/types';
 import { CURRENCY_LABEL, formatMoney } from '~~/shared/money';
 import ExpenseRow from '~/components/expense/ExpenseRow.vue';
 import ExpenseDetail from '~/components/expense/ExpenseDetail.vue';
@@ -18,7 +18,7 @@ import ExpenseDetail from '~/components/expense/ExpenseDetail.vue';
  */
 const tripId = useTripId();
 const api = useApi();
-const { trip, members, memberMap, memberName } = useTrip(tripId);
+const { trip, members, memberMap, memberName, fxDefaults } = useTrip(tripId);
 
 const baseCurrency = computed(() => trip.value?.base_currency ?? 'TWD');
 const baseLabel = computed(() => CURRENCY_LABEL[baseCurrency.value] ?? baseCurrency.value);
@@ -347,6 +347,104 @@ function toggleAll(): void {
   collapsedDates.value = anyExpanded.value ? groups.value.map((g) => g.date) : [];
 }
 
+// ── 結算章:這筆是第幾次結算蓋的 ─────────────────────────────
+/**
+ * 列首的鎖(aria-label)和明細裡的說明都要講「第 N 次結算」,
+ * 但 GET /expenses 只給 settlement_round_id —— seq 在結算歷史裡,
+ * 所以在這裡查一次做成 id -> seq 的表。
+ *
+ * 刻意 immediate: false:多數旅程在結算之前一筆章都沒有,
+ * 不該為了一個可能永遠用不到的標籤,每次進列表都多打一次 API。
+ * key 和結算頁用同一個,從結算頁走過來時直接吃快取,不會重抓。
+ */
+const roundsState = useAsyncData<SettlementRound[]>(
+  () => `rounds:${tripId.value}`,
+  () => api.get<SettlementRound[]>(`/api/trips/${encodeURIComponent(tripId.value)}/rounds`),
+  { default: () => [], immediate: false, deep: false, dedupe: 'defer' },
+);
+
+const hasSettled = computed(() => (
+  sharedList.value.some((e) => e.settlement_round_id)
+  || personalList.value.some((e) => e.settlement_round_id)
+));
+
+watch(hasSettled, (yes) => {
+  if (yes && roundsState.status.value === 'idle') roundsState.execute();
+}, { immediate: true });
+
+const roundSeqById = computed(() => new Map<string, number>(
+  (roundsState.data.value ?? []).map((r) => [r.id, r.seq]),
+));
+
+/** 查不到就回 null —— 元件會退回只說「已結算」,不會顯示「第 null 次」 */
+function roundSeqOf(expense: Expense): number | null {
+  const id = expense.settlement_round_id;
+  return id ? roundSeqById.value.get(id) ?? null : null;
+}
+
+// ── 編輯 ────────────────────────────────────────────────────
+/**
+ * 編輯用 bottom sheet,不開獨立路由。三個理由:
+ *
+ *  1. **資料已經在手上。** GET /expenses 回傳的每筆都帶完整的 payers / shares,
+ *     sheet 直接把物件遞給 ExpenseForm 就能預填。獨立路由等於重新載入整趟支出、
+ *     只為了在裡面找出一筆(server 沒有查單筆的端點),還要多一次載入狀態。
+ *  2. **手機單手操作。** sheet 從下方升起,主要動作(儲存修改)落在拇指區;
+ *     關掉之後列表還停在原本的捲動位置、原本展開的那一列。
+ *     換成路由就是離開再回來,捲動位置與展開狀態都得自己重建。
+ *  3. **和刪除確認一致。** 這頁的刪除本來就是 UiAppSheet,
+ *     Esc / 點背景關閉 / 焦點鎖那些行為不必再實作一次,也不會兩處不一樣。
+ *
+ * 代價是編輯狀態不在網址上(不能分享、重新整理會關掉)——
+ * 記帳是幾十秒就結束的動作,不值得為此付上面三項成本。
+ */
+const editTarget = ref<Expense | null>(null);
+const editOpen = ref(false);
+const saving = ref(false);
+const editError = ref<string | null>(null);
+
+function askEdit(expense: Expense): void {
+  editTarget.value = expense;
+  editError.value = null;
+  editOpen.value = true;
+}
+
+async function saveEdit(payload: Record<string, unknown>): Promise<void> {
+  const expense = editTarget.value;
+  if (!expense || saving.value) return;
+  saving.value = true;
+  editError.value = null;
+  try {
+    // PATCH 是整筆取代(payload 和 POST 完全相同),不是部分更新 ——
+    // 表單本來就把每一欄都送出,沒有「只改一欄」這種中間狀態要處理。
+    await api.patch(
+      `/api/trips/${encodeURIComponent(tripId.value)}/expenses/${encodeURIComponent(expense.id)}`,
+      payload,
+    );
+    editOpen.value = false;
+    showToast(`已更新「${String(payload.description || expense.description || '這筆花費')}」`);
+
+    // 共同 ↔ 個人 被改掉時,把 Tab 切到它的新家。
+    // 不切的話,使用者按完儲存只會看到那筆從眼前消失 —— 那看起來像刪掉了,不像搬家。
+    const nextKind: Kind = payload.kind === 'personal' ? 'personal' : 'shared';
+    if (nextKind !== expense.kind) tab.value = nextKind;
+
+    // 編輯可以把共同改成個人(或反過來),所以兩軌都要重抓 ——
+    // 只抓原本那一軌的話,那筆會從舊 tab 消失但不會出現在新 tab。
+    await Promise.all([
+      sharedTrack.refresh({ dedupe: 'cancel' }),
+      personalTrack.refresh({ dedupe: 'cancel' }),
+      balanceState.refresh({ dedupe: 'cancel' }),
+    ]);
+  }
+  catch (e) {
+    editError.value = api.errorMessage(e, '儲存失敗,請再試一次。');
+  }
+  finally {
+    saving.value = false;
+  }
+}
+
 // ── 刪除 ────────────────────────────────────────────────────
 const target = ref<Expense | null>(null);
 const confirmOpen = ref(false);
@@ -640,6 +738,7 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
                   :names="memberMap"
                   :expanded="openId === expense.id"
                   :detail-id="`detail-${expense.id}`"
+                  :round-seq="roundSeqOf(expense)"
                   @toggle="toggle(expense.id)"
                 />
                 <Transition name="detail">
@@ -648,6 +747,8 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
                       :expense="expense"
                       :names="memberMap"
                       :base-currency="baseCurrency"
+                      :round-seq="roundSeqOf(expense)"
+                      @edit="askEdit(expense)"
                       @delete="askDelete(expense)"
                     />
                   </div>
@@ -700,6 +801,7 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
                 :names="memberMap"
                 :expanded="openId === expense.id"
                 :detail-id="`detail-${expense.id}`"
+                :round-seq="roundSeqOf(expense)"
                 @toggle="toggle(expense.id)"
               />
               <Transition name="detail">
@@ -708,6 +810,8 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
                     :expense="expense"
                     :names="memberMap"
                     :base-currency="baseCurrency"
+                    :round-seq="roundSeqOf(expense)"
+                    @edit="askEdit(expense)"
                     @delete="askDelete(expense)"
                   />
                 </div>
@@ -726,6 +830,37 @@ onBeforeUnmount(() => clearTimeout(toastTimer));
       <Icon name="lucide:plus" size="20" class="shrink-0" />
       <span>記一筆</span>
     </NuxtLink>
+
+    <!-- ═════════ 編輯支出 ═════════ -->
+    <UiAppSheet
+      v-model:open="editOpen"
+      title="編輯這筆花費"
+      size="lg"
+      :dismissible="!saving"
+    >
+      <!--
+        v-if 帶 members.length:SplitEditor 會在成員名單「變動」時把新成員自動加進均分名單,
+        名單還沒載完就掛載表單,等它載完就會把預填好的分攤對象改掉。
+        key 綁 id:換一筆編輯時整個表單重掛載,不會留著上一筆的草稿。
+        --form-sticky-bg:表單底部那顆黏著的送出鈕要跟 sheet 的底色一致(見 ExpenseForm)。
+      -->
+      <div
+        v-if="editTarget && members.length"
+        :key="editTarget.id"
+        style="--form-sticky-bg: var(--bg-elevated)"
+      >
+        <ExpenseForm
+          :members="members"
+          :base-currency="baseCurrency"
+          :fx-defaults="fxDefaults"
+          :initial="editTarget"
+          submit-label="儲存修改"
+          :submitting="saving"
+          :error-message="editError"
+          @submit="saveEdit"
+        />
+      </div>
+    </UiAppSheet>
 
     <!-- ═════════ 刪除二次確認 ═════════ -->
     <UiAppSheet

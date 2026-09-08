@@ -94,7 +94,7 @@ Nuxt 4 · TypeScript · Cloudflare Workers · D1
         │        一個 Cloudflare Worker                 │
         │                                              │
         │  前端    Vue 3 SPA（ssr: false）+ PWA        │
-        │  API     server/api/**   30 支端點            │
+        │  API     server/api/**   31 支端點            │
         │  排程    server/tasks/**                      │
         │            fx:sync        0 1 * * *  (UTC)   │
         │            reminders:run  */5 * * * * (UTC)  │
@@ -139,8 +139,9 @@ app/
   assets/css/main.css         設計系統（CSS 變數 + 深色模式）
 
 server/
-  api/            25 支端點：21 支在 trips/[trip]/ 底下（全部經過 requireTrip）、
-                  2 支 trips/ 列表與建立、2 支 admin/
+  api/            31 支端點：23 支在 trips/[trip]/ 底下（全部經過 requireTrip）、
+                  2 支 trips/ 列表與建立、4 支 auth/、2 支 admin/
+    trips/[trip]/expenses/[id].patch.ts ★ 編輯支出（整筆取代，不是部分更新）
     trips/[trip]/rounds.post.ts        ★ 關閉一次結算回合
     trips/[trip]/rounds/preview.get.ts ★ 這一輪要結什麼
     trips/[trip]/rounds/index.get.ts      結算歷史
@@ -199,6 +200,54 @@ reservations            預約：opens_at_utc（何時開放搶）+ booked_for_u
 > SQLite 的 `ALTER TABLE` 不支援加 CHECK 約束(要加只能整表重建)。
 > 所以「全新建的資料庫」比「migrate 過來的」多一層防護,
 > 差異僅在最後一道防線:兩邊都靠 server 端守住(只有結算回合會寫 `'round'`)。
+
+</details>
+
+<details>
+<summary><b>支出的三支寫入端點（新增 / 編輯 / 刪除）</b></summary>
+
+| | |
+|---|---|
+| `POST /api/trips/:trip/expenses` | 記一筆 → `201 { id, fx_rate, fx_rate_date, fx_markup_pct }` |
+| `PATCH /api/trips/:trip/expenses/:id` | 編輯 → `200`,body 與 POST **完全相同** |
+| `DELETE /api/trips/:trip/expenses/:id` | 刪除 → `200 { ok: true }` |
+
+三支的 `WHERE` 都同時綁 `trip_id`。拿別的旅程的 `expense id` 過來就查不到 → `404`;
+這是權限的邊界,不是「查無資料」的便利回應。
+
+**`PATCH` 是整筆取代,不是部分更新。** body 收到什麼就是那筆支出的全貌,
+`expense_payers` / `expense_shares` 先刪光再重寫,不做 diff:
+
+- 分攤模式本身可以整個換掉(`equal` → `exact`),diff 要處理「這個人原本在名單裡
+  現在不在了」「模式換了所以每個人的金額都變了」,複雜度遠高於重寫。
+- 重寫天然保證守恆 —— 寫進去的那批列就是剛剛驗過合計的那一批,不會有殘留。
+  留一列舊的下來的話合計仍然對得上(新的那批是守恆的),但那個人會憑空多欠一筆,
+  **而畫面上完全看不出來**。
+- 反過來說,「body 裡沒有這個欄位」= 使用者把它清空了。`fx_rate_override` 尤其如此:
+  做成「維持原狀」的話,使用者就永遠拿不掉自己填錯的覆寫匯率。
+
+> [!IMPORTANT]
+> **`UPDATE expenses` + `DELETE payers/shares` + `INSERT payers/shares` 全部在同一個
+> `dbh.batch()` 裡。** 中途失敗留下「支出還在、分攤空了」的話,那筆帳會被
+> `findUnbalancedExpenses` 判成付款與分攤對不上 —— 而在被發現以前,
+> 結算算出來的每個人淨額都是錯的。
+>
+> 編輯的失敗情境比新增危險得多:新增失敗只是「沒記到」,
+> 編輯失敗如果寫了一半,留下的是一筆**已經存在、正在被結算採用**的壞帳。
+
+**驗證邏輯和 POST 是同一套,一行都沒有放寬** —— 編輯是另一條寫入路徑,
+漏掉哪一條驗證,那條就等於不存在(跨旅程的成員 id、公費當個人花費的付款人、
+公費出現在分攤名單裡,三種都會靜靜把帳弄壞)。
+
+**匯率用新的 `currency` 與 `spent_at` 重新 snapshot。** 沿用原本那筆會少一次查詢,
+但編輯支出最常見的兩個理由就是「幣別記錯」和「日期記錯」——
+沿用等於在新的幣別上掛一個對不上任何一天的匯率,而且它不會自己修好。
+`fx_markup_pct` 同理照 POST 的規則重算(本位幣一律 0)。
+
+**`created_at` 與 `settlement_round_id` 不在 `SET` 裡。**
+前者是「什麼時候被記下來」而不是消費時間(消費時間是 `spent_at`)——
+改一個錯字就讓那筆跳到列表最上面是錯的;後者能走到 `PATCH` 就一定是 `NULL`
+或指向一個已撤銷的回合,兩種都不該被這支動到。
 
 </details>
 
@@ -318,9 +367,10 @@ reservations            預約：opens_at_utc（何時開放搶）+ booked_for_u
 之後有人補登支出、改名字、刪帳,重算會得到不同的數字,
 但**當時**是照這份淨額付的錢。存下來才有可稽核的軌跡。
 
-已經蓋章的支出**不給刪**(`409`)。那筆帳已經被算進當時的轉帳、
-錢也已經照那個數字付出去了;直接刪掉會讓那次結算的明細指向一筆不存在的支出。
-要刪就先撤銷那次結算。
+已經蓋章的支出**不給刪、也不給改**(`409`)。那筆帳已經被算進當時的轉帳、
+錢也已經照那個數字付出去了;直接刪掉會讓那次結算的明細指向一筆不存在的支出,
+而改金額會讓那份明細對不上它自己的淨額快照 —— 兩種都會讓「這 1,850 是怎麼來的」
+事後答不出來。要刪或要改都先撤銷那次結算(撤銷會把章拆掉,那筆就又能動了)。
 
 </details>
 
@@ -765,13 +815,14 @@ node scripts/import-excel.mjs http://localhost:3000
 全部**零依賴** —— 用 `node --experimental-strip-types` 直接跑,不需要 vitest 或任何 test runner。
 
 ```bash
-pnpm test           # 9 個單元測試檔（不需要 dev server）        197 項
+pnpm test           # 9 個單元測試檔（不需要 dev server）        198 項
 pnpm test:api       # API 整合測試（需要 dev server）
-pnpm test:features  # 只跑公費 / 成員 / 手續費 / 訂位那一支         87 項
+pnpm test:features  # 只跑公費 / 成員 / 手續費 / 訂位那一支         89 項
 pnpm test:rounds    # 只跑結算回合那一支（需要 dev server）        306 項
+pnpm test:edit      # 只跑編輯支出那一支（需要 dev server）        187 項
 ```
 
-`api.test` + `api.features` + `api.rounds` 合計 **449 項**,
+`pnpm test:api` 的 6 個測試檔合計 **714 項**,
 全部打真實 HTTP + 真實 D1(dev 用 miniflare 的本機庫,和 wrangler 共用)。
 
 > [!TIP]
@@ -795,12 +846,14 @@ pnpm test:rounds    # 只跑結算回合那一支（需要 dev server）        
 | `sql-safety.test.ts` | 2 | **掃描原始碼**,把 SQL 插值 / 串接 / 動態子句本身當失敗 |
 | `schema-types.test.ts` | 15 | `schema.sql` ↔ `shared/types.ts` 欄位一致 |
 | `cron-config.test.ts` | 8 | `nuxt.config.ts` ↔ `wrangler.jsonc` 的 cron 同步 |
-| `vue-compile.test.mjs` | 27 | 所有 SFC 實際編譯 |
+| `vue-compile.test.mjs` | 28 | 所有 SFC 實際編譯 |
 | `settle.fuzz.ts` | 20000 | 隨機案例:全部歸零、不漏帳、轉帳 ≤ n−1 筆 |
 | `api.test.ts` | 56 | 真實 HTTP + 真實 D1:驗證、結算、還款、刪除 |
-| `api.features.test.ts` | 87 | 公費收支與不變量、成員改名/刪除防護、刷卡手續費、訂位兩個時間 |
+| `api.features.test.ts` | 89 | 公費收支與不變量、成員改名/刪除防護、刷卡手續費、訂位兩個時間 |
+| `api.concurrency.test.ts` | 25 | **併發競態**:`Promise.all` 打同一組端點 —— 結算 + 標記已還款的 3ms 空窗、兩支手機同時退還公費 |
 | `api.access.test.ts` | 51 | **存取控制**:旅程之間互不可見、id 不是憑證、editor 拿不到 share_token、只有 owner 能刪、認領無主旅程、登出後看不到東西 |
 | `api.rounds.test.ts` | 306 | **結算回合的 15 組情境**:公費不會被清空、公費墊款後不再重複收、吸收手動還款不吐反向轉帳、連續兩回合不互相反轉、撤銷是精確反運算且不刪手動還款、舊畫面指紋防護、蓋章的支出不准刪、幣別互相隔離、`pot/moves` 的原子性 |
+| `api.edit.test.ts` | 187 | **編輯支出的 12 組情境**:改文字不動到第二個欄位、`created_at` 不變、改金額三邊(payers / shares / balance)一起對、換幣別與換日期都重新 snapshot 匯率、換分攤模式沒有殘留列、**驗證失敗時整筆快照一格都沒動**、別趟的 id → 404、蓋章 → 409 撤銷後 → 200、`fx_rate_override` 沒送就是清掉 |
 
 `ledger.test.ts` 是純函式測試(不需要 dev server),`api.rounds.test.ts` 打真實 HTTP。
 兩層是刻意的:數學性質在單元層用隨機案例壓,而「錢真的有沒有寫進資料庫」
@@ -904,6 +957,31 @@ npx wrangler secret put NUXT_VAPID_SUBJECT      # mailto:you@example.com
 
 pnpm deploy
 ```
+
+> [!IMPORTANT]
+> **`NUXT_PBKDF2_ITERATIONS` 決定了登入能不能用,部署前先讀這一段。**
+>
+> Workers 沒有原生 bcrypt/argon2,密碼雜湊只能用 WebCrypto 的 PBKDF2 ——
+> 而 PBKDF2 的重點就是「故意很慢」,偏偏**免費版每次呼叫只有 10ms CPU**。
+> 實測(`node scripts/bench-pbkdf2.mjs`,M 系列 Mac):
+>
+> | 迭代次數 | 本機耗時 | 10ms 預算 |
+> |---|---|---|
+> | 25,000 | 2.6 ms | ✅ 免費版也安全 |
+> | 50,000（預設） | 3.6 ms | ⚠️ 線上 CPU 較慢,**可能剛好超標** |
+> | 100,000 | 7.2 ms | ❌ 免費版幾乎確定超標 |
+> | 600,000（OWASP 建議） | 45.3 ms | ❌ 需要 Workers Paid |
+>
+> 超標的症狀是**登入直接失敗**(Worker 被 CPU limit 中斷),不是變慢。
+>
+> - **走免費版** → 先設 `25000` 確認整條路徑活著,再往上試:
+>   `npx wrangler secret put NUXT_PBKDF2_ITERATIONS`
+> - **走 Workers Paid($5/月,30 秒 CPU)** → 設 `600000`,直接拿到建議強度
+>
+> **兩者之間切換不需要任何資料遷移。** 每個使用者的迭代次數存在自己那一列
+> (`users.password_iter`),調高之後舊帳號照樣登得進來,並在下次登入成功時
+> 自動用新參數重算(見 `server/api/auth/login.post.ts`)。
+> 所以「先免費跑起來、之後再升級」是安全的路徑。
 
 <details>
 <summary><b>產生 VAPID 金鑰</b></summary>
@@ -1084,6 +1162,10 @@ CRUD 與 2–10 人結算是微秒級,沒問題。**不要在 Worker 裡跑 OCR*
 
 ## Roadmap
 
+- [x] **編輯支出** — `PATCH /api/trips/:trip/expenses/:id`,整筆取代語意、
+      payers / shares 刪光重寫、匯率用新的幣別與日期重新 snapshot,
+      全部在同一個 `dbh.batch()` 裡。蓋章的支出 `409`(和刪除同一套保護)。
+      在這之前打錯一個字只能刪掉重記,而重記會拿到新的 `created_at`,列表排序整個跳掉
 - [x] **分階段結算(settlement rounds)** — `settlement_rounds` / `settlement_round_nets`、
       `expenses.settlement_round_id`、`settlements.round_id` + `source`,
       五支端點(preview / close / list / detail / revert)。
@@ -1124,7 +1206,7 @@ CRUD 與 2–10 人結算是微秒級,沒問題。**不要在 Worker 裡跑 OCR*
 - 原始 Excel 40 筆支出 + 5 筆預訂全數匯入(`40 成功 / 0 失敗`、`預訂 5/5`),
   四個合計欄與 Excel 摘要區完全吻合
   (共同 台幣 45,902 / 日幣 148,863;個人 台幣 −2,062 / 日幣 99,952)
-- **197 項單元測試 + 449 項 API 整合測試 + 20,000 筆 fuzz** 全綠
+- **198 項單元測試 + 714 項 API 整合測試 + 20,000 筆 fuzz** 全綠
   (`pnpm test` 的 9 個測試檔全部執行完才回報,見 Bugs Fixed)
 - 公費的不變量(剩餘 = −淨額)由兩條獨立計算路徑交叉驗證
 - **結算回合的兩個範圍**(算術 = 整趟 / 明細 = 未標記)由 `test/ledger.test.ts` 與
@@ -1163,7 +1245,7 @@ CRUD 與 2–10 人結算是微秒級,沒問題。**不要在 Worker 裡跑 OCR*
 
 - **沒有實際部署過**。`wrangler.jsonc` 的 `database_id` 仍是 placeholder
 - **`pnpm build` 沒有在這一輪重跑** —— 上次成功的數字(286 kB / 98.2 kB gzip)
-  是加結算回合 UI 之前的。`vue-compile` 有實際編譯全部 27 個 SFC,
+  是加結算回合 UI 之前的。`vue-compile` 有實際編譯全部 28 個 SFC,
   所以編譯錯誤擋住了,但 bundle 大小是舊數字
 - **UI 這一輪從頭到尾沒有在瀏覽器裡開過** —— 這次沒有可用的瀏覽器工具,
   所以結算回合面板、總覽頁、公費勾選面板、金額排序、成員編輯、訂位面板

@@ -2,7 +2,7 @@
 /**
  * 記一筆支出。這是整個 App 最重要的畫面。
  *
- * 兩個設計重點:
+ * 三個設計重點:
  *
  * 1. **付款人與分攤人是分開的兩組人。**
  *    例如「喧刷卡付了 6,274,但實際是民用 3,857、喧用 2,417」——
@@ -13,10 +13,16 @@
  *    分攤與付款的合計必須等於支出金額,server 會擋。
  *    但使用者不該在按下送出後才知道差了 3 塊 —— 所以這裡用
  *    shared/split.ts(和 server 同一份程式碼)即時算出差額並顯示。
+ *
+ * 3. **新增與編輯共用同一份表單。**
+ *    給了 initial 就是編輯(把既有支出預填進來),沒給就是記新的一筆。
+ *    刻意不複製一份「編輯版表單」—— 兩邊的驗證、試算、公費規則必須永遠一致,
+ *    分成兩份的那一刻就注定會有一邊先壞掉。送出的 payload 兩邊完全相同
+ *    (PATCH 是整筆取代語意),差別只在呼叫端打 POST 還是 PATCH。
  */
-import type { Kind, PaymentMethod, Member } from '~~/shared/types';
-import { toMinor, EXPONENT, CURRENCY_LABEL } from '~~/shared/money';
-import { previewShares } from '~~/shared/split';
+import type { Kind, PaymentMethod, Member, Expense } from '~~/shared/types';
+import { toMinor, fromMinor, EXPONENT, CURRENCY_LABEL } from '~~/shared/money';
+import { previewShares, splitEqually } from '~~/shared/split';
 import type { PayerDraft } from './PayerEditor.vue';
 import type { SplitDraft } from './SplitEditor.vue';
 
@@ -27,6 +33,14 @@ const props = defineProps<{
   fxDefaults?: { cash_spread_pct: number; card_fee_pct: number };
   submitting?: boolean;
   errorMessage?: string | null;
+  /**
+   * 要編輯的既有支出。給了就預填,沒給就是空白的新表單。
+   * 直接吃列表頁已經有的 Expense —— GET /expenses 回傳的每筆都帶完整的
+   * payers / shares,所以編輯不需要另外開一個「查單筆」的端點。
+   */
+  initial?: Expense | null;
+  /** 送出鈕的文案。編輯時要改成「儲存修改」之類,不然使用者會以為又記了一筆新的。 */
+  submitLabel?: string;
 }>();
 
 const emit = defineEmits<{ submit: [payload: Record<string, unknown>] }>();
@@ -196,13 +210,21 @@ const amountStep = computed(() => (EXPONENT[currency.value] === 0 ? '1' : '0.01'
  */
 const DEFAULT_MARKUP = { cash: 0, card: 1.5 };
 
-const markupDefault = computed(() => {
-  if (!isForeign.value) return 0;
+/**
+ * 某個「(幣別, 付款方式)」組合的預設加成。
+ * 刻意做成吃參數的函式,而不是只留下面那個 computed —— applyInitial 要問的是
+ * **存下來那筆自己的組合**的預設值,而 computed 只認得當下 ref 的值。
+ */
+function defaultMarkupFor(cur: string, method: PaymentMethod): number {
+  // 本位幣不需要換匯,任何加成都沒有意義(和 server 同一條規則)
+  if (cur === props.baseCurrency) return 0;
   const d = props.fxDefaults;
-  return paymentMethod.value === 'card'
+  return method === 'card'
     ? (d?.card_fee_pct ?? DEFAULT_MARKUP.card)
     : (d?.cash_spread_pct ?? DEFAULT_MARKUP.cash);
-});
+}
+
+const markupDefault = computed(() => defaultMarkupFor(currency.value, paymentMethod.value));
 
 const markupInput = ref<number | null>(null);
 /** 使用者自己改過的話,就不要再被切換付款方式蓋掉 */
@@ -236,6 +258,121 @@ const markupHint = computed(() => {
   return `換算時在當日中價上加 ${pct}% —— ${
     paymentMethod.value === 'card' ? '相當於國外交易手續費' : '相當於換鈔價差'}。`;
 });
+
+// ── 編輯:把既有支出預填回表單 ────────────────────────────────
+const submitText = computed(() => props.submitLabel || '記下這筆');
+
+/**
+ * 分攤模式的反推 —— 這是整個編輯功能唯一有失真的地方,所以講清楚。
+ *
+ * DB 只存「算完的每人金額」(expense_shares),**不存當初選的是
+ * equal / shares / exact**。所以編輯時只能從金額回推,而回推必然會失真。
+ *
+ * 判定規則:拿 shared/split.ts 的 splitEqually()(和 server 寫入時同一份程式碼)
+ * 重算一次,每個人都對得上才算 equal,否則一律 exact。
+ * 刻意用重算而不是「大家金額一樣就是均分」—— 100 日圓三個人分是 34/33/33,
+ * 只比相等會把一個貨真價實的均分誤判成自訂金額。
+ *
+ * 兩個已知失真,**都是預期行為,不是 bug**:
+ *
+ *  1. 原本選「按份數」(2:1:1)的,進來會顯示成「指定金額」。
+ *     份數本身沒有被存下來,救不回來。
+ *  2. 原本用「指定金額」手動填出剛好等於均分的數字,進來會顯示成「均分」。
+ *
+ * 兩種情況下畫面顯示的每人金額都和 DB 一模一樣,直接按儲存也不會改動任何數字 ——
+ * 「送出後的 shares 金額 === 進來時的 shares 金額」才是這裡要保證的不變量,
+ * 「還原使用者當初點了哪顆按鈕」做不到,也不影響帳的正確性。
+ *
+ * 真正會咬人的是第 1 種的後續操作:使用者若在按份數的支出上改了總金額,
+ * 系統會按「指定金額」原封不動保留舊的每人金額,合計就對不上 ——
+ * 但這時 SplitEditor 的差額提示會立刻紅字擋住送出,不會靜靜寫錯帳。
+ */
+function inferSplit(src: Expense): SplitDraft {
+  const lines = src.shares ?? [];
+  const ids = lines.map((s) => s.member_id);
+  const equal = splitEqually(src.amount_minor, ids);
+  const isEqual = ids.length > 0 && lines.every((s) => equal.get(s.member_id) === s.amount_minor);
+  return {
+    mode: isEqual ? 'equal' : 'exact',
+    // 三種模式的草稿都填好(份數除外,它無從回推)——
+    // 使用者切到別的模式時看到的是同一批人,不會突然變成空白。
+    members: ids,
+    shares: {},
+    amounts: Object.fromEntries(lines.map((s) => [s.member_id, fromMinor(s.amount_minor, src.currency)])),
+  };
+}
+
+/**
+ * 預填。難點是單位:DB 的 payers / shares 是 amount_minor(日幣 3857、台幣 123456),
+ * 而表單欄位是人類單位 —— 一律走 shared/money.ts 的 fromMinor(),不自己寫除法,
+ * 不然 TWD 的兩位小數遲早會在某個地方被除錯。
+ */
+function applyInitial(src: Expense): void {
+  kind.value = src.kind;
+  description.value = src.description ?? '';
+  category.value = src.category ?? '';
+  currency.value = src.currency;
+  amountInput.value = fromMinor(src.amount_minor, src.currency);
+  paymentMethod.value = src.payment_method;
+  spentAt.value = src.spent_at;
+  note.value = src.note ?? '';
+  fxOverride.value = src.fx_rate_override;
+  // 有覆寫匯率就把進階區打開 —— 收起來的話使用者會看不到自己當初填的數字,
+  // 以為它不見了(而它其實還在,而且正影響換算結果)。
+  showAdvanced.value = src.fx_rate_override != null;
+
+  /**
+   * 加成:存下來的值就是當初的決定,markupDefault 的 watcher 不能在下一拍
+   * 用預設值蓋掉它 —— 使用者只是進來改個說明,刷卡手續費就被偷偷從 2% 改回 1.5%。
+   * 所以初次載入時**必須**擋住那個 watcher。
+   *
+   * 但無條件 `markupTouched = true` 擋得太久 —— 它擋的是這張表單的一輩子,
+   * 連使用者自己在編輯中換付款方式都不再帶入預設值:JPY 現金(0%)改成刷卡,
+   * 手續費會留在 0% 送出,而同一筆用「記一筆」新增成刷卡卻是 1.5% ——
+   * 同一筆花費新增和編輯算出不同的本位幣金額。反方向(刷卡改現金)更糟,
+   * 把國外交易手續費留在現金花費上,多算 1.5%。
+   *
+   * 所以只有「當初真的自訂過」才算 touched:把存下來的值和**它自己那個
+   * (幣別, 付款方式) 組合**的預設值比,不一樣才是使用者動過手。當初就是走預設的,
+   * 就繼續跟隨預設,換付款方式時預設值才跟得上;自訂過的值依舊不會被蓋掉。
+   * (比的時候用 defaultMarkupFor(src...) 而不是 markupDefault —— 後者是 computed,
+   * 講的是「當下 ref 的組合」,依賴 applyInitial 裡的賦值順序太脆。)
+   */
+  const savedMarkup = src.fx_markup_pct ?? 0;
+  markupInput.value = savedMarkup;
+  markupTouched.value = savedMarkup !== defaultMarkupFor(src.currency, src.payment_method);
+
+  /**
+   * 付款人:server 對「單一付款人」是把全額寫進 expense_payers 的,
+   * 所以讀回來一定有金額。這裡把它還原成 amount = null(= 慣例上的「全額」),
+   * PayerEditor 才會停在單一付款人模式,而不是一進來就變成多人墊款、
+   * 逼使用者面對一個他從來沒填過的金額欄。
+   */
+  const paid = src.payers ?? [];
+  const single = paid.length === 1 && paid[0]!.amount_minor === src.amount_minor;
+  payers.value = paid.map((p) => ({
+    member_id: p.member_id,
+    amount: single ? null : fromMinor(p.amount_minor, src.currency),
+  }));
+
+  split.value = inferSplit(src);
+
+  /**
+   * 公費開關刻意保持關閉,即使這筆真的是公費付的。
+   * fromPot 會**鎖住**付款人與分攤並強制改寫成「公費付、全員均分」——
+   * 猜錯(例如公費付但只有兩個人分攤)就等於在使用者沒動手的情況下改掉他的帳。
+   * 資料本身已經正確帶進來了,要重新套用公費規則,自己勾一下就好。
+   */
+}
+
+/**
+ * immediate:編輯用的 sheet 是帶著資料一起掛載的,不能等到下一拍才填 ——
+ * PayerEditor 的「單一 / 多人」模式是在它自己的 setup 讀 model 長度決定的,
+ * 晚一步填,它就已經用空的 model 決定好模式了。
+ */
+watch(() => props.initial, (src) => {
+  if (src) applyInitial(src);
+}, { immediate: true });
 </script>
 
 <template>
@@ -410,11 +547,16 @@ const markupHint = computed(() => {
       {{ errorMessage }}
     </div>
 
-    <!-- 手機上黏在底部,拇指可及 -->
+    <!--
+      手機上黏在底部,拇指可及。
+      漸層底色預設是頁面底色,但這張表單也會被放進 UiAppSheet(編輯支出),
+      那裡的底是 --bg-elevated —— 深色模式下兩者差得出來,會露出一條色帶。
+      所以留一個 --form-sticky-bg 讓容器覆寫,而不是在這裡寫死。
+    -->
     <div class="sticky bottom-0 pt-2 pb-1"
-         style="background: linear-gradient(to top, var(--bg) 60%, transparent)">
+         style="background: linear-gradient(to top, var(--form-sticky-bg, var(--bg)) 60%, transparent)">
       <UiAppButton type="submit" variant="primary" block :disabled="!canSubmit" :loading="submitting">
-        <Icon name="lucide:check" /> 記下這筆
+        <Icon name="lucide:check" /> {{ submitText }}
       </UiAppButton>
     </div>
   </form>

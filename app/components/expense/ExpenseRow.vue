@@ -18,9 +18,15 @@ const props = withDefaults(defineProps<{
   expanded?: boolean;
   /** 展開後那塊明細的 id,做 aria-controls */
   detailId?: string;
+  /**
+   * 這筆被蓋章的那次結算是第幾次。expenses 端點只給 settlement_round_id,
+   * seq 要另外查結算歷史,所以由列表頁查好傳進來(拿不到就只說「已結算」)。
+   */
+  roundSeq?: number | null;
 }>(), {
   expanded: false,
   detailId: undefined,
+  roundSeq: null,
 });
 
 defineEmits<{ toggle: [] }>();
@@ -71,6 +77,19 @@ const METHODS = {
   card: { icon: 'lucide:credit-card', label: '刷卡' },
 } as const;
 const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.cash);
+
+/**
+ * 鎖的無障礙名稱 / tooltip。
+ *
+ * 「已結算」三個字是有語意的 —— 它回答的是「為什麼這筆不能改」,
+ * 換成純圖示就把那句話弄丟了。所以圖示一定要帶名稱,
+ * 而完整的說明(第幾次、怎麼解鎖)在展開的 ExpenseDetail 裡。
+ */
+const settledLabel = computed(() => (
+  props.roundSeq
+    ? `已列入第 ${props.roundSeq} 次結算,不能修改或刪除`
+    : '已列入結算,不能修改或刪除'
+));
 </script>
 
 <template>
@@ -81,8 +100,28 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
     :aria-controls="detailId"
     @click="$emit('toggle')"
   >
-    <!-- 頭像:誰墊的錢(個人帳則是算在誰身上) -->
-    <span class="avatar" aria-hidden="true">{{ leadInitial }}</span>
+    <!--
+      頭像:誰墊的錢(個人帳則是算在誰身上)。
+
+      已列入結算回合的標記疊在頭像右下角。使用者的需求原話是「已結清的記錄就標記起來,
+      下次從尚未被標記的地方開始結算」—— 後半段(結算範圍)在 server 做完了,
+      但前半段是**看得見的標記**,少了它使用者根本不知道哪幾筆已經算過。
+      文案(aria-label / title)刻意不寫「已結清」:章是蓋在支出上,
+      而債是由那個回合的轉帳「整批」清掉的,不是一筆一筆對應。
+      為什麼從描述後面的標籤改成列首的鎖,見下方 .lock 的說明。
+    -->
+    <span class="lead">
+      <span class="avatar" aria-hidden="true">{{ leadInitial }}</span>
+      <span
+        v-if="expense.settlement_round_id"
+        class="lock"
+        role="img"
+        :aria-label="settledLabel"
+        :title="settledLabel"
+      >
+        <Icon name="lucide:lock" size="9" />
+      </span>
+    </span>
 
     <span class="min-w-0 flex-1 text-left">
       <span class="flex items-baseline gap-1.5">
@@ -90,17 +129,6 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
           {{ expense.description || '未填說明' }}
         </span>
         <span v-if="expense.category" class="chip shrink-0">{{ expense.category }}</span>
-        <!--
-          已列入結算回合的標記。使用者的需求原話是「已結清的記錄就標記起來,
-          下次從尚未被標記的地方開始結算」—— 後半段(結算範圍)在 server 做完了,
-          但前半段是**看得見的標記**,少了它使用者根本不知道哪幾筆已經算過。
-          文案刻意不寫「已結清」:章是蓋在支出上,而債是由那個回合的轉帳
-          「整批」清掉的,不是一筆一筆對應。
-        -->
-        <span v-if="expense.settlement_round_id" class="chip chip-settled shrink-0">
-          <Icon name="lucide:lock" size="9" />
-          已結算
-        </span>
       </span>
 
       <!-- 手機:付款人 · 分攤 · 付款方式 擠在第二行 -->
@@ -200,10 +228,29 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
   background: var(--bg-sunken);
 }
 
+/*
+ * 頭像 + 鎖。
+ *
+ * 鎖以前是描述文字後面的一個「已結算」標籤,所以它的 x 位置跟著描述長度跑,
+ * 每一列都不一樣 —— 右邊的付款人 / 分攤 / 付款方式 / 金額全是對齊的欄,
+ * 只有它在文字流裡漂,整排看起來是歪的。而且手機上描述會 truncate,
+ * 標籤跟在後面第一個被擠掉,最需要看到「這筆不能改」的地方反而看不到。
+ *
+ * 解法是把它移到列首。疊在頭像上(而不是自己佔一欄)有兩個好處:
+ *  1. 一列的水平空間一分都沒少 —— 手機上那 20px 要留給描述。
+ *  2. 沒蓋章的列不會因為少一個欄位而整排位移 —— 佔位問題根本不存在,
+ *     因為頭像那一欄本來就固定 2.25rem,鎖是疊上去的。
+ * 語意上也對:列首的鎖就是「這列鎖住了」,和明細裡「不能編輯 / 刪除」是同一件事。
+ */
+.lead {
+  position: relative;
+  flex-shrink: 0;
+  width: 2.25rem;
+  height: 2.25rem;
+}
 .avatar {
   display: grid;
   place-items: center;
-  flex-shrink: 0;
   width: 2.25rem;
   height: 2.25rem;
   border-radius: 999px;
@@ -211,6 +258,29 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
   font-weight: 600;
   background: color-mix(in oklab, var(--brand) 14%, transparent);
   color: var(--brand);
+}
+.lock {
+  position: absolute;
+  right: -0.125rem;
+  bottom: -0.125rem;
+  display: grid;
+  place-items: center;
+  width: 0.9375rem;
+  height: 0.9375rem;
+  border-radius: 999px;
+  background: var(--credit);
+  color: var(--brand-text);
+  /* 描邊用列的底色,鎖才不會和頭像糊在一起 */
+  box-shadow: 0 0 0 2px var(--bg-elevated);
+}
+/* 展開 / hover 時列底色變 sunken,描邊要跟著換,不然會看到一圈殘留的白邊 */
+.exp-row[aria-expanded='true'] .lock {
+  box-shadow: 0 0 0 2px var(--bg-sunken);
+}
+@media (hover: hover) {
+  .exp-row:hover .lock {
+    box-shadow: 0 0 0 2px var(--bg-sunken);
+  }
 }
 
 /* 分類標籤 */
@@ -221,18 +291,6 @@ const method = computed(() => METHODS[props.expense.payment_method] ?? METHODS.c
   line-height: 1.4;
   background: var(--bg-sunken);
   color: var(--text-muted);
-}
-.chip-settled {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.1875rem;
-  background: color-mix(in oklab, var(--credit) 15%, transparent);
-  color: var(--credit);
-}
-/* 展開 / hover 時列背景會變成 sunken,標籤要換個底色才看得出層次 */
-.exp-row[aria-expanded='true'] .chip-settled,
-.exp-row:hover .chip-settled {
-  background: color-mix(in oklab, var(--credit) 20%, transparent);
 }
 /* 展開 / hover 時列背景會變成 sunken,標籤要換個底色才看得出層次 */
 .exp-row[aria-expanded='true'] .chip {
