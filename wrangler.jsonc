@@ -8,6 +8,14 @@
 	"assets": {
 		"directory": ".output/public"
 	},
+	// 自訂網域。trip-ledger.com 要先加進同一個 Cloudflare 帳號(Domains),
+	// deploy 時 wrangler 會自動建 DNS 記錄與憑證。
+	// 換網域後記得重設 secret NUXT_PUBLIC_ORIGIN(排程 self-fetch 用),
+	// 而且推播訂閱綁 origin,使用者要重新訂閱。
+	"routes": [
+		{ "pattern": "trip-ledger.com", "custom_domain": true },
+		{ "pattern": "www.trip-ledger.com", "custom_domain": true }
+	],
 	// ⚠️ 只能有**一個** trip-ledger 的 binding。
 	//
 	// `wrangler d1 execute trip-ledger` 是用 database_name 去找的,兩筆同名時它拿第一筆的

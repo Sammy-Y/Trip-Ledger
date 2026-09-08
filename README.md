@@ -950,7 +950,7 @@ pnpm db:migrate:remote                 # 補上增量變更（is_pot / booked_fo
 
 ```bash
 npx wrangler secret put NUXT_TASK_SECRET
-npx wrangler secret put NUXT_PUBLIC_ORIGIN      # https://trip-ledger.<你的>.workers.dev
+npx wrangler secret put NUXT_PUBLIC_ORIGIN      # https://trip-ledger.com（wrangler.jsonc routes 綁的自訂網域）
 npx wrangler secret put NUXT_VAPID_PRIVATE_JWK  # 推播用，不做推播可跳過
 npx wrangler secret put NUXT_VAPID_PUBLIC_KEY
 npx wrangler secret put NUXT_VAPID_SUBJECT      # mailto:you@example.com
