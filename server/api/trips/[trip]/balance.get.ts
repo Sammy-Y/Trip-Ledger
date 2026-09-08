@@ -33,11 +33,19 @@ async function potSummary(dbh: D1Database, tripId: string): Promise<PotSummary |
        FROM settlements WHERE trip_id = ? AND from_member = ?
        GROUP BY currency, to_member`,
     ).bind(tripId, pot.id).all<{ currency: string; member_id: string; amt: number }>(),
-    // 公費付掉的支出
+    // 公費付掉的支出。
+    //
+    // ⚠️ `kind = 'shared'` 不能省。utils/ledger.ts 的淨額只算 shared,
+    // 這裡如果連 personal 一起算,`剩餘 = −公費淨額` 這個不變量就會差掉
+    // 那筆個人花費的金額 —— 結算頁要公費退 16,000、總覽卻說它只有 11,000,
+    // 中間那 5,000 卡在沒有任何畫面能解決的地方(實測出來的)。
+    //
+    // expenses.post 會擋「公費當個人花費付款人」,但那只在**寫入當下有公費**才擋得到;
+    // 先記帳、之後才把某個成員標成公費的話就繞過去了(見 members/[id].patch.ts)。
     dbh.prepare(
       `SELECT e.currency, SUM(p.amount_minor) AS amt
        FROM expense_payers p JOIN expenses e ON e.id = p.expense_id
-       WHERE e.trip_id = ? AND p.member_id = ?
+       WHERE e.trip_id = ? AND e.kind = 'shared' AND p.member_id = ?
        GROUP BY e.currency`,
     ).bind(tripId, pot.id).all<{ currency: string; amt: number }>(),
   ]);

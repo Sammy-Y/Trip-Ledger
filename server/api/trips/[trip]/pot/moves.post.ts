@@ -101,7 +101,8 @@ export default defineEventHandler(async (event) => {
                     WHERE trip_id = ?1 AND currency = ?2 AND from_member = ?3), 0) AS refunded,
          COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p
                     JOIN expenses e ON e.id = p.expense_id
-                    WHERE e.trip_id = ?1 AND e.currency = ?2 AND p.member_id = ?3), 0) AS spent`,
+                    WHERE e.trip_id = ?1 AND e.kind = 'shared'
+                      AND e.currency = ?2 AND p.member_id = ?3), 0) AS spent`,
     ).bind(trip.id, b.currency, pot.id)
       .first<{ contributed: number; refunded: number; spent: number }>();
 
@@ -120,18 +121,54 @@ export default defineEventHandler(async (event) => {
 
   const note = b.note?.trim() || (inbound ? '投入公費' : '公費退還');
 
-  const stmts = b.entries.map((e) =>
-    dbh.prepare(
-      `INSERT INTO settlements (id, trip_id, from_member, to_member, currency, amount_minor, note)
-       VALUES (?,?,?,?,?,?,?)`,
-    ).bind(
-      uid(), trip.id,
-      inbound ? e.member_id : pot.id,
-      inbound ? pot.id : e.member_id,
-      b.currency, e.amount_minor, note,
-    ));
+  const stmts = b.entries.map((e) => (inbound
+    // 投入沒有上限問題 —— 錢是流進公費的,不可能超支。
+    ? dbh.prepare(
+        `INSERT INTO settlements (id, trip_id, from_member, to_member, currency, amount_minor, note)
+         VALUES (?,?,?,?,?,?,?)`,
+      ).bind(uid(), trip.id, e.member_id, pot.id, b.currency, e.amount_minor, note)
+    /**
+     * 退還:把上限**再一次寫進 SQL 本身**。
+     *
+     * 上面那個事前檢查是「讀完再判斷」,寫入是另一次往返 —— 中間有空窗。
+     * 實測:兩支手機同時各退還「剛好等於全部餘額」的金額,兩支都通過事前檢查、
+     * 兩筆都寫進去 → 公費剩餘變成負的 → 結算據此寫出一筆多出 6,000 的
+     * 真實轉帳,而那 6,000 是憑空生出來的。
+     *
+     * batch 是循序跑在同一個交易裡,所以每一列都看得到前面幾列的效果,
+     * 這個條件會隨著寫入逐步收緊 → 總額**永遠不可能**超過公費手上的錢。
+     *
+     * 代價:如果餘額中途不夠,後面幾列會被跳過(而不是整批失敗)。
+     * 那是可接受的 —— 少寫幾列可以再補,憑空生出來的債務卻會變成
+     * 別人真的要付的錢。下面會比對實際寫入筆數並回報。
+     */
+    : dbh.prepare(
+        `INSERT INTO settlements (id, trip_id, from_member, to_member, currency, amount_minor, note)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+         WHERE (
+           COALESCE((SELECT SUM(amount_minor) FROM settlements
+                      WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?3), 0)
+           - COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p
+                        JOIN expenses e ON e.id = p.expense_id
+                        WHERE e.trip_id = ?2 AND e.kind = 'shared'
+                          AND e.currency = ?5 AND p.member_id = ?3), 0)
+           - COALESCE((SELECT SUM(amount_minor) FROM settlements
+                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?3), 0)
+         ) >= ?6`,
+      ).bind(uid(), trip.id, pot.id, e.member_id, b.currency, e.amount_minor, note)));
 
-  await dbh.batch(stmts);
+  const results = await dbh.batch(stmts);
+  const written = results.reduce((s, r) => s + (r.meta?.changes ?? 0), 0);
+
+  if (written !== b.entries.length) {
+    // 只有退還會走到這裡(投入沒有條件)。代表在這一瞬間有人也在退還公費。
+    throw createError({
+      statusCode: 409,
+      statusMessage: `${pot.name}的餘額在寫入的這一瞬間被別人動了,`
+        + `只成功記下 ${written}/${b.entries.length} 筆(沒有超額)。`
+        + '請重新整理看最新的剩餘金額,再補記剩下的。',
+    });
+  }
 
   setResponseStatus(event, 201);
   return {

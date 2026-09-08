@@ -79,6 +79,9 @@ eq('公費排在成員名單最後', members[members.length - 1]?.name, '公費'
 check('回傳 fx_defaults', typeof tripRes.json.fx_defaults?.card_fee_pct === 'number',
   JSON.stringify(tripRes.json.fx_defaults));
 eq('刷卡手續費預設 1.5%', tripRes.json.fx_defaults?.card_fee_pct, 1.5);
+// 現金預設 0% —— 出發前在台灣換好的現金,成本在換鈔當下就固定了,
+// 記帳時再加一次價差是重複計價。只有在當地才換的情況要自己填。
+eq('現金價差預設 0%', tripRes.json.fx_defaults?.cash_spread_pct, 0);
 
 const dupPot = await post(`/api/trips/${T}/members`, { name: '公費2', is_pot: true });
 eq('第二個公費 → 400', dupPot.status, 400);
@@ -236,7 +239,13 @@ eq('刷卡不給 markup → 201', cardDefault.status, 201);
 eq('套用預設 1.5%', cardDefault.json.fx_markup_pct, 1.5);
 
 const cashDefault = await makeExpense({ description: '現金預設', payment_method: 'cash' });
-eq('現金套用預設 1.5%', cashDefault.json.fx_markup_pct, 1.5);
+eq('現金套用預設 0%(不加價差)', cashDefault.json.fx_markup_pct, 0);
+
+// 在當地才換鈔的情況:自己填得進去
+const cashCustom = await makeExpense({
+  description: '現金當地換鈔 0.8%', payment_method: 'cash', fx_markup_pct: 0.8,
+});
+eq('現金自訂 0.8% 被採用', cashCustom.json.fx_markup_pct, 0.8);
 
 const cardCustom = await makeExpense({
   description: '刷卡自訂 2%', payment_method: 'card', fx_markup_pct: 2,

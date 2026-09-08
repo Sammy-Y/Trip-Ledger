@@ -181,16 +181,20 @@ function onSubmit() {
 const isForeign = computed(() => currency.value !== props.baseCurrency);
 const amountStep = computed(() => (EXPONENT[currency.value] === 0 ? '1' : '0.01'));
 
-// ── 換匯加成:刷卡的國外交易手續費 / 現金的換匯價差 ──────────────
+// ── 換匯加成:只有刷卡預設要加 ────────────────────────────────
 /**
- * 台灣發卡行的「國外交易手續費」= 國際組織費 + 發卡行加收,
- * 實務上 Visa / Mastercard / JCB 多為合計 **1.5%**(AmEx 約 2%)。
- * 所以預設值放 1.5%,但各家卡真的不一樣 —— 使用者自己最清楚,要能改。
+ * **刷卡**才有國外交易手續費:國際組織費 + 發卡行加收,
+ * 台灣的 Visa / Mastercard / JCB 實務上合計約 **1.5%**(AmEx 約 2%)。
  *
- * 預設值的唯一來源是 server 的 runtimeConfig(cardFeePct / cashSpreadPct),
+ * **現金預設 0%。** 這個團的做法是出發前就在台灣把現金換好,
+ * 那筆錢的成本在換鈔當下就固定了 —— 記帳時再加一次價差等於重複計價,
+ * 算出來的台幣金額會比實際付出的還多。
+ * (在當地 ATM 提領或臨櫃換的話才有價差,那種情況逐筆自己填。)
+ *
+ * 兩個預設值的唯一來源都是 server 的 runtimeConfig(cardFeePct / cashSpreadPct),
  * 經 GET /api/trips/:trip 的 fx_defaults 帶進來,前端不自己寫死一份。
  */
-const DEFAULT_MARKUP = { cash: 1.5, card: 1.5 };
+const DEFAULT_MARKUP = { cash: 0, card: 1.5 };
 
 const markupDefault = computed(() => {
   if (!isForeign.value) return 0;
@@ -224,7 +228,11 @@ function resetMarkup(): void {
 const markupHint = computed(() => {
   const pct = markupPct.value;
   if (!isForeign.value) return '';
-  if (!pct) return '不加計任何手續費,直接用當日中價換算。';
+  if (!pct) {
+    return paymentMethod.value === 'cash'
+      ? '直接用當日中價換算,不加計價差(現金出發前就換好了)。'
+      : '不加計任何手續費,直接用當日中價換算。';
+  }
   return `換算時在當日中價上加 ${pct}% —— ${
     paymentMethod.value === 'card' ? '相當於國外交易手續費' : '相當於換鈔價差'}。`;
 });
@@ -282,7 +290,8 @@ const markupHint = computed(() => {
           實際金額以銀行帳單為準 —— 收到帳單後可用下方的「覆寫匯率」回填正確數字。
         </template>
         <template v-else>
-          現金以當日中價加計換匯價差估算,與你實際換到的匯率會有落差。
+          現金直接用當日中價換算,不加計價差 —— 出發前換好的現金,成本在換鈔當下就固定了。
+          在當地才換的話可以自己填價差。
         </template>
       </p>
 
@@ -312,6 +321,9 @@ const markupHint = computed(() => {
           {{ markupHint }}
           <template v-if="paymentMethod === 'card' && !markupTouched">
             台灣的 Visa / Mastercard / JCB 多為 1.5%(AmEx 約 2%),你的卡不同的話直接改。
+          </template>
+          <template v-else-if="paymentMethod === 'cash' && !markupTouched">
+            在當地 ATM 提領或臨櫃換鈔才有價差,那種情況填進來。
           </template>
         </p>
       </div>

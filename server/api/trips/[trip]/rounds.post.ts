@@ -53,7 +53,7 @@ export default defineEventHandler(async (event) => {
   if (!known) throw createError({ statusCode: 400, statusMessage: `不支援的幣別 ${currency}` });
 
   // ── 寫錢之前的所有檢查 ──────────────────────────────────────
-  const [ledger, unbalanced, itemRows, seqRow] = await Promise.all([
+  const [ledger, unbalanced, itemRows, seqRow, fpRow] = await Promise.all([
     tripLedger(dbh, trip.id, currency),
     findUnbalancedExpenses(dbh, trip.id, currency),
     dbh.prepare(
@@ -64,6 +64,11 @@ export default defineEventHandler(async (event) => {
       `SELECT COALESCE(MAX(seq), 0) AS max_seq FROM settlement_rounds
        WHERE trip_id = ? AND currency = ?`,
     ).bind(trip.id, currency).first<{ max_seq: number }>(),
+    // 這個幣別目前的還款狀態。寫入時會再核對一次 —— 見下面的樂觀鎖說明。
+    dbh.prepare(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(amount_minor), 0) AS total
+       FROM settlements WHERE trip_id = ? AND currency = ?`,
+    ).bind(trip.id, currency).first<{ n: number; total: number }>(),
   ]);
 
   if (unbalanced.length) {
@@ -116,10 +121,41 @@ export default defineEventHandler(async (event) => {
   const seq = (seqRow?.max_seq ?? 0) + 1;
 
   const stmts = [
+    /**
+     * ── 樂觀鎖:把「讀到的狀態」變成資料庫層的寫入前提 ──────────
+     *
+     * 上面那些檢查都是「讀完再判斷」,而寫入是另一次往返 ——
+     * 中間那個空窗期什麼都可能發生。實測過的災難:
+     *
+     *   點「結算」→ 3ms 後點「標記已還款」→ 兩支都回 201
+     *   → 1,500 的債被記了 3,000,然後 App 開始叫收錢的人反過來付 1,500 回去。
+     *   (localhost 空窗約 15ms;Workers 打遠端 D1 讀取要 4 次往返,
+     *    空窗是幾十到幾百毫秒 —— 網路慢的時候手殘點兩下就中。)
+     *
+     * body 的 `expect` 指紋擋不住,因為它是拿**同一份過期的讀取**去比對。
+     *
+     * 所以這裡把前提寫進 SQL 本身:INSERT ... SELECT ... WHERE <前提>。
+     * 前提不成立就插不進這一列,而後面的 nets / settlements / UPDATE 都
+     * 外鍵指向這個 round_id → FOREIGN KEY constraint failed → **整個 batch 回滾**。
+     * (D1 的 batch 是單一交易,而且 D1 預設開啟外鍵 —— 兩件事都實測確認過。)
+     *
+     * 前提包含三件事:未結明細筆數、這個幣別的還款筆數、還款總額。
+     * 加總額是因為筆數相同但金額不同也會讓算術結果不一樣。
+     */
     dbh.prepare(
       `INSERT INTO settlement_rounds (id, trip_id, currency, seq, label, note)
-       VALUES (?,?,?,?,?,?)`,
-    ).bind(roundId, trip.id, currency, seq, b.label?.trim() || null, b.note?.trim() || null),
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6
+       WHERE (SELECT COUNT(*) FROM expenses
+               WHERE trip_id = ?2 AND kind = 'shared' AND currency = ?3
+                 AND settlement_round_id IS NULL) = ?7
+         AND (SELECT COUNT(*) FROM settlements
+               WHERE trip_id = ?2 AND currency = ?3) = ?8
+         AND (SELECT COALESCE(SUM(amount_minor), 0) FROM settlements
+               WHERE trip_id = ?2 AND currency = ?3) = ?9`,
+    ).bind(
+      roundId, trip.id, currency, seq, b.label?.trim() || null, b.note?.trim() || null,
+      itemCount, fpRow?.n ?? 0, fpRow?.total ?? 0,
+    ),
 
     // 淨額快照(含公費)。之後資料變了也還原得出當時是照什麼數字付的。
     ...block.nets.map((n) =>
@@ -144,11 +180,24 @@ export default defineEventHandler(async (event) => {
     ).bind(roundId, trip.id, currency),
   ];
 
+  let stamped = itemCount;
   try {
-    await dbh.batch(stmts);
+    const results = await dbh.batch(stmts);
+    // 蓋章的筆數用 UPDATE 真正改到的列數,而不是上面那個事前 COUNT ——
+    // 預覽之後才新增的那筆也會被蓋到,回報事前的數字就是明知故錯。
+    const changes = results[results.length - 1]?.meta?.changes;
+    if (typeof changes === 'number') stamped = changes;
   } catch (e) {
-    // UNIQUE(trip_id, currency, seq) 撞到 = 另一支手機剛剛結完同一輪
     const msg = String((e as Error)?.message ?? e);
+    // FOREIGN KEY = 上面的樂觀鎖前提不成立 → round 那一列沒插進去 → 整批回滾。
+    if (/FOREIGN\s*KEY/i.test(msg)) {
+      throw createError({
+        statusCode: 409,
+        statusMessage: '這個幣別的帳在你按下結算的這一瞬間被改動了'
+          + '(有人記了一筆帳、或標記了還款)。什麼都沒有寫入,請重新整理再結算。',
+      });
+    }
+    // UNIQUE(trip_id, currency, seq) 撞到 = 另一支手機剛剛結完同一輪
     if (/UNIQUE|constraint/i.test(msg)) {
       throw createError({
         statusCode: 409,
@@ -163,7 +212,7 @@ export default defineEventHandler(async (event) => {
     id: roundId,
     currency,
     seq,
-    item_count: itemCount,
+    item_count: stamped,
     recorded,
     deferred: block.deferred,
     nets: block.nets,
