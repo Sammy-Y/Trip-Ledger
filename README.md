@@ -53,6 +53,8 @@ Nuxt 4 · TypeScript · Cloudflare Workers · D1
 - **預約開放時間提醒** — 日本餐廳「每月 1 號 12:00 開放訂位」的排程推播
 - **訂位時間獨立記錄** — 「什麼時候開放搶」和「訂到哪一餐」是兩個欄位,可能差好幾個月;訂到之後打勾、時間有變可直接改
 - **免註冊協作** — 連結丟 LINE 群組,旅伴點開就能記帳
+- **旅程之間互相隔離** — 每個人只看得到自己建立的、或用分享連結進去過的旅程。
+  建立者可以註冊帳號(換手機也找得回來、只有他能刪除旅程),旅伴不用
 - **PWA** — 加到主畫面、離線可用
 
 ---
@@ -92,7 +94,7 @@ Nuxt 4 · TypeScript · Cloudflare Workers · D1
         │        一個 Cloudflare Worker                 │
         │                                              │
         │  前端    Vue 3 SPA（ssr: false）+ PWA        │
-        │  API     server/api/**   25 支端點            │
+        │  API     server/api/**   30 支端點            │
         │  排程    server/tasks/**                      │
         │            fx:sync        0 1 * * *  (UTC)   │
         │            reminders:run  */5 * * * * (UTC)  │
@@ -114,10 +116,12 @@ migrations/             既有資料庫的增量變更（見 Local Development�
   001-members-is-pot.sql
   002-reservations-booked.sql
   003-settlement-rounds.sql   ★ 結算回合的 2 張表 + 3 個欄位 + 2 個索引
+  004-auth.sql                ★ 存取控制的 4 張表（users / sessions / session_trips / trip_access）
 
 app/
   pages/
     index.vue                 旅程列表（首頁）
+    login.vue                 ★ 登入 / 註冊（一頁兩用）
     t/[trip]/overview.vue     ★ 總覽：公費剩餘 / 總花費 / 每人合計 / 投入・退還
     t/[trip]/index.vue        支出列表（可收合、可篩選、可依金額排序）
     t/[trip]/new.vue          記一筆
@@ -300,7 +304,7 @@ reservations            預約：opens_at_utc（何時開放搶）+ booked_for_u
 是真的發生過的付款,撤銷回合不該把它們一起消滅。
 撤銷之後那些支出回到「未結算」,下次預覽又會出現,這正是預期行為。
 
-**端點**(`:trip` 一律吃 trip id 或 share_token):
+**端點**(`:trip` 吃 trip id 或 share_token —— 但**光知道 id 不等於有權限**,見 Access Control):
 
 | | |
 |---|---|
@@ -453,6 +457,117 @@ expenses.fx_markup_pct    套在中價之上的估算加成（現金價差 / 海
 > `…(fallback:earliest)`。那種筆數的換算金額是**近似值**,UI 標成近似並提示
 > 使用者用 `fx_rate_override` 照信用卡帳單回填。
 > 回傳 `null` 反而更糟 —— `fx_rate` 留空的話,之後每個統計都得再猜一次匯率。
+
+</details>
+
+<details>
+<summary><b>Access Control（存取控制）</b></summary>
+
+在 issue #3 之前這個 App **完全沒有權限層**,而且那是刻意的 ——
+註解裡寫明「這是自己和幾個朋友用的工具」。要開放給不特定使用者,有三個洞必須先補:
+
+| 洞 | 症狀 |
+|---|---|
+| `GET /api/trips` 沒有 `WHERE` | 首頁列出資料庫裡**所有人**的旅程,連 `share_token` 一起回傳 |
+| `requireTrip` 是 `share_token = ?1 OR id = ?1` | 拿到 id 就等於有權限,配合上一條等於後門大開 |
+| `DELETE /api/trips/:trip` 不分身分 | 任何拿到連結的人都能刪掉整趟(支出 CASCADE,無法復原) |
+
+### 採用的模型:混合式
+
+**建立者有帳號,旅伴不用。** 理由是旅遊分帳的天然形狀就是「一個人開團、其他人被拉進來」,
+強迫五個旅伴都註冊會直接殺死使用率。帳號解決的是另一件事:**換手機之後還找得回自己的旅程**。
+
+| 身分 | 怎麼進來 | 能做什麼 |
+|---|---|---|
+| owner | 登入 + `trip_access` 有紀錄 | 全部,含刪除旅程、看 share_token |
+| editor(訪客) | 持有 share_token,或這個 session 解鎖過 | 記帳、結算、改成員 —— 但不能刪除旅程 |
+| 其他人 | — | `404`(不是 `403`,見下) |
+
+### 四張表
+
+```
+users          帳號本身（email + PBKDF2 密碼雜湊 + 失敗鎖定）
+sessions       一個瀏覽器一筆。user_id 為 NULL 就是訪客
+               → 登入與未登入共用同一套 cookie 機制,requireTrip 只有一條路徑
+session_trips  訪客憑 share_token 解鎖過的旅程
+trip_access    帳號對旅程的正式權限（owner / editor）
+               → 獨立一張表而非 trips.owner_id,之後「轉移旅程」不用改 schema
+```
+
+### 判斷順序(`server/utils/trip.ts`)
+
+```
+1. 已登入,且 trip_access 有這個 user  → 用該筆的 role
+2. session 之前用 share_token 解鎖過   → editor
+3. 網址上那一段就是有效的 share_token  → 解鎖並記進 session,editor
+4. 以上皆非                            → 404
+```
+
+**第 4 條回 404 而不是 403** —— 回 403 等於告訴對方「這個 id 是存在的」,
+那本身就是資訊洩漏,可以拿來枚舉出哪些旅程存在。
+
+**`requireTrip` 的簽名刻意沒有改。** 21 個既有端點原封不動就自動受到保護 ——
+權限是那種「漏掉一個檔案就前功盡棄」的東西,把它收斂成一個 choke point
+比在 21 個地方各寫一次可靠得多。需要分辨 owner / editor 的少數端點
+改用 `resolveTripAccess` 或 `requireOwner`。
+
+### 分享連結一定要用 share_token
+
+```js
+// ✘ 壞掉:從旅程列表點進來時網址是 /t/<trip-id>,
+//    而 trip id 對沒有權限的人是無效的 —— 朋友點開只會看到 404
+const shareUrl = `${location.origin}/t/${route.params.trip}`
+
+// ✔ useTrip().shareUrl —— 用 API 回傳的 share_token 組
+```
+
+這是這次改動最容易踩到的回歸。`useTrip()` 統一提供 `shareUrl`,
+呼叫端不要自己拼(`app/layouts/default.vue` 和 `members.vue` 都吃過這個虧)。
+
+### 無主旅程
+
+權限層上線前建立的旅程沒有任何 `trip_access` 紀錄。它們仍能用 share_token 進去記帳,
+但沒有人能刪除。登入的使用者可以在旅程列表按「認領」收為己有
+(`POST /api/trips/:trip/claim`)。
+
+> [!WARNING]
+> 認領的條件是「登入 + 進得去這趟」,而進得去的條件是持有 share_token。
+> 所以在你認領之前,**任何拿到那條連結的人都可以搶先認領**。
+> 對既有的幾趟私人旅程可以接受;要更嚴就得改成 migration 時直接綁定 `user_id`。
+
+### 密碼雜湊被 CPU 上限綁架
+
+Workers 沒有原生 bcrypt/argon2,只剩 WebCrypto 的 PBKDF2。而 PBKDF2 的重點是「故意很慢」,
+偏偏**免費版 Workers 每次呼叫只有 10ms CPU**。實測(`node scripts/bench-pbkdf2.mjs`):
+
+| 迭代次數 | 本機耗時 | 10ms 預算 |
+|---|---|---|
+| 50,000 | 3.6 ms | ✔ |
+| 100,000 | 7.2 ms | 線上很可能超標 |
+| 200,000 | 14.5 ms | ✘ |
+| 600,000(OWASP 建議值) | 45.3 ms | ✘ |
+
+所以預設值是 **50,000**,那是被 CPU 上限逼出來的妥協,不是安全上的建議值。
+升級 Workers Paid(30 秒 CPU)之後把 `pbkdf2Iterations` 改成 `600000` 即可 ——
+每個使用者的迭代次數存在自己那一列,**舊帳號照樣登得進來**,
+會在下次登入成功時自動用新參數重算。升級不需要任何資料遷移。
+
+### 其他
+
+- **session token 存雜湊** — cookie 放原始 token,DB 只存 SHA-256。DB 外洩時拿到的東西不能直接當 cookie 用
+- **登入 / 註冊會換一組新 session** — 防 session fixation。訪客期間解鎖過的旅程會一起搬過去
+- **email 不存在時也跑一次 PBKDF2** — 否則「查無此人」比「密碼錯」快一整個雜湊的時間,光看回應時間就能問出某個 email 有沒有註冊
+- **連續 8 次失敗鎖 15 分鐘**
+- **`Referrer-Policy: no-referrer`** — 否則頁面上任何一個外連(例如訂位連結指向的餐廳網站)都會在 log 裡看到完整網址,也就是 share_token
+- **`X-Robots-Tag: noindex`** — 防止搜尋引擎收錄被分享到公開場合的旅程連結
+
+### 已知限制
+
+- **註冊會明確回「這個 email 已經註冊過」** — 可以拿來確認某個 email 有沒有在這裡註冊。
+  要堵住得改成「我們寄了一封信給你」的流程,那需要先接 email 服務
+- **沒有 email 驗證、沒有忘記密碼** — 密碼弄丟就進不去了
+- **editor 拿不到 share_token** — 想再分享給新旅伴要請 owner 出面
+- **沒有 token 輪替** — 連結外流目前只能刪掉整趟重建
 
 </details>
 
@@ -684,6 +799,7 @@ pnpm test:rounds    # 只跑結算回合那一支（需要 dev server）        
 | `settle.fuzz.ts` | 20000 | 隨機案例:全部歸零、不漏帳、轉帳 ≤ n−1 筆 |
 | `api.test.ts` | 56 | 真實 HTTP + 真實 D1:驗證、結算、還款、刪除 |
 | `api.features.test.ts` | 87 | 公費收支與不變量、成員改名/刪除防護、刷卡手續費、訂位兩個時間 |
+| `api.access.test.ts` | 51 | **存取控制**:旅程之間互不可見、id 不是憑證、editor 拿不到 share_token、只有 owner 能刪、認領無主旅程、登出後看不到東西 |
 | `api.rounds.test.ts` | 306 | **結算回合的 15 組情境**:公費不會被清空、公費墊款後不再重複收、吸收手動還款不吐反向轉帳、連續兩回合不互相反轉、撤銷是精確反運算且不刪手動還款、舊畫面指紋防護、蓋章的支出不准刪、幣別互相隔離、`pot/moves` 的原子性 |
 
 `ledger.test.ts` 是純函式測試(不需要 dev server),`api.rounds.test.ts` 打真實 HTTP。

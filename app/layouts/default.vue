@@ -16,7 +16,7 @@ const inTrip = computed(() => !!tripId.value);
 
 // useTrip 以 tripId 當 useAsyncData 的 key,所以 layout 和 page 同時呼叫
 // 也只會打一次 API、看到同一份資料。沒有 tripId 時它自己不會發請求。
-const { trip, pending } = useTrip(tripId);
+const { trip, pending, shareUrl } = useTrip(tripId);
 
 const tripName = computed(() => trip.value?.name?.trim() || '');
 /** 名稱還在路上時顯示骨架,不要讓標頭空一下再跳出文字 */
@@ -107,9 +107,23 @@ function legacyCopy(text: string): boolean {
   }
 }
 
+/**
+ * 分享用的網址。
+ *
+ * ⚠️ 不能直接用 window.location.href。從旅程列表點進來時網址是
+ * /t/<trip-id>/...,而 trip id 對沒有權限的人是無效的 —— 複製那個給朋友,
+ * 對方只會看到「找不到這個旅程」。一定要把識別碼換成 share_token,
+ * 同時保留目前所在的子頁面(旅伴點進來會落在同一個畫面)。
+ */
+const shareHref = computed<string | null>(() => {
+  if (!shareUrl.value) return null;
+  const suffix = route.path.replace(`/t/${tripId.value}`, '');
+  return `${shareUrl.value}${suffix}`;
+});
+
 async function copyShareLink(): Promise<void> {
-  // 複製當前頁網址 —— 旅伴點進來會落在同一個畫面,而且每頁都有導覽可以走去別處
-  const url = window.location.href;
+  const url = shareHref.value;
+  if (!url) return;
   const ok = (await writeClipboard(url)) || legacyCopy(url);
   shareState.value = ok ? 'copied' : 'error';
   clearTimeout(shareTimer);
@@ -164,6 +178,7 @@ onBeforeUnmount(() => clearTimeout(shareTimer));
         <UiAppButton
           variant="ghost"
           block
+          v-if="shareHref"
           :icon="shareUi.icon"
           :class="['text-sm', shareUi.tone]"
           @click="copyShareLink"
@@ -195,6 +210,7 @@ onBeforeUnmount(() => clearTimeout(shareTimer));
 
         <UiAppButton
           variant="ghost"
+          v-if="shareHref"
           :icon="shareUi.icon"
           :aria-label="shareUi.label"
           :class="['shrink-0', 'px-3', 'text-xs', shareUi.tone]"

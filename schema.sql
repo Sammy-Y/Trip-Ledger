@@ -209,3 +209,52 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   auth       TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ─────────────────────────────────────────────────────────────
+-- 存取控制。issue #3
+--
+-- 混合式:建立者有帳號(跨裝置找回、可刪除旅程),
+-- 旅伴憑 share_token 免註冊即可記帳。
+-- 細節與取捨見 migrations/004-auth.sql。
+-- ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS users (
+  id             TEXT PRIMARY KEY,
+  email          TEXT NOT NULL UNIQUE,
+  display_name   TEXT NOT NULL,
+  password_hash  TEXT NOT NULL,
+  password_salt  TEXT NOT NULL,
+  password_iter  INTEGER NOT NULL,
+  failed_count   INTEGER NOT NULL DEFAULT 0,
+  locked_until   TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- id 存的是 cookie token 的 SHA-256,不是 token 本身。
+-- user_id 為 NULL 代表訪客 session。
+CREATE TABLE IF NOT EXISTS sessions (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT REFERENCES users(id) ON DELETE CASCADE,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+
+-- 訪客憑 share_token 解鎖過的旅程。
+CREATE TABLE IF NOT EXISTS session_trips (
+  session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  trip_id     TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  unlocked_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (session_id, trip_id)
+);
+
+CREATE TABLE IF NOT EXISTS trip_access (
+  trip_id    TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role       TEXT NOT NULL CHECK (role IN ('owner','editor')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (trip_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trip_access_user ON trip_access(user_id);

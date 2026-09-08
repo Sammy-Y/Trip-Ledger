@@ -69,6 +69,30 @@ export function useTrip(tripId: MaybeRefOrGetter<string>) {
   const trip = computed<Trip | null>(() => state.data.value?.trip ?? null);
   const members = computed<Member[]>(() => state.data.value?.members ?? []);
 
+  /**
+   * 權限。載入完成前一律當成權限最小的那一種 ——
+   * 寧可讓「刪除」晚半秒出現,也不要先閃出來再消失。
+   */
+  const role = computed<'owner' | 'editor'>(() => state.data.value?.role ?? 'editor');
+  const isOwner = computed(() => role.value === 'owner');
+  const orphan = computed(() => state.data.value?.orphan ?? false);
+  const anonymous = computed(() => state.data.value?.anonymous ?? false);
+
+  /**
+   * 分享連結。
+   *
+   * ⚠️ 一定要用 share_token 組,**不能用網址上的那一段**。
+   * 從旅程列表點進來時網址是 /t/<trip-id>,而 trip id 對沒有權限的人
+   * 是完全無效的 —— 拿它當分享連結,朋友點開只會看到 404。
+   * 拿不到 token(editor)時回 null,呼叫端據此不要顯示分享區塊。
+   */
+  const shareUrl = computed<string | null>(() => {
+    const token = state.data.value?.share_token;
+    if (!token) return null;
+    const origin = import.meta.client ? location.origin : '';
+    return `${origin}/t/${token}`;
+  });
+
   /** 公費(is_pot = 1)。沒設定的話是 null。一趟最多一個,由資料庫的 unique index 保證。 */
   const pot = computed<Member | null>(() => members.value.find(m => m.is_pot) ?? null);
   /** 真正的「人」—— 分攤名單要用這個,公費不該是受益人。 */
@@ -133,5 +157,15 @@ export function useTrip(tripId: MaybeRefOrGetter<string>) {
     tripToken,
     /** 有沒有 tripId 可用。沒有的話 status 會停在 idle。 */
     hasToken,
+    /** 'owner' | 'editor'。載入完成前一律是 'editor'(權限最小)。 */
+    role,
+    /** owner 才能刪除旅程、看得到分享連結。 */
+    isOwner,
+    /** 這趟還沒有擁有者,登入的人可以認領。 */
+    orphan,
+    /** 目前沒登入,這趟的帳只綁在這個瀏覽器上。 */
+    anonymous,
+    /** 完整的分享網址(用 share_token 組)。拿不到 token 時是 null。 */
+    shareUrl,
   };
 }
