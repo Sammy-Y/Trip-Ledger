@@ -65,9 +65,9 @@ useHead({ title: '結算 — 旅遊記帳' });
 
 const tripId = useTripId();
 const api = useApi();
-// people = 扣掉公費的真人。「每人淨額」整張卡只講真人,所以那裡一律用 people;
-// 「每人這趟花費」看的是每個人自己的帳,用 members(公費不會有分攤,自然是 0)。
-const { members, people, memberName, memberMap, pot } = useTrip(tripId);
+// people = 扣掉公費的真人。這一頁的兩張表都只講真人 —— 公費不是人,
+// 「他這趟花了多少」「他應收應付多少」套在它身上都沒有意義。
+const { people, memberName, memberMap, pot } = useTrip(tripId);
 
 /** 公費的 member_id。這趟沒設公費時是 null。 */
 const potId = computed<string | null>(() => pot.value?.id ?? null);
@@ -393,7 +393,12 @@ const memberTotals = computed<MemberTotalRow[]>(() => {
   if (!b) return [];
   const perMember = b.per_member ?? {};
 
-  const rows: MemberTotalRow[] = members.value.map(m => ({
+  /*
+    只列真人。公費**不出現在這張表裡** —— 它不會有分攤,所以永遠是一列全 0,
+    而那一列除了雜訊什麼都不是,還會讓人以為公費是第三個旅伴。
+    (總覽頁的「每人合計」早就是這樣做的,兩頁要一致。)
+  */
+  const rows: MemberTotalRow[] = people.value.map(m => ({
     id: m.id,
     name: m.name,
     // per_member 只含「有分攤記錄」的人,沒花錢的成員也要出現(顯示 0),
@@ -401,7 +406,15 @@ const memberTotals = computed<MemberTotalRow[]>(() => {
     ...(perMember[m.id] ?? ZERO_TOTALS),
   }));
 
-  // 反過來:per_member 有、members 沒有的 id(成員被刪掉)也補上,不要靜靜漏掉一筆錢
+  /*
+    反過來:per_member 有、上面那份名單沒有的 id 也要補上,不要靜靜漏掉一筆錢。
+    兩種情況會走到這裡:
+      ① 成員被刪掉了,但他的分攤還在(那筆錢要看得見)
+      ② **公費身上出現了分攤** —— 那是資料壞掉(有人把公費放進分攤名單,
+         或把已經有帳的成員改標成公費),會讓「公費淨額 = −剩餘」這個支點失效。
+    所以上面排除公費、這裡不排除,是刻意的:正常情況它不出現,
+    真的出事的時候它必須出現,而不是被藏起來。
+  */
   const known = new Set(rows.map(r => r.id));
   for (const [id, v] of Object.entries(perMember)) {
     if (!known.has(id)) rows.push({ id, name: memberName(id), ...v });

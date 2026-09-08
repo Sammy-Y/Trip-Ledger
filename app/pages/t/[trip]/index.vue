@@ -18,7 +18,7 @@ import ExpenseDetail from '~/components/expense/ExpenseDetail.vue';
  */
 const tripId = useTripId();
 const api = useApi();
-const { trip, members, memberMap, memberName, fxDefaults, pot } = useTrip(tripId);
+const { trip, members, people, memberMap, memberName, fxDefaults, pot } = useTrip(tripId);
 
 const baseCurrency = computed(() => trip.value?.base_currency ?? 'TWD');
 const baseLabel = computed(() => CURRENCY_LABEL[baseCurrency.value] ?? baseCurrency.value);
@@ -151,10 +151,14 @@ const ZERO = { sharedOwedBase: 0, personalBase: 0, totalBase: 0, unconverted: 0 
 
 const memberStats = computed<MemberStat[]>(() => {
   const perMember = balanceState.data.value?.per_member ?? {};
-  const rows: MemberStat[] = members.value.map((m) => ({
+  // 只列真人。公費不會有分攤,列進來就是一列全 0 —— 除了雜訊什麼都不是,
+  // 還會讓人以為它是第三個旅伴(結算頁與總覽頁的同一張表也是這樣做的)。
+  const rows: MemberStat[] = people.value.map((m) => ({
     id: m.id, name: m.name, ...(perMember[m.id] ?? ZERO),
   }));
-  // balance 裡有、成員名單裡沒有的(成員已被移除)也要列出來,不然合計會少一塊
+  // balance 裡有、上面那份名單沒有的也要列出來,不然合計會少一塊。
+  // 兩種情況:成員被移除但分攤還在,或**公費身上出現了分攤**(資料壞掉,
+  // 會讓「公費淨額 = −剩餘」失效)。所以上面排除公費、這裡不排除是刻意的。
   for (const [id, stat] of Object.entries(perMember)) {
     if (!rows.some((r) => r.id === id)) rows.push({ id, name: memberName(id), ...stat });
   }
