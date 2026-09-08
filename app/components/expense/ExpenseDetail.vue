@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Expense } from '~~/shared/types';
 import { CURRENCY_LABEL, EXPONENT, formatMoney, fromMinor } from '~~/shared/money';
+import { splitEqually } from '~~/shared/split';
 
 /**
  * 一筆支出的完整組成 —— 這頁最重要的一塊。
@@ -18,11 +19,14 @@ const props = withDefaults(defineProps<{
   names: Map<string, string>;
   /** 旅程本位幣,用來顯示「約等於多少」的估算值 */
   baseCurrency?: string;
+  /** 被蓋章的那次結算是第幾次(列表頁查結算歷史後傳進來)。null = 查不到 */
+  roundSeq?: number | null;
 }>(), {
   baseCurrency: 'TWD',
+  roundSeq: null,
 });
 
-defineEmits<{ delete: [] }>();
+defineEmits<{ edit: []; delete: [] }>();
 
 function nameOf(id: string): string {
   return props.names.get(id) ?? '未知成員';
@@ -33,6 +37,8 @@ const amountMinor = computed(() => props.expense.amount_minor);
 
 interface Line {
   key: string;
+  /** 成員 id。分攤方式的回推要用它去比對均分的結果,不能只留名字 */
+  id: string;
   name: string;
   minor: number;
   /** 佔「支出金額」的比例。刻意用支出金額當分母,合計對不上時比例也會露出破綻 */
@@ -44,6 +50,7 @@ function toLines(list: Array<{ member_id: string; amount_minor: number }>): Line
   return list
     .map((l, i) => ({
       key: `${l.member_id}:${i}`,
+      id: l.member_id,
       name: nameOf(l.member_id),
       minor: l.amount_minor,
       pct: total > 0 ? (l.amount_minor / total) * 100 : null,
@@ -62,13 +69,26 @@ const shareDiff = computed(() => shareTotal.value - amountMinor.value);
 /** 只有一個付款人、而且金額就是全額 —— 這是最常見的情況,不必再顯示合計列 */
 const singlePayer = computed(() => payerLines.value.length === 1 && payerDiff.value === 0);
 
-/** 分攤方式沒有存在 DB 裡,從金額回推:全部一樣就是平均分攤 */
+/**
+ * 分攤方式沒有存在 DB 裡,只能從金額回推。
+ *
+ * 判定要和編輯表單用**同一條規則**(shared/split.ts 的 splitEqually),
+ * 否則同一筆會出現「明細寫自訂金額、點編輯卻停在均分」的矛盾。
+ * 這也是為什麼不能只比「大家金額一樣」—— 100 日圓三個人分是 34/33/33,
+ * 那是不折不扣的均分,只是餘數被分掉了。
+ */
 const splitHint = computed(() => {
   const lines = shareLines.value;
   if (isPersonal.value || lines.length < 2) return '';
-  const first = lines[0]!.minor;
-  const allEqual = lines.every((l) => l.minor === first);
-  return allEqual ? `平均分攤,每人 ${formatMoney(first, props.expense.currency)}` : '自訂金額';
+  const equal = splitEqually(amountMinor.value, lines.map((l) => l.id));
+  if (!lines.every((l) => equal.get(l.id) === l.minor)) return '自訂金額';
+  const values = lines.map((l) => l.minor);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const cur = props.expense.currency;
+  return min === max
+    ? `平均分攤,每人 ${formatMoney(min, cur)}`
+    : `平均分攤,除不盡的餘數已分配(每人 ${formatMoney(min, cur)} 或 ${formatMoney(max, cur)})`;
 });
 
 function fmtPct(pct: number | null): string {
@@ -300,18 +320,29 @@ const createdText = computed(() => {
       </p>
 
       <!--
-        已列入結算回合的支出不能刪(server 會回 409)。
-        按鈕直接停用並說明原因 —— 讓人按下去、確認完、才在對話框裡看到
-        「不能刪除」是很差的體驗,而且會讓人以為是系統壞了。
+        已列入結算回合的支出不能改也不能刪(server 兩邊都回 409)。
+        入口直接不畫出來並說明原因 —— 讓人按下去、把表單填完、才在送出時看到
+        「不能修改」是很差的體驗,而且會讓人以為是系統壞了。
+        這段文字也是列首那個鎖的完整版:圖示只說得出「鎖住了」,
+        說不出「第幾次結算」和「怎麼解開」。
       -->
       <span v-if="expense.settlement_round_id" class="settled-note">
         <Icon name="lucide:lock" size="13" class="shrink-0" />
-        <span>已列入結算,不能刪除。要刪請先到結算頁撤銷那次結算。</span>
+        <span>
+          已列入{{ roundSeq ? `第 ${roundSeq} 次` : '' }}結算,不能修改或刪除。
+          要改請先到結算頁撤銷那次結算。
+        </span>
       </span>
-      <button v-else type="button" class="del-btn" @click="$emit('delete')">
-        <Icon name="lucide:trash-2" size="15" />
-        <span>刪除這筆</span>
-      </button>
+      <span v-else class="flex items-center gap-1">
+        <button type="button" class="act-btn" @click="$emit('edit')">
+          <Icon name="lucide:pencil" size="15" />
+          <span>編輯</span>
+        </button>
+        <button type="button" class="act-btn is-danger" @click="$emit('delete')">
+          <Icon name="lucide:trash-2" size="15" />
+          <span>刪除這筆</span>
+        </button>
+      </span>
     </div>
   </div>
 </template>
@@ -398,35 +429,51 @@ const createdText = computed(() => {
   color: var(--warn);
 }
 
-/* 破壞性動作:不做成搶眼的實心鈕,但點擊區維持 44px */
-.del-btn {
+/*
+ * 編輯 / 刪除:都不做成搶眼的實心鈕(明細是拿來讀的,不是拿來動手的),
+ * 但點擊區維持 44px。刪除用 --debit 提示破壞性,編輯用中性色 ——
+ * 兩顆並排時,顏色是唯一能防止手滑按錯的東西。
+ */
+.act-btn {
   display: inline-flex;
   align-items: center;
   gap: 0.375rem;
   min-height: 44px;
   padding-inline: 0.75rem;
-  margin-inline: -0.75rem;
   border-radius: 0.75rem;
   font-size: 0.8125rem;
   font-weight: 500;
+  color: var(--text-muted);
+  transition: background-color 0.15s ease, color 0.15s ease, transform 0.12s ease;
+}
+.act-btn.is-danger {
   color: var(--debit);
-  transition: background-color 0.15s ease, transform 0.12s ease;
+  /* 最後一顆的內距要抵銷掉,文字才對齊右邊的內容邊界 */
+  margin-right: -0.75rem;
 }
 @media (hover: hover) {
-  .del-btn:hover {
+  .act-btn:hover {
+    background: var(--bg);
+    color: var(--text);
+  }
+  .act-btn.is-danger:hover {
     background: color-mix(in oklab, var(--debit) 10%, transparent);
+    color: var(--debit);
   }
 }
-.del-btn:active {
+.act-btn:active {
   transform: scale(0.98);
+  background: var(--bg);
+}
+.act-btn.is-danger:active {
   background: color-mix(in oklab, var(--debit) 10%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .del-btn {
+  .act-btn {
     transition: none;
   }
-  .del-btn:active {
+  .act-btn:active {
     transform: none;
   }
 }

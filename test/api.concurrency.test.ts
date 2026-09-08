@@ -61,6 +61,8 @@ async function req(method: string, path: string, body?: unknown): Promise<{ stat
 const get = (p: string) => req('GET', p);
 const post = (p: string, b?: unknown) => req('POST', p, b);
 const patch = (p: string, b?: unknown) => req('PATCH', p, b);
+const del = (p: string) => req('DELETE', p);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 await post('/api/admin/sync-rates');
 
@@ -368,6 +370,162 @@ group('[防護] 公費退還的上限:兩支端點都要守');
   const bal = await settlementRows(T);
   const row = (bal.pot?.by_currency ?? []).find((c: J) => c.currency === 'TWD');
   eq('剩餘正確 = 1,000,000 − 300,000', row?.remainingMinor, 700000);
+}
+
+// ═══════════════════════════════════════════════════════════════
+group('[競態] 編輯 / 刪除支出 vs 關閉回合 —— 蓋章的錢不能再變');
+
+// 這一組守的是回合的可稽核性:一個回合的淨額快照,必須就是**它蓋章的那些支出**
+// 算出來的淨額。對不上就代表回合宣告「這些錢已經付了」的金額和帳目不符,
+// 而且那些支出已經蓋章 —— 不撤銷就修不了,「這 1,850 是怎麼來的」永遠答不出來。
+//
+// 稽核找到兩條路徑,而且是**相反方向**的同一個空窗(修法在兩支端點各一半):
+//
+//   ① PATCH 的「已蓋章 → 409」是先讀再寫。讀完之後才蓋的章擋不住,
+//      於是已蓋章的支出被改掉。
+//      → expenses/[id].patch.ts 每一句都帶 settlement_round_id IS NULL
+//   ② 反過來:PATCH 落在 rounds.post 的讀取與寫入之間。它不改 kind、
+//      不改 currency、不碰 settlements —— 原本的樂觀鎖三個量一個都沒動,
+//      回合照樣成立,而快照停在舊金額。
+//      → rounds.post.ts 的前提加上支出內容的指紋
+//
+// 兩條都是實測出來的:修之前同時送出 14/14 全部留下一個對不上的回合,
+// 只修 ① 之後仍然 6/30 —— ② 不是理論上的可能性,是剩下來的那 6 次。
+//
+// 判準不是「誰該贏」。兩支都被擋、任一支贏都是安全的結果;
+// 不能發生的是**兩支都成功而且回合的數字對不上**。
+{
+  /** 三個人才看得出「錢在人之間搬家」—— 兩個人的話任何改動都同時改到兩邊。 */
+  async function newTrip3() {
+    const t = await post('/api/trips', {
+      name: `併發測試 編輯 ${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      base_currency: 'TWD', members: ['A', 'B', 'C'],
+    });
+    const T = t.json.share_token as string;
+    const members: J[] = (await get(`/api/trips/${T}`)).json.members;
+    const id: Record<string, string> = {};
+    for (const m of members) id[m.name] = m.id;
+    return { T, id };
+  }
+
+  /** 一個回合的淨額快照 vs 它蓋章的支出現在算出來的淨額。 */
+  function netsOf(rows: J[], sign: 1 | -1, key: 'payers' | 'shares', into: Map<string, number>) {
+    for (const it of rows) {
+      for (const r of (it[key] ?? []) as J[]) {
+        into.set(r.member_id, (into.get(r.member_id) ?? 0) + sign * r.amount_minor);
+      }
+    }
+  }
+  const fmt = (m: Map<string, number>) => [...m].filter(([, v]) => v !== 0)
+    .map(([k, v]) => `${k.slice(0, 6)} ${v}`).sort().join(' | ');
+
+  async function inconsistentRounds(T: string): Promise<string[]> {
+    const bad: string[] = [];
+    for (const r of ((await get(`/api/trips/${T}/rounds`)).json as J[]) ?? []) {
+      const full = (await get(`/api/trips/${T}/rounds/${r.id}`)).json;
+      const live = new Map<string, number>();
+      netsOf(full.items ?? [], 1, 'payers', live);
+      netsOf(full.items ?? [], -1, 'shares', live);
+      const snap = new Map<string, number>(
+        ((full.nets ?? []) as J[]).map((n) => [n.memberId, n.netMinor]),
+      );
+      if (fmt(live) !== fmt(snap)) bad.push(`快照 ${fmt(snap)} / 實際 ${fmt(live)}`);
+    }
+    return bad;
+  }
+
+  /**
+   * 同時「關閉回合」和「動一筆支出」。
+   *
+   * delay 正的是**回合**慢出手、負的是**編輯**慢出手(毫秒)。
+   * 兩個方向都要掃:編輯先寫完會落進回合的讀寫空窗(→ ②),
+   * 回合先寫完則是編輯的 409 檢查過期(→ ①)。
+   * 只掃一邊的話,另一支端點沒修也會全綠。
+   */
+  async function race(label: string, mutate: (T: string, id: Record<string, string>, eid: string) => Promise<J>) {
+    const outcomes: Record<string, number> = {};
+    const bad: string[] = [];
+
+    // 沒有斷言「誰該贏」,所以掃不掃得到某個組合都不影響綠燈 ——
+    // 這些數字只是為了讓兩支端點的前提都真的被打到(印出來的狀態組合看得見)。
+    for (const delay of [-30, -18, -10, -4, 0, 0, 6, 12, 20, 30]) {
+      const { T, id } = await newTrip3();
+      const created = await post(`/api/trips/${T}/expenses`, {
+        kind: 'shared', description: '晚餐', currency: 'TWD', amount: 3000, spent_at: '2026-03-08',
+        payers: [{ member_id: id.A }],
+        split: { mode: 'equal', members: [id.A, id.B, id.C] },
+      });
+      const eid = created.json.id as string;
+
+      const [round, edit] = await Promise.all([
+        (async () => {
+          if (delay > 0) await sleep(delay);
+          return post(`/api/trips/${T}/rounds`, { currency: 'TWD' });
+        })(),
+        (async () => {
+          if (delay < 0) await sleep(-delay);
+          return mutate(T, id, eid);
+        })(),
+      ]);
+      const key = `${round.status}/${edit.status}`;
+      outcomes[key] = (outcomes[key] ?? 0) + 1;
+      for (const why of await inconsistentRounds(T)) bad.push(`delay=${delay} ${key} ${why}`);
+    }
+
+    check(`${label}:沒有一個回合的快照對不上它蓋章的支出`,
+      bad.length === 0, bad.slice(0, 2).join(' ;; '));
+    console.log(`       狀態組合(回合/編輯): ${JSON.stringify(outcomes)}`);
+  }
+
+  // ① 改金額。稽核的原始情境:¥10,000 補上漏打的零變 ¥20,000。
+  await race('改金額', (T, id, eid) => patch(`/api/trips/${T}/expenses/${eid}`, {
+    kind: 'shared', description: '晚餐', currency: 'TWD', amount: 9000, spent_at: '2026-03-08',
+    payers: [{ member_id: id.A }],
+    split: { mode: 'equal', members: [id.A, id.B, id.C] },
+  }));
+
+  // ② 只改分攤,金額一分錢都沒動 —— 未結總額也不變,只有加權校驗和看得到。
+  //    「其實那道菜只有乙吃」是真的會發生的編輯。
+  await race('只改分攤(金額不變)', (T, id, eid) => patch(`/api/trips/${T}/expenses/${eid}`, {
+    kind: 'shared', description: '晚餐', currency: 'TWD', amount: 3000, spent_at: '2026-03-08',
+    payers: [{ member_id: id.A }],
+    split: { mode: 'exact', amounts: { [id.B!]: 3000 } },
+  }));
+
+  // ③ 刪除。同一個 TOCTOU:回合蓋完章之後才刪掉,那個回合的明細就空了,
+  //    而快照和轉帳還在,金額再也回推不出來。
+  await race('刪掉整筆', (T, _id, eid) => del(`/api/trips/${T}/expenses/${eid}`));
+}
+
+group('[防護] 指紋不能過度敏感 —— 不動錢的編輯不該擋掉結算');
+
+// 樂觀鎖加得太寬的話,「改個錯字」也會讓結算回 409,而使用者完全不知道
+// 自己該重新整理什麼(畫面上的數字一個都沒變)。所以指紋只看付款與分攤,
+// 描述、分類、備註都不在裡面。
+{
+  const { T, id } = await newTrip(false);
+  const created = await post(`/api/trips/${T}/expenses`, {
+    kind: 'shared', description: '晚餐', currency: 'TWD', amount: 3000, spent_at: '2026-03-08',
+    payers: [{ member_id: id.A }],
+    split: { mode: 'equal', members: [id.A, id.B] },
+  });
+  const eid = created.json.id as string;
+  const pv = (await get(`/api/trips/${T}/rounds/preview?currency=TWD`)).json.blocks[0];
+
+  eq('改描述 → 200', (await patch(`/api/trips/${T}/expenses/${eid}`, {
+    kind: 'shared', description: '第一晚的晚餐', category: '餐飲', note: '有點貴',
+    currency: 'TWD', amount: 3000, spent_at: '2026-03-08',
+    payers: [{ member_id: id.A }],
+    split: { mode: 'equal', members: [id.A, id.B] },
+  })).status, 200);
+
+  const close = await post(`/api/trips/${T}/rounds`, {
+    currency: 'TWD',
+    expect: { item_count: pv.item_count, recorded_count: pv.recorded.length },
+  });
+  eq('改完描述,照原本的預覽結算 → 201', close.status, 201);
+  eq('轉帳金額還是原本那個', close.json.recorded?.[0]?.amountMinor, 150000);
+  eq('全部結清(淨額歸零)', await netAbsSum(T), 0);
 }
 
 process.exit(summary() > 0 ? 1 : 0);

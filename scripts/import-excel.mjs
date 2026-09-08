@@ -30,14 +30,45 @@
  * 不屬於任何帳號 —— 進得去、記得了帳,但沒有人能刪除它,換裝置也找不回來。
  * 所以這支腳本會先登入,讓匯進來的旅程掛在你的帳號下(role = owner)。
  *
+ * ══ 分批匯入 ════════════════════════════════════════════════
+ *
+ * 預設一次匯入全部。但「先匯前兩天 → 結算 → 再匯後面幾天」是這個 App
+ * 最重要的使用情境(結算回合的整個設計就是為它存在的),所以要能分批:
+ *
+ *   --from=YYYY-MM-DD    只匯這天(含)以後的
+ *   --until=YYYY-MM-DD   只匯這天(含)以前的
+ *   --trip=<id|token>    匯進既有旅程,不要建新的
+ *
+ * 沒有日期的支出怎麼分批,靠 SHARED 第 7 欄的 stage 標記決定:
+ *
+ *   'pre'   行前就付掉的(機票、住宿、保險、Icoca 加值…)→ 跟「第一批」走
+ *   'wrap'  跨全程的彙總列(門票合計、伴手禮總計…)和回程高鐵 → 跟「最後一批」走
+ *
+ * 判斷方式:'pre' 只在匯入窗口含旅程第一天時才匯,'wrap' 只在含最後一天時才匯。
+ * 這樣兩批之間不會重複、也不會漏。個人花費原檔全部沒有日期,一律當 'wrap'。
+ *
+ * 例:
+ *   # 第一批:行前 + 3/8、3/9
+ *   node scripts/import-excel.mjs --until=2026-03-09
+ *   # 第二批:3/10 之後 + 彙總列 + 個人花費(匯進同一趟)
+ *   node scripts/import-excel.mjs --from=2026-03-10 --trip=<id>
+ *
  * 用法:
  *   IMPORT_EMAIL=you@example.com IMPORT_PASSWORD=... node scripts/import-excel.mjs [baseUrl]
  *
  * 不給帳密也還是跑得完(方便純測試),但會印一行警告。
  */
-const BASE = process.argv[2] || 'http://localhost:3000';
+const argv = process.argv.slice(2);
+const flag = (name) => {
+  const hit = argv.find((a) => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : null;
+};
+const BASE = argv.find((a) => !a.startsWith('--')) || 'http://localhost:3000';
 const EMAIL = process.env.IMPORT_EMAIL || '';
 const PASSWORD = process.env.IMPORT_PASSWORD || '';
+const FROM = flag('from');
+const UNTIL = flag('until');
+const INTO_TRIP = flag('trip');
 
 // ── 來源資料(從 xlsx 抽出)────────────────────────────────────
 //
@@ -46,18 +77,23 @@ const PASSWORD = process.env.IMPORT_PASSWORD || '';
 // 語意是專案作者提供的 —— 那是一筆從公費出的錢,不是某個人付的。
 // 備註欄的用途是讓人日後看得懂這筆總額是怎麼組成的,
 // 所以這裡選清楚而不選逐字轉錄。
-// 共同花費:項目 | 幣別 | 金額 | 人員(付款人,null = 公費) | 日期 | 備註
+// 共同花費:項目 | 幣別 | 金額 | 人員(付款人,null = 公費) | 日期 | 備註 | stage
+//
+// 第 7 欄 stage 不是原檔的欄位,是**分批匯入**用的標記(見檔頭)。
+// 只有「沒有日期」的列需要它 —— 有日期的列直接用日期判斷就好。
+//   'pre'   行前就付掉的,跟第一批走
+//   'wrap'  跨全程的彙總列與回程,跟最後一批走
 const SHARED = [
-  ['機票（來回）',        'TWD', 22596, null,    null, null],
-  ['住宿(大阪)',          'TWD',  6633, null,    null, null],
-  ['住宿(京都)',          'TWD',  7111, null,    null, null],
-  ['國泰旅平險+不便險',   'TWD',  1798, null,    null, null],
-  ['E-SIM DJB',           'TWD',  1404, null,    null, null],
-  ['Klook 行程 (伊根)',   'TWD',  3250, null,    null, null],
-  ['機場計程車',          'TWD',   413, null,    null, null],
-  ['回程高鐵',            'TWD',  1080, null,    null, null],
-  ['Icoca加值',           'JPY', 10000, 'MIN',   null, null],
-  ['Icoca加值',           'TWD',  1617, 'Hsuan', null, null],
+  ['機票（來回）',        'TWD', 22596, null,    null, null, 'pre'],
+  ['住宿(大阪)',          'TWD',  6633, null,    null, null, 'pre'],
+  ['住宿(京都)',          'TWD',  7111, null,    null, null, 'pre'],
+  ['國泰旅平險+不便險',   'TWD',  1798, null,    null, null, 'pre'],
+  ['E-SIM DJB',           'TWD',  1404, null,    null, null, 'pre'],
+  ['Klook 行程 (伊根)',   'TWD',  3250, null,    null, null, 'pre'],
+  ['機場計程車',          'TWD',   413, null,    null, null, 'pre'],
+  ['回程高鐵',            'TWD',  1080, null,    null, null, 'wrap'],
+  ['Icoca加值',           'JPY', 10000, 'MIN',   null, null, 'pre'],
+  ['Icoca加值',           'TWD',  1617, 'Hsuan', null, null, 'pre'],
   ['3/8 吃飯',            'JPY', 13244, null, '2026-03-08', null],
   ['3/8 超商、超市',      'JPY',   662, null, '2026-03-08', null],
   ['3/9 吃飯',            'JPY', 18109, null, '2026-03-09', null],
@@ -72,13 +108,13 @@ const SHARED = [
   ['3/13 超商、超市',     'JPY',  5523, null, '2026-03-13', null],
   ['3/13 勝尾寺計程車',   'JPY',  3400, null, '2026-03-13', null],
   ['門票、御守合計',      'JPY',  8100, null, null,
-   '平等院門票 1400\n(清水1000+金閣1000+下鴨御守1500) / 民 1,500 (下鴨御守)\n伊根 400 (舟屋參觀門票) / 天橋立瓦片 300\n勝尾寺門票1000'],
+   '平等院門票 1400\n(清水1000+金閣1000+下鴨御守1500) / 民 1,500 (下鴨御守)\n伊根 400 (舟屋參觀門票) / 天橋立瓦片 300\n勝尾寺門票1000', 'wrap'],
   ['伴手禮總計',          'JPY', 16882, null, null,
-   '3/8｜草莓餅乾 2,969 (喧)\n3/9｜伊藤久右衛門 6,274 (民: 3857 / 喧: 2417)\n3/10｜西尾抹茶夾心捲 (民 - 未標示金額)\n3/12｜伊根伴手禮 2,600 (喧刷卡)\n3/13｜砂糖樹 2,592 (民)\n3/13｜阪急洋芋片 2,447 (喧)'],
+   '3/8｜草莓餅乾 2,969 (喧)\n3/9｜伊藤久右衛門 6,274 (民: 3857 / 喧: 2417)\n3/10｜西尾抹茶夾心捲 (民 - 未標示金額)\n3/12｜伊根伴手禮 2,600 (喧刷卡)\n3/13｜砂糖樹 2,592 (民)\n3/13｜阪急洋芋片 2,447 (喧)', 'wrap'],
   ['線香、玩具',          'JPY',  9805, null, null,
-   '3/9｜米果玩具 1,735 (公費)\n3/9｜平等院線香 1,200 (民)\n3/10｜線香 6,270 (民)\n3/12｜扭蛋 600 (喧)'],
+   '3/9｜米果玩具 1,735 (公費)\n3/9｜平等院線香 1,200 (民)\n3/10｜線香 6,270 (民)\n3/12｜扭蛋 600 (喧)', 'wrap'],
   ['雜項',                'JPY',  4310, null, null,
-   '3/8｜2/b 吊飾 1,320 (公費)\n3/11｜飯店稅金 800 (公費)\n3/12｜暖暖包 100 (喧)\n3/13｜3coins 2,090 (民)'],
+   '3/8｜2/b 吊飾 1,320 (公費)\n3/11｜飯店稅金 800 (公費)\n3/12｜暖暖包 100 (喧)\n3/13｜3coins 2,090 (民)', 'wrap'],
 ];
 
 // 個人花費:項目 | 幣別 | 金額 | 人員(擁有者)
@@ -127,7 +163,26 @@ const RESERVATIONS = [
 ];
 
 const TRIP_START = '2026-03-08';
+const TRIP_END = '2026-03-13';
 const POT_NAME = '公費';
+
+/**
+ * 這次的匯入窗口含不含旅程的頭 / 尾。
+ * 'pre'(行前付的)跟頭走,'wrap'(跨全程彙總、回程)跟尾走 ——
+ * 分兩批匯的時候,這兩組各只會落在其中一批裡,不會重複也不會漏。
+ */
+const WINDOW_HAS_START = !FROM || FROM <= TRIP_START;
+const WINDOW_HAS_END = !UNTIL || UNTIL >= TRIP_END;
+
+/** 這一列這次要不要匯。date 為 null 的列改看 stage。 */
+function inWindow(date, stage) {
+  if (date) {
+    if (FROM && date < FROM) return false;
+    if (UNTIL && date > UNTIL) return false;
+    return true;
+  }
+  return stage === 'wrap' ? WINDOW_HAS_END : WINDOW_HAS_START;
+}
 // 人員留空的那 25 筆要寫進備註的說明。不再是 ⚠ ——
 // 「這筆從公費付」是一個已確認的事實,不是匯入時的權宜之計。
 const POT_NOTE = `由${POT_NAME}支付:原 Excel 的「人員」欄留空,而留空就代表這筆是從${POT_NAME}出的錢。`;
@@ -158,7 +213,13 @@ async function req(method, path, body) {
   return json;
 }
 
+const WINDOW_LABEL = FROM || UNTIL
+  ? `${FROM ?? '(不限)'} ~ ${UNTIL ?? '(不限)'}`
+  : '全部';
 console.log(`匯入目標: ${BASE}`);
+console.log(`匯入窗口: ${WINDOW_LABEL}`
+  + `   行前支出:${WINDOW_HAS_START ? '匯' : '跳過'}`
+  + `   彙總列/個人花費:${WINDOW_HAS_END ? '匯' : '跳過'}`);
 
 if (EMAIL && PASSWORD) {
   const me = await req('POST', '/api/auth/login', { email: EMAIL, password: PASSWORD });
@@ -170,14 +231,29 @@ if (EMAIL && PASSWORD) {
 // 匯率必須先有,否則每筆的 fx_rate 都會是 null
 await req('POST', '/api/admin/sync-rates');
 
-// 成員取自「下拉清單」工作表(權威來源),與 Excel 的「/2」公式一致。
-// pot 讓 server 順手建一個 is_pot=1 的成員 —— 25 筆留空的付款人要記到它身上。
-const trip = await req('POST', '/api/trips', {
-  name: '2026/03 神戶京都宇治（Excel 匯入）',
-  base_currency: 'TWD',
-  members: ['MIN', 'Hsuan'],
-  pot: POT_NAME,
-});
+// --trip 是「第二批匯進同一趟」用的:不要再建一趟新的,也不要重建成員
+// (成員重複會被 UNIQUE 擋掉,而且 member_id 換了舊支出就對不上)。
+let trip;
+if (INTO_TRIP) {
+  const existing = await req('GET', `/api/trips/${encodeURIComponent(INTO_TRIP)}`);
+  // share_token 只有 owner 拿得到。後面每個請求都用它,所以沒拿到就直接停 ——
+  // 用 trip id 當識別碼雖然也能通,但那要求 session 已經解鎖過這趟,
+  // 在腳本裡靜靜地依賴那件事很容易在下次執行時壞掉。
+  if (!existing.share_token) {
+    throw new Error('拿不到這趟的 share_token —— 請確認你是這趟旅程的擁有者(owner)。');
+  }
+  trip = { id: existing.trip.id, share_token: existing.share_token };
+  console.log(`匯入既有旅程: ${existing.trip.name}`);
+} else {
+  // 成員取自「下拉清單」工作表(權威來源),與 Excel 的「/2」公式一致。
+  // pot 讓 server 順手建一個 is_pot=1 的成員 —— 25 筆留空的付款人要記到它身上。
+  trip = await req('POST', '/api/trips', {
+    name: '2026/03 神戶京都宇治（Excel 匯入）',
+    base_currency: 'TWD',
+    members: ['MIN', 'Hsuan'],
+    pot: POT_NAME,
+  });
+}
 const { members } = await req('GET', `/api/trips/${trip.share_token}`);
 
 // 公費用 is_pot 認,不用名字認 —— 名字只是顯示用的,改名不該讓匯入靜靜壞掉。
@@ -199,7 +275,9 @@ let ok = 0, fail = 0, fromPot = 0;
 const failures = [];
 
 console.log('── 共同花費 ──');
-for (const [desc, cur, amt, payer, date, note] of SHARED) {
+let skipped = 0;
+for (const [desc, cur, amt, payer, date, note, stage] of SHARED) {
+  if (!inWindow(date, stage)) { skipped++; continue; }
   // 沒有 payer 不是「缺資料」,而是一個有意義的值:這筆從公費付。
   const byPot = !payer;
   if (byPot) fromPot++;
@@ -220,8 +298,11 @@ for (const [desc, cur, amt, payer, date, note] of SHARED) {
   }
 }
 
-console.log('\n── 個人花費 ──');
+// 個人花費原檔一列都沒有日期(是整趟的購物合計),所以整組當 'wrap' 處理 ——
+// 只在匯入窗口含旅程最後一天時才進來。
+console.log(WINDOW_HAS_END ? '\n── 個人花費 ──' : '\n── 個人花費(這批跳過)──');
 for (const [desc, cur, amt, owner] of PERSONAL) {
+  if (!WINDOW_HAS_END) { skipped++; continue; }
   try {
     await req('POST', `/api/trips/${trip.share_token}/expenses`, {
       kind: 'personal', description: desc, currency: cur, amount: amt,
@@ -237,9 +318,11 @@ for (const [desc, cur, amt, owner] of PERSONAL) {
   }
 }
 
-console.log('\n── 預訂 ──');
+// 預訂是行前規劃,跟第一批走。第二批(--from)不要再匯一次。
+console.log(WINDOW_HAS_START ? '\n── 預訂 ──' : '\n── 預訂(這批跳過)──');
 let resOk = 0;
 for (const [name, url, opensJst, bookingName, note] of RESERVATIONS) {
+  if (!WINDOW_HAS_START) continue;
   try {
     // JST → UTC。存成 SQLite 的 datetime 可比較格式。
     const opensUtc = opensJst
@@ -259,10 +342,19 @@ for (const [name, url, opensJst, bookingName, note] of RESERVATIONS) {
 }
 
 console.log(`\n${'─'.repeat(60)}`);
-console.log(`支出: ${ok} 成功 / ${fail} 失敗   預訂: ${resOk}/${RESERVATIONS.length}`);
+console.log(`支出: ${ok} 成功 / ${fail} 失敗`
+  + (skipped ? ` / ${skipped} 筆不在這次的窗口內` : '')
+  + `   預訂: ${resOk}/${WINDOW_HAS_START ? RESERVATIONS.length : 0}`);
+// 分批匯的時候要明講「還有東西沒進來」—— 否則使用者看到支出筆數對不上原檔
+// 會以為匯入壞了,而那正是最該讓他一眼看懂的事。
+if (skipped) {
+  console.log(`ℹ 這批只匯了窗口 ${WINDOW_LABEL} 的部分,還有 ${skipped} 筆要用另一批匯:`);
+  console.log(`    node scripts/import-excel.mjs --trip=${trip.id}`
+    + (UNTIL ? ` --from=${UNTIL}` : '') + (UNTIL ? '   # 記得把 --from 調成下一天' : ''));
+}
 // 這個數字要一直印出來:它是原 Excel 算不出「誰欠誰」的原因,
 // 也是解釋「為什麼公費付了這麼多筆」的唯一線索。
-console.log(`ℹ 共同花費有 ${fromPot}/${SHARED.length} 筆在原 Excel 沒有記錄付款人,`);
+console.log(`ℹ 這批的共同花費有 ${fromPot} 筆在原 Excel 沒有記錄付款人,`);
 console.log(`  依「人員留空 = ${POT_NAME}支出」的語意,這些都匯入成由${POT_NAME}支付的共同花費。`);
 console.log(`  ${POT_NAME}目前淨額會是負的 —— 每個人投入了多少原檔沒記,請到總覽頁用「投入」補上。`);
 console.log(`ℹ 預訂的「預約時段」沒有匯入(原檔年份是 2025,待人工確認後再補 booked_for_utc)。`);

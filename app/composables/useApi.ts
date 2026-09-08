@@ -45,6 +45,10 @@ const GENERIC_REASONS = new Set([
   'unprocessable entity', 'too many requests', 'internal server error',
   'not implemented', 'bad gateway', 'service unavailable', 'gateway timeout',
   'error', 'fetch failed', 'failed to fetch', 'load failed', 'networkerror',
+  // Nitro 沒被攔截的例外(例如 D1 丟出來的 SQL 錯誤)statusMessage 就是這句。
+  // 少了它,使用者按下儲存會看到一個英文的「Server Error」——
+  // 那既沒說明發生什麼事,也沒告訴他該怎麼辦。
+  'server error',
 ]);
 
 /** 沒有 statusMessage 可用時,依狀態碼給的說明。 */
@@ -122,15 +126,28 @@ export function apiErrorMessage(e: unknown, fallback = '發生未知的錯誤,�
   const body = (rawData && typeof rawData === 'object' ? rawData : {}) as Record<string, unknown>;
   const statusCode = readStatusCode(e);
 
+  /**
+   * 5xx 分兩種,而且只有 statusMessage 分得出來:
+   *   - server 自己丟的(createError({ statusCode: 500, statusMessage: '算出非法的轉帳金額…' }))
+   *     → statusMessage 是寫給使用者看的中文,照顯示。
+   *   - **沒被攔截的例外**(D1 的 SQL 錯誤之類)→ statusMessage 是 Nitro 補的
+   *     'Server Error',而 body.message 是例外原文
+   *     (「D1_ERROR: UNIQUE constraint failed: expense_shares…」)。
+   *     那是給開發者看的,絕不能丟到使用者臉上 —— 他既看不懂也無能為力,
+   *     這種情況要退回「伺服器出了點狀況,請稍後再試」。
+   * 所以 5xx 時只信 statusMessage,不看 message。
+   */
+  const serverFault = statusCode >= 500;
+
   // 優先序:server 明確給的 statusMessage > body 的 message > error 物件本身的欄位
   // (注意 FetchError.statusMessage 讀的是 HTTP statusText,中文會被 h3 過濾掉,
   //  所以一定要先看 body.statusMessage)
   const explicit = firstUsefulString(
     body.statusMessage,
-    body.message,
-    typeof rawData === 'string' ? rawData : undefined,
+    serverFault ? undefined : body.message,
+    serverFault ? undefined : (typeof rawData === 'string' ? rawData : undefined),
     anyE.statusMessage,
-    anyE.message,
+    serverFault ? undefined : anyE.message,
   );
   return explicit ?? fallbackForStatus(statusCode) ?? fallback;
 }
