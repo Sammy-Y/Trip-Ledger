@@ -277,18 +277,21 @@ function subtitle(t: TripRow): string {
       只有**已登入**且還沒有旅程的人需要這一塊。
       沒登入的人上面 hero 的「建立帳號 / 登入」就是他的下一步,
       再畫一個「建立旅程」的空狀態只會給他一顆按了會被 401 擋掉的鈕。
+
+      ⚠️ 這裡**刻意不放按鈕**。它出現的條件是「已登入且沒有旅程」,
+      而那個條件成立的時候,上面 hero 的「新的旅程」一定也在畫面上
+      (它對已登入的人是常駐的)—— 兩顆功能一模一樣的主要按鈕同時出現,
+      使用者得先判斷它們是不是同一件事。留說明、不留鈕:
+      這一塊的價值是那段文字(講清楚一趟旅程是什麼、分享連結怎麼用),
+      按鈕本來就在上面。
     -->
     <UiEmptyState
       v-else-if="!trips.length && isLoggedIn"
       icon="lucide:luggage"
       title="還沒有任何旅程"
-      description="開一趟,把行程中的花費記下來,回家就不用再算誰欠誰。
+      description="用上面的「新的旅程」開一趟,把行程中的花費記下來,回家就不用再算誰欠誰。
         建好之後把分享連結丟給旅伴,他們不用註冊就能一起記。"
-    >
-      <UiAppButton variant="primary" icon="lucide:plus" @click="showNew = true">
-        建立旅程
-      </UiAppButton>
-    </UiEmptyState>
+    />
 
     <ul v-else class="grid gap-3 md:grid-cols-2">
       <li v-for="t in trips" :key="t.id">
