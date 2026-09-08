@@ -11,7 +11,7 @@ import type { Member } from '~~/shared/types';
 
 const route = useRoute();
 const tripId = computed(() => String(route.params.trip ?? ''));
-const { members, pot, people, pending, refresh } = useTrip(tripId);
+const { members, pot, people, pending, refresh, shareUrl, isOwner, orphan } = useTrip(tripId);
 const api = useApi();
 
 const errorMessage = ref<string | null>(null);
@@ -118,11 +118,13 @@ async function confirmDelete() {
 }
 
 // ── 分享連結 ────────────────────────────────────────────────
-const shareUrl = computed(() =>
-  import.meta.client ? `${location.origin}/t/${tripId.value}` : `/t/${tripId.value}`);
+// ⚠️ shareUrl 來自 useTrip(用 share_token 組),**不要**用 tripId 自己拼。
+// 從旅程列表點進來時 tripId 是 trip id,而 trip id 對沒有權限的人是無效的 ——
+// 拿它當分享連結,朋友點開只會看到「找不到這個旅程」。
 const copied = ref(false);
 
 async function copyLink() {
+  if (!shareUrl.value) return;
   try {
     await navigator.clipboard.writeText(shareUrl.value);
     copied.value = true;
@@ -260,7 +262,7 @@ async function copyLink() {
     </div>
 
     <!-- 這是這個產品降低協作門檻的核心設計,文案要把它講出來 -->
-    <div class="card space-y-3 p-4">
+    <div v-if="shareUrl" class="card space-y-3 p-4">
       <div>
         <h2 class="font-semibold">
           分享給旅伴
@@ -280,6 +282,26 @@ async function copyLink() {
           {{ copied ? '已複製' : '複製' }}
         </UiAppButton>
       </div>
+    </div>
+
+    <!--
+      拿不到 share_token 的情況有兩種,訊息要分開講,
+      否則使用者會以為是壞掉了。
+    -->
+    <div v-else-if="orphan" class="card p-4 text-sm">
+      <h2 class="font-semibold">分享給旅伴</h2>
+      <p class="mt-1" style="color: var(--text-muted)">
+        這趟旅程還沒有擁有者。
+        <NuxtLink to="/" class="font-medium" style="color: var(--brand)">回到旅程列表認領</NuxtLink>
+        之後就能拿到分享連結。
+      </p>
+    </div>
+
+    <div v-else-if="!isOwner" class="card p-4 text-sm">
+      <h2 class="font-semibold">分享給旅伴</h2>
+      <p class="mt-1" style="color: var(--text-muted)">
+        分享連結只有旅程的擁有者拿得到。你可以請對方再分享一次給新的旅伴。
+      </p>
     </div>
 
     <UiAppSheet v-model:open="confirmOpen" title="刪除成員">

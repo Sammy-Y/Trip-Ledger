@@ -14,7 +14,7 @@
 const props = withDefaults(defineProps<{
   /** 欄位標籤。不給就不顯示 label(例如放在 table 裡) */
   label?: string;
-  type?: 'text' | 'number' | 'date' | 'select' | 'textarea';
+  type?: 'text' | 'number' | 'date' | 'select' | 'textarea' | 'email' | 'password';
   placeholder?: string;
   /** 說明文字,顯示在欄位下方。有 error 時會被 error 蓋掉 */
   hint?: string;
@@ -70,7 +70,10 @@ const describedById = computed(() => `${fieldId}-desc`);
 
 /** 數字欄位在手機上要跳出數字鍵盤 */
 const resolvedInputmode = computed(
-  () => props.inputmode ?? (props.type === 'number' ? 'decimal' : undefined),
+  () => props.inputmode
+    ?? (props.type === 'number' ? 'decimal' : undefined)
+    // email 鍵盤有 @ 和 .com,登入表單少按好幾下
+    ?? (props.type === 'email' ? 'email' : undefined),
 );
 
 /** 金額欄位靠右 + 等寬 */

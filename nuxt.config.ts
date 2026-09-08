@@ -37,6 +37,24 @@ export default defineNuxtConfig({
     },
   },
 
+  // 安全標頭。
+  //
+  // Referrer-Policy 是這裡最重要的一個:分享連結 /t/<share_token> 的 token
+  // 就是這趟旅程的鑰匙,而預設的 referrer 政策會把完整網址送給頁面上
+  // 任何一個外連目的地(訂位連結指向的餐廳網站就會在 log 裡看到你的 token)。
+  //
+  // noindex 則是防止搜尋引擎把某人分享到公開場合的旅程連結收錄起來。
+  routeRules: {
+    '/**': {
+      headers: {
+        'Referrer-Policy': 'no-referrer',
+        'X-Robots-Tag': 'noindex, nofollow',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+      },
+    },
+  },
+
   app: {
     head: {
       htmlAttrs: { lang: 'zh-Hant-TW' },
@@ -73,6 +91,21 @@ export default defineNuxtConfig({
     // task 走 self-fetch 後路時用的共享密鑰
     taskSecret: '',
     publicOrigin: '',
+    // 密碼雜湊的 PBKDF2 迭代次數。
+    //
+    // ⚠️ 這個值是被 Cloudflare 的 CPU 上限逼出來的妥協,不是安全上的建議值。
+    // OWASP 對 PBKDF2-SHA256 的建議是 600,000 次。
+    // 實測(node scripts/bench-pbkdf2.mjs,M 系列 Mac):
+    //     50,000 →  3.6ms      100,000 →  7.2ms
+    //    200,000 → 14.5ms      600,000 → 45.3ms
+    // Workers 免費版每次呼叫只有 10ms CPU,而線上的 CPU 比本機慢,
+    // 所以 100,000 在免費版上很可能就超標,登入會直接失敗。
+    //
+    // 升級 Workers Paid(30 秒 CPU)之後,把這個值改成 600000 ——
+    // 每個使用者的迭代次數存在自己那一列,舊帳號照樣登得進來,
+    // 並在下次登入成功時自動用新參數重算(見 server/api/auth/login.post.ts)。
+    // 也就是說「之後再升級」不需要任何資料遷移。
+    pbkdf2Iterations: '50000',
   },
 
   pwa: {
