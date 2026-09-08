@@ -7,9 +7,17 @@
  * 前端不再做任何過濾 —— 過濾是 server 的責任,在前端補一層只會讓人誤以為安全。
  *
  * 三種身分會看到不同的東西:
- *   已登入      → 自己建立的 + 用連結進去過的
- *   訪客(有過操作)→ 這個瀏覽器用連結解鎖過的,並提示註冊才不會弄丟
- *   全新訪客     → 空的,引導他建立或登入
+ *   已登入   → 自己建立的 + 用連結進去過的
+ *   訪客     → 只有用分享連結解鎖過的那幾趟(他不能建立新的,見下)
+ *   全新訪客 → 空的,引導他登入
+ *
+ * ── 那段文案為什麼一直留著 ─────────────────────────────────
+ *
+ * 標題與三條賣點對已登入的人也留在旅程列表上方,不是只給陌生人看的 landing。
+ * 理由是這個 App 的核心主張("誰墊的錢和誰真的用了是兩件事")本身就是使用者
+ * 每次回來要重新想起的東西 —— 它解釋了為什麼記帳表單要分「付款人」和「分攤」
+ * 兩區、為什麼結算頁要逐幣別分開。把它藏在只有陌生人看得到的地方,
+ * 等於這個產品最重要的一句話只講一次。
  */
 interface TripRow {
   id: string; name: string; base_currency: string;
@@ -34,8 +42,15 @@ const trips = computed(() => data.value ?? []);
 
 await refreshAuth();
 
-/** 沒登入卻已經有旅程 = 這些資料只綁在這個瀏覽器上,清了就沒了。 */
-const atRisk = computed(() => !isLoggedIn.value && trips.value.length > 0);
+/**
+ * 訪客手上的那幾趟只綁在這個瀏覽器的 session 上。
+ *
+ * 現在建立旅程一定要登入,所以訪客列表裡的旅程一定是**別人的**、
+ * 靠分享連結解鎖進來的 —— 清掉瀏覽器資料不會弄丟任何帳(owner 那邊都在),
+ * 只是要再開一次那條連結。所以這句提示的語氣要比以前輕:
+ * 以前匿名建立的旅程真的會永久消失,那是「痛哭失聲」級別;現在不是。
+ */
+const guestList = computed(() => !isLoggedIn.value && trips.value.length > 0);
 /** 已登入時才有意義:哪些是還沒收編的無主旅程。 */
 const claimable = computed(() => trips.value.filter((t) => t.orphan));
 
@@ -84,6 +99,14 @@ async function removeTrip() {
 const claiming = ref<string | null>(null);
 
 /** 把無主旅程收為己有。要登入,所以沒登入時先送去登入頁再回來。 */
+/**
+ * 認領無主旅程。
+ *
+ * 建立旅程現在要登入,所以**不會再有新的**無主旅程 —— 這條路徑只服務
+ * 那個規則上線前建立的那幾趟(進得去、記得帳,但沒有 owner 所以誰都刪不掉)。
+ * 全部認領完之後這段程式碼就沒有使用者了,但留著:它是那些既有資料
+ * 唯一的出口,而 server 端的 /claim 也還在。
+ */
 async function claim(t: TripRow) {
   if (!isLoggedIn.value) {
     await navigateTo(`/login?redirect=${encodeURIComponent('/')}`);
@@ -109,14 +132,12 @@ async function signOut() {
 /**
  * 陌生人第一次進來要看到的東西。
  *
- * 沒登入、而且這個瀏覽器一趟旅程都沒有 —— 對這個人來說「我的旅程 /
- * 還沒有任何旅程」是沒有意義的:他還沒有任何資料,那句話只是在描述空集合。
- * 要先回答「這是什麼、為什麼要用」。一旦登入或建了第一趟就換回列表。
+ * **永遠顯示**(登入與否都一樣),理由見檔頭那段。
+ * 差別只在下面接的是「登入 / 建立帳號」還是旅程列表。
  *
  * 刻意不看 pending:setup 裡的兩個 await(旅程列表與 /auth/me)都在首次
- * 渲染前就 resolve,所以不會先閃一下 hero 再跳成列表。
+ * 渲染前就 resolve,所以不會先閃一下再跳。
  */
-const showHero = computed(() => !isLoggedIn.value && !trips.value.length);
 
 /**
  * 三個賣點。
@@ -143,14 +164,35 @@ function subtitle(t: TripRow): string {
 
 <template>
   <div class="mx-auto w-full max-w-2xl px-4 py-6 space-y-5">
-    <!-- 第一次進來的人看到的不是空列表,而是「這是什麼」。理由見 showHero -->
-    <section v-if="showHero" class="pb-2 md:py-4">
-      <span class="hero-badge">
-        <Icon name="lucide:luggage" size="14" />
-        旅遊記帳 · 多人分帳
-      </span>
+    <!--
+      標題與三條賣點:登入與否都顯示。理由見檔頭 ——
+      它解釋了為什麼記帳表單要分「付款人」和「分攤」、為什麼結算逐幣別分開,
+      那是使用者每次回來都要重新想起的東西,不是只給陌生人看的招牌。
+    -->
+    <section :class="isLoggedIn ? 'pb-1' : 'pb-2 md:py-4'">
+      <div class="flex items-start justify-between gap-3">
+        <span class="hero-badge">
+          <Icon name="lucide:luggage" size="14" />
+          旅遊記帳 · 多人分帳
+        </span>
+        <!-- 登入後帳號的出入口收在這裡,不另外開一列 header -->
+        <div v-if="isLoggedIn" class="flex shrink-0 items-center gap-2">
+          <span class="max-w-[10rem] truncate text-sm" style="color: var(--text-muted)">
+            {{ user?.display_name }}
+          </span>
+          <button
+            type="button" class="rounded-lg p-2" style="color: var(--text-muted)"
+            aria-label="登出" @click="signOut"
+          >
+            <Icon name="lucide:log-out" size="18" />
+          </button>
+        </div>
+      </div>
 
-      <h1 class="hero-title mt-4 text-3xl font-bold leading-tight tracking-tight md:text-4xl">
+      <h1
+        class="hero-title mt-4 font-bold leading-tight tracking-tight"
+        :class="isLoggedIn ? 'text-2xl md:text-3xl' : 'text-3xl md:text-4xl'"
+      >
         出國花的每一筆,回國前分乾淨
       </h1>
 
@@ -165,59 +207,54 @@ function subtitle(t: TripRow): string {
         </li>
       </ul>
 
-      <div class="mt-7 flex flex-wrap items-center gap-2.5">
-        <UiAppButton variant="primary" @click="showNew = true">
-          <Icon name="lucide:plus" /> 建立第一趟旅程
-        </UiAppButton>
+      <!--
+        沒登入時這裡是唯一的出口 —— **不再有「不用帳號也能開始記」**。
+        建立旅程現在要登入(理由見 server/api/trips/index.post.ts 的長註解):
+        匿名建立會生出沒有 owner、誰都刪不掉、建立者換個分頁就找不到的旅程。
+        但第三條賣點「旅伴不用註冊」仍然成立 —— 那是**加入別人的**旅程,
+        持有分享連結本身就是憑證,和「開一趟新的」是兩件風險不同的事。
+      -->
+      <div v-if="!isLoggedIn" class="mt-7 flex flex-wrap items-center gap-2.5">
+        <NuxtLink to="/login?mode=register">
+          <UiAppButton variant="primary" icon="lucide:user-plus">
+            建立帳號
+          </UiAppButton>
+        </NuxtLink>
         <NuxtLink to="/login">
           <UiAppButton variant="ghost">登入</UiAppButton>
         </NuxtLink>
       </div>
 
-      <!--
-        免註冊是這個產品的賣點,但它有代價,而且代價要在他按下去**之前**講。
-        事後才說「你的資料只在這個瀏覽器裡」等於騙他一次。
-      -->
-      <p class="hero-note mt-6 text-xs leading-relaxed" style="color: var(--text-muted)">
-        不用帳號也能開始記 —— 但那樣旅程只存在這個瀏覽器裡,清除資料或換裝置就找不回來。
+      <div v-else class="mt-6">
+        <UiAppButton variant="primary" icon="lucide:plus" @click="showNew = true">
+          新的旅程
+        </UiAppButton>
+      </div>
+
+      <p
+        v-if="!isLoggedIn"
+        class="hero-note mt-6 text-xs leading-relaxed"
+        style="color: var(--text-muted)"
+      >
+        旅伴收到分享連結的話不用註冊,直接點開就能一起記帳 —— 帳號只有開新旅程的人需要。
       </p>
     </section>
 
-    <header v-else class="flex items-start justify-between gap-3">
-      <div class="min-w-0">
-        <h1 class="text-2xl font-bold">我的旅程</h1>
-        <p class="text-sm mt-0.5 truncate" style="color: var(--text-muted)">
-          <template v-if="isLoggedIn">{{ user?.display_name }}</template>
-          <template v-else>記帳、分帳、看誰欠誰</template>
-        </p>
-      </div>
-      <div class="flex items-center gap-2 shrink-0">
-        <NuxtLink v-if="!isLoggedIn" to="/login">
-          <UiAppButton variant="ghost">登入</UiAppButton>
-        </NuxtLink>
-        <button
-          v-else type="button" class="p-2 rounded-lg" style="color: var(--text-muted)"
-          aria-label="登出" @click="signOut">
-          <Icon name="lucide:log-out" />
-        </button>
-        <UiAppButton variant="primary" @click="showNew = true">
-          <Icon name="lucide:plus" /> 新增
-        </UiAppButton>
-      </div>
-    </header>
-
     <!--
-      沒登入但已經有旅程 —— 這是最容易讓人痛哭失聲的情境:
-      清一次瀏覽器資料,整趟的帳就再也找不回來了。所以講得直白一點。
+      訪客手上的旅程一定是**別人的**(建立要登入),靠分享連結解鎖進來的。
+      所以清掉瀏覽器資料不會弄丟任何帳 —— owner 那邊都在,只是要再開一次連結。
+      語氣因此比以前輕:以前匿名建立的旅程真的會永久消失。
     -->
-    <div v-if="atRisk" class="card p-4 flex items-start gap-3">
-      <Icon name="lucide:triangle-alert" class="mt-0.5 shrink-0" style="color: var(--debit)" />
+    <div v-if="guestList" class="card flex items-start gap-3 p-4">
+      <Icon name="lucide:info" class="mt-0.5 shrink-0" style="color: var(--text-muted)" />
       <div class="min-w-0 flex-1 text-sm">
-        <p class="font-medium">這些旅程只存在這個瀏覽器裡</p>
+        <p class="font-medium">你正在用訪客身分</p>
         <p class="mt-0.5" style="color: var(--text-muted)">
-          清除瀏覽器資料或換一台裝置就找不回來了。建立帳號就能永久保存。
+          這幾趟是靠分享連結進來的,只記在這個瀏覽器裡 ——
+          換裝置或清除資料之後要再開一次那條連結。
+          有帳號的話自己的旅程就會跟著你走。
         </p>
-        <NuxtLink to="/login?mode=register" class="inline-block mt-2 font-medium" style="color: var(--brand)">
+        <NuxtLink to="/login?mode=register" class="mt-2 inline-block font-medium" style="color: var(--brand)">
           建立帳號 →
         </NuxtLink>
       </div>
@@ -236,15 +273,20 @@ function subtitle(t: TripRow): string {
       載入失敗:{{ error.message }}
     </p>
 
+    <!--
+      只有**已登入**且還沒有旅程的人需要這一塊。
+      沒登入的人上面 hero 的「建立帳號 / 登入」就是他的下一步,
+      再畫一個「建立旅程」的空狀態只會給他一顆按了會被 401 擋掉的鈕。
+    -->
     <UiEmptyState
-      v-else-if="!trips.length && !showHero"
+      v-else-if="!trips.length && isLoggedIn"
       icon="lucide:luggage"
       title="還沒有任何旅程"
-      :description="isLoggedIn
-        ? '建立第一趟旅程,把行程中的花費記下來,回家就不用再算誰欠誰。'
-        : '建立第一趟旅程,或是打開旅伴傳給你的分享連結。'">
-      <UiAppButton variant="primary" @click="showNew = true">
-        <Icon name="lucide:plus" /> 建立旅程
+      description="開一趟,把行程中的花費記下來,回家就不用再算誰欠誰。
+        建好之後把分享連結丟給旅伴,他們不用註冊就能一起記。"
+    >
+      <UiAppButton variant="primary" icon="lucide:plus" @click="showNew = true">
+        建立旅程
       </UiAppButton>
     </UiEmptyState>
 
@@ -307,9 +349,6 @@ function subtitle(t: TripRow): string {
             <Icon name="lucide:plus" class="inline" /> 再加一位
           </button>
         </div>
-        <p v-if="!isLoggedIn" class="text-sm" style="color: var(--text-muted)">
-          你還沒登入。這趟旅程會綁在這個瀏覽器上,換裝置就找不回來了。
-        </p>
         <p v-if="errorMessage" class="text-sm" style="color: var(--debit)">{{ errorMessage }}</p>
         <UiAppButton type="submit" variant="primary" block :loading="creating" :disabled="!form.name.trim()">
           建立

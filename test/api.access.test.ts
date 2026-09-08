@@ -8,6 +8,9 @@
  * 用法:先 `pnpm dev`,再
  *   node --experimental-strip-types test/api.access.test.ts [baseUrl]
  */
+import { DatabaseSync } from 'node:sqlite';
+import { readdirSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { group, check, eq, summary } from './_harness.ts';
 
 const BASE = process.argv[2] || process.env.BASE_URL || '';
@@ -72,6 +75,33 @@ class Client {
   forget() { this.cookies.clear(); }
 }
 
+/**
+ * 把一趟旅程變成「無主」—— 刪掉它的 trip_access。
+ *
+ * **API 刻意沒有這個動作**:讓一趟旅程失去擁有者是沒有現實對應的操作。
+ * 這裡直接動資料庫,因為要測的是「規則上線前留下的歷史資料還收得回來」,
+ * 那個狀態現在已經沒有任何使用者流程能製造出來。
+ *
+ * 走 miniflare 的 sqlite 檔(和 api.rounds / api.pot 數列時同一招)。
+ * 拿不到檔案就直接讓測試失敗,不要靜靜跳過那一整組。
+ */
+function orphanize(tripId: string): void {
+  const dir = fileURLToPath(new URL('../.wrangler/state/v3/d1/miniflare-D1DatabaseObject/', import.meta.url));
+  const files = readdirSync(dir).filter((n) => n.endsWith('.sqlite') && n !== 'metadata.sqlite');
+  if (!files.length) throw new Error('找不到本機 D1 檔案,無法製造無主旅程');
+  // 目錄裡可能有多個(wrangler.jsonc 的 database_id 改過就會多一個),
+  // dev server 讀的是最近被寫入的那個。
+  const path = dir + files
+    .map((n) => ({ n, at: statSync(dir + n).mtimeMs }))
+    .sort((a, b) => b.at - a.at)[0]!.n;
+  const dbh = new DatabaseSync(path);
+  try {
+    dbh.prepare('DELETE FROM trip_access WHERE trip_id = ?').run(tripId);
+  } finally {
+    dbh.close();
+  }
+}
+
 const stamp = Date.now();
 const alice = new Client();
 const bob = new Client();
@@ -120,7 +150,6 @@ const aliceTrip = await alice.post('/api/trips', {
 });
 eq('建立 → 201', aliceTrip.status, 201);
 eq('role = owner', aliceTrip.json.role, 'owner');
-eq('不是匿名建立', aliceTrip.json.anonymous, false);
 const aliceTripId: string = aliceTrip.json.id;
 const aliceToken: string = aliceTrip.json.share_token;
 
@@ -165,22 +194,70 @@ group('[權限] 只有 owner 能刪除');
 eq('Alice 刪自己的旅程 → 200', (await alice.del(`/api/trips/${aliceTripId}`)).status, 200);
 eq('刪掉之後連 owner 也讀不到 → 404', (await alice.get(`/api/trips/${aliceTripId}`)).status, 404);
 
-// ── 匿名建立與認領 ────────────────────────────────────────
+// ── 建立要登入,但加入不用 ──────────────────────────────────
 
-group('[匿名] 沒登入也能開一趟,但沒有 owner');
-const anonTrip = await anon.post('/api/trips', { name: `無主旅程 ${stamp}`, members: ['甲', '乙'] });
-eq('建立 → 201', anonTrip.status, 201);
-eq('role = editor', anonTrip.json.role, 'editor');
-eq('標記為匿名', anonTrip.json.anonymous, true);
-const orphanId: string = anonTrip.json.id;
-const orphanToken: string = anonTrip.json.share_token;
-eq('自己看得到(靠 session)',
-  (await anon.get('/api/trips')).json.some((t: J) => t.id === orphanId), true);
-eq('標記為無主', (await anon.get(`/api/trips/${orphanId}`)).json.orphan, true);
-eq('無主旅程沒人能刪 → 403', (await anon.del(`/api/trips/${orphanId}`)).status, 403);
+group('[門檻] 沒登入不能開新旅程 —— 但拿到連結就能記帳');
+/*
+  這一組守的是那條門檻放在正確的位置上。
 
-group('[認領] 登入的人可以把無主旅程收為己有');
-eq('沒登入不能認領 → 401', (await anon.post(`/api/trips/${orphanId}/claim`)).status, 401);
+  匿名建立以前是允許的,理由是「註冊門檻擋在想試試的人前面會勸退他」。
+  實際跑起來會累積出無主旅程:沒有 owner、誰都刪不掉、建立者換個分頁
+  就再也找不到。門檻該擋的是「開一趟新的」,不是「加入別人的」——
+  後者持有分享連結本身就是憑證,而且是這個產品降低協作門檻的核心設計。
+*/
+const anonCreate = await anon.post('/api/trips', { name: `不該建成 ${stamp}`, members: ['甲'] });
+eq('沒登入建立旅程 → 401', anonCreate.status, 401);
+check('錯誤訊息要說得出「旅伴不用註冊」,不然他會以為整個 App 都要註冊',
+  String(anonCreate.json.statusMessage ?? '').includes('不用註冊'),
+  String(anonCreate.json.statusMessage));
+eq('一趟都沒被建出來', (await anon.get('/api/trips')).json.length, 0);
+
+// 但同一個訪客拿到 Alice 的分享連結就能進去記帳(aliceTrip 在上面已經刪掉了,
+// 所以這裡另外開一趟)。
+const shared = await alice.post('/api/trips', {
+  name: `分享給訪客 ${stamp}`, base_currency: 'JPY', members: ['Alice', 'Guest'],
+});
+const sharedId: string = shared.json.id;
+const sharedToken: string = shared.json.share_token;
+eq('登入的人建立 → 201', shared.status, 201);
+eq('建立者是 owner', shared.json.role, 'owner');
+
+eq('訪客用 share_token 進得去 → 200', (await anon.get(`/api/trips/${sharedToken}`)).status, 200);
+eq('而且他是 editor', (await anon.get(`/api/trips/${sharedToken}`)).json.role, 'editor');
+const guestMembers = (await anon.get(`/api/trips/${sharedToken}`)).json.members ?? [];
+const guestExpense = await anon.post(`/api/trips/${sharedToken}/expenses`, {
+  kind: 'shared', description: '訪客記的一筆', currency: 'JPY', amount: 1000,
+  spent_at: '2026-03-08',
+  payers: [{ member_id: guestMembers[0]?.id }],
+  split: { mode: 'equal', members: guestMembers.map((m: J) => m.id) },
+});
+eq('訪客記帳 → 201(這是「旅伴不用註冊」的實質內容)', guestExpense.status, 201);
+eq('但他仍然刪不掉整趟 → 403', (await anon.del(`/api/trips/${sharedId}`)).status, 403);
+eq('那一筆也真的進去了', (await alice.get(`/api/trips/${sharedId}/expenses`)).json.length, 1);
+
+group('[認領] 既有的無主旅程仍然收得回來');
+/*
+  新規則之後不會再產生無主旅程,但規則上線前建立的那幾趟還在
+  (線上實際遇到:進得去、記得帳,但沒有 owner 所以誰都刪不掉)。
+  這一組直接往 trip_access 的空狀態造一趟來守那條出口 ——
+  不能再靠「匿名建立一趟」來製造,因為那條路已經封了。
+*/
+const orphan = await alice.post('/api/trips', { name: `待認領 ${stamp}`, members: ['甲', '乙'] });
+const orphanId: string = orphan.json.id;
+const orphanToken: string = orphan.json.share_token;
+// 讓它變成無主:把 Alice 的 owner 紀錄拿掉。API 沒有這個動作(刻意的),
+// 所以這裡直接動資料庫 —— 這一組模擬的是「歷史資料」而不是使用者能觸發的流程。
+eq('先確認它現在有 owner', (await alice.get(`/api/trips/${orphanId}`)).json.orphan, false);
+await orphanize(orphanId);
+
+// ⚠️ 這裡刻意不用 alice 查。她的 trip_access 剛被刪掉,而她的 session
+// 從來沒有用 share_token 解鎖過這一趟 —— 所以她現在拿 trip id 去問會得到 404,
+// 那是對的(光知道 id 不是憑證)。要看無主狀態只能走 share_token。
+eq('原本的擁有者失去權限後,連看都看不到 → 404',
+  (await alice.get(`/api/trips/${orphanId}`)).status, 404);
+eq('變成無主', (await alice.get(`/api/trips/${orphanToken}`)).json.orphan, true);
+eq('無主旅程沒人能刪 → 403', (await alice.del(`/api/trips/${orphanToken}`)).status, 403);
+eq('沒登入不能認領 → 401', (await anon.post(`/api/trips/${orphanToken}/claim`)).status, 401);
 const dave = new Client();
 eq('登入了但進不去也不能認領 → 404',
   (await dave.post(`/api/trips/${orphanId}/claim`)).status, 404);
@@ -194,8 +271,9 @@ eq('認領後看得到 share_token',
 eq('不再是無主', (await bob.get(`/api/trips/${orphanId}`)).json.orphan, false);
 eq('重複認領 → 409', (await bob.post(`/api/trips/${orphanToken}/claim`)).status, 409);
 
-// 原本的匿名 session 仍然進得去(他還是這趟的記帳者),但已經不是 owner
-eq('原本的匿名使用者還是進得去', (await anon.get(`/api/trips/${orphanId}`)).status, 200);
+// 原本用連結進來的訪客仍然進得去(他還是這趟的記帳者),但不是 owner
+await anon.get(`/api/trips/${orphanToken}`);
+eq('訪客還是進得去', (await anon.get(`/api/trips/${orphanId}`)).status, 200);
 eq('但他是 editor 不是 owner', (await anon.get(`/api/trips/${orphanId}`)).json.role, 'editor');
 eq('別人認領後他就刪不掉了 → 403', (await anon.del(`/api/trips/${orphanId}`)).status, 403);
 
@@ -212,5 +290,6 @@ eq('登入後列表又有了',
 
 // 收尾:把測試建立的旅程刪掉
 await bob.del(`/api/trips/${orphanId}`);
+await alice.del(`/api/trips/${sharedId}`);
 
 process.exit(summary() > 0 ? 1 : 0);

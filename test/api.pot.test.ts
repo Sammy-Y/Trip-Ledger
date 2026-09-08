@@ -33,6 +33,7 @@ import { readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { group, check, eq, summary } from './_harness.ts';
+import { loginFixture } from './_session.ts';
 
 const BASE = process.argv[2] || process.env.BASE_URL || '';
 
@@ -55,17 +56,10 @@ if (!base) {
 console.log(`dev server: ${base}`);
 
 type J = Record<string, any>;
-async function req(method: string, path: string, body?: unknown): Promise<{ status: number; json: J }> {
-  const r = await fetch(base + path, {
-    method,
-    headers: body ? { 'content-type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  let json: J = {};
-  const txt = await r.text();
-  try { json = txt ? JSON.parse(txt) : {}; } catch { json = { _raw: txt.slice(0, 200) }; }
-  return { status: r.status, json };
-}
+// 建立旅程要登入(見 server/api/trips/index.post.ts),所以整支測試跑在一個
+// 拋棄式帳號的 session 上。cookie 的處理與逐檔獨立的理由見 test/_session.ts。
+const session = await loginFixture(base, 'pot');
+const req = session.req;
 const get = (p: string) => req('GET', p);
 const post = (p: string, b?: unknown) => req('POST', p, b);
 const patch = (p: string, b?: unknown) => req('PATCH', p, b);
