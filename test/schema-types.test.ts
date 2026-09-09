@@ -62,7 +62,8 @@ function fieldsOf(iface: string): string[] {
 }
 
 group('[結構] schema.sql 能被解析');
-const tables = ['trips', 'members', 'expenses', 'reservations', 'settlements', 'fx_rates'];
+const tables = ['trips', 'members', 'expenses', 'reservations', 'settlements', 'fx_rates',
+  'fx_exchanges'];
 for (const t of tables) {
   const cols = columnsOf(t);
   check(`${t} 解析出欄位 (${cols.length})`, cols.length > 2, cols.join(','));
@@ -76,6 +77,8 @@ const pairs: Array<[string, string, string[]]> = [
   // Expense 多了 payers / shares 兩個組裝出來的陣列,不是資料表欄位
   ['Expense', 'expenses', ['payers', 'shares']],
   ['Reservation', 'reservations', []],
+  // FxExchange 刻意沒有 rate 欄位 —— 匯率是導出值(見 schema.sql 的 fx_exchanges)
+  ['FxExchange', 'fx_exchanges', []],
 ];
 for (const [iface, table, extra] of pairs) {
   const cols = new Set(columnsOf(table));
@@ -101,6 +104,13 @@ group('[覆蓋率] 資料表的重要欄位不該在型別裡缺漏');
   check('Reservation 型別覆蓋 reservations 所有欄位', uncovered.length === 0,
     uncovered.length ? `資料表有但型別沒有: ${uncovered.join(', ')}` : '');
 }
+{
+  const cols = columnsOf('fx_exchanges');
+  const fields = new Set(fieldsOf('FxExchange'));
+  const uncovered = cols.filter((c) => !fields.has(c) && c !== 'trip_id');
+  check('FxExchange 型別覆蓋 fx_exchanges 所有欄位', uncovered.length === 0,
+    uncovered.length ? `資料表有但型別沒有: ${uncovered.join(', ')}` : '');
+}
 
 group('[不變量] 金額欄位一律是整數最小單位');
 check('expenses.amount_minor 是 INTEGER',
@@ -109,5 +119,19 @@ check('沒有任何 REAL 型別的金額欄位（浮點數存錢是災難）',
   !/amount\w*\s+REAL/i.test(sql));
 check('fx_rate 才可以是 REAL（匯率不是金額）',
   /fx_rate\s+REAL/i.test(sql));
+
+group('[不變量] 換匯存的是兩邊的金額，不是匯率');
+// 存 rate 的話金額要由浮點數反推，而加權平均會從 0.2067 變成 0.2075
+// （完整推導見 schema.sql 的 fx_exchanges）。這條守的是那個設計決定本身。
+{
+  const cols = columnsOf('fx_exchanges');
+  check('fx_exchanges 有 amount_minor 與 cost_minor 兩個整數欄位',
+    cols.includes('amount_minor') && cols.includes('cost_minor')
+    && /amount_minor\s+INTEGER/i.test(sql) && /cost_minor\s+INTEGER/i.test(sql));
+  check('fx_exchanges 沒有 rate 欄位（匯率是導出值）',
+    !cols.some((c) => /rate/i.test(c)), cols.filter((c) => /rate/i.test(c)).join(','));
+  check('換到的與付出的幣別不可相同（同幣別沒有匯率可言）',
+    /CHECK\s*\(\s*currency\s*<>\s*cost_currency\s*\)/i.test(sql));
+}
 
 process.exit(summary() > 0 ? 1 : 0);

@@ -1,4 +1,4 @@
-import { toMinor, fromMinor, formatMinor, formatMoney, EXPONENT, CURRENCY_SYMBOL, CURRENCY_LABEL } from '../shared/money.ts';
+import { toMinor, fromMinor, formatMinor, formatMoney, exchangeRate, exchangeCostMinor, formatRate, EXPONENT, CURRENCY_SYMBOL, CURRENCY_LABEL } from '../shared/money.ts';
 import { group, check, eq, summary } from './_harness.ts';
 
 group('[exponent] JPY 沒有輔幣，TWD 用分');
@@ -56,5 +56,60 @@ group('[幣別符號] 不可有兩個幣別共用同一符號');
     Object.keys(CURRENCY_SYMBOL).every((c) => !!CURRENCY_LABEL[c]),
     Object.keys(CURRENCY_SYMBOL).filter((c) => !CURRENCY_LABEL[c]).join(','));
 }
+
+group('[換匯] 有效匯率 = 付出的 ÷ 換到的');
+// 使用者實際的兩筆:出發前在台灣分次換好
+const FIRST = { amount: 5000, cost: 105000 };    // 0.21  換 ¥5,000  → NT$1,050
+const SECOND = { amount: 10000, cost: 205000 };  // 0.205 換 ¥10,000 → NT$2,050
+eq('第 1 次 NT$1,050 換 ¥5,000 → 0.21',
+  exchangeRate(FIRST.amount, 'JPY', FIRST.cost, 'TWD'), 0.21);
+eq('第 2 次 NT$2,050 換 ¥10,000 → 0.205',
+  exchangeRate(SECOND.amount, 'JPY', SECOND.cost, 'TWD'), 0.205);
+eq('換到 0 沒有匯率可言（回 null，不是 Infinity）',
+  exchangeRate(0, 'JPY', 105000, 'TWD'), null);
+
+group('[換匯] 加權平均 = Σ付出 ÷ Σ換到');
+{
+  const totalAmount = FIRST.amount + SECOND.amount;   // 15,000
+  const totalCost = FIRST.cost + SECOND.cost;         // NT$3,100
+  const avg = exchangeRate(totalAmount, 'JPY', totalCost, 'TWD')!;
+  eq('¥15,000 / NT$3,100 → 平均顯示 0.2067', formatRate(avg), '0.2067');
+
+  // 反向:換入與換出的順序顛倒，總和不變 → 平均一定一樣。
+  // 這條之所以是**結構性**成立的，就是因為資料庫存的是金額不是匯率
+  // （存匯率就得把每筆的 rate 再平均，那個才會被順序和筆數影響）。
+  const reversed = exchangeRate(
+    SECOND.amount + FIRST.amount, 'JPY', SECOND.cost + FIRST.cost, 'TWD')!;
+  eq('加權平均與紀錄順序無關', reversed, avg);
+
+  // 這是「存 rate 就會算錯」的那個數字。差 0.4%，¥15,000 上是 12 塊台幣，
+  // 金額差距越大差越多 —— 所以 schema 存兩邊的金額而不是匯率。
+  const naive = (0.21 + 0.205) / 2;
+  eq('把每筆的匯率再平均會得到 0.2075（錯的）', formatRate(naive), '0.2075');
+  check('兩者確實不同（否則這條測試在守一個不存在的差別）', naive !== avg,
+    `naive=${naive} weighted=${avg}`);
+}
+
+group('[換匯] 填匯率 → 自動算出台幣');
+// 使用者講的是「我換 0.21」而不是「我付了 1,050」，表單要能雙向換算
+eq('0.21 換 ¥5,000 → 付 NT$1,050', exchangeCostMinor(5000, 'JPY', 0.21, 'TWD'), 105000);
+eq('0.205 換 ¥10,000 → 付 NT$2,050', exchangeCostMinor(10000, 'JPY', 0.205, 'TWD'), 205000);
+for (const [amount, rate] of [[5000, 0.21], [10000, 0.205], [30000, 0.2067], [1, 0.21]] as const) {
+  const cost = exchangeCostMinor(amount, 'JPY', rate, 'TWD');
+  const back = exchangeRate(amount, 'JPY', cost, 'TWD')!;
+  // 四捨五入到「分」之後反推，誤差不可超過半分除以金額
+  check(`¥${amount} @ ${rate} 來回誤差在四捨五入之內`,
+    Math.abs(back - rate) <= 0.005 / amount + 1e-12,
+    `back=${back} rate=${rate} cost=${cost}`);
+}
+eq('匯率是 NaN 時回 0，不寫出 NaN', exchangeCostMinor(5000, 'JPY', Number.NaN, 'TWD'), 0);
+
+group('[換匯] formatRate 用有效位數，不用固定小數位');
+eq('0.21 不補零成 0.2100', formatRate(0.21), '0.21');
+eq('0.20666… → 0.2067', formatRate(0.20666666666666667), '0.2067');
+// 固定 4 位小數會把台幣→日幣印成 4.8123，韓元→台幣印成 0.0234（少一位有效數字）
+eq('反方向 4.81234 → 4.812', formatRate(4.81234), '4.812');
+eq('小數很多的幣別 0.023414 → 0.02341', formatRate(0.023414), '0.02341');
+eq('null 顯示破折號而不是 NaN', formatRate(null), '—');
 
 process.exit(summary() > 0 ? 1 : 0);
