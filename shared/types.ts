@@ -39,9 +39,9 @@ export interface Transfer { from: string; to: string; amountMinor: number; }
  * remainingMinor = 投入 − 公費付掉的 − 已退還。
  * 這個數字就是「公費現在還剩多少現金」。
  *
- * ⚠️ 它等於公費成員淨額的相反數:`公費淨額 === −remainingMinor`。
- * 淨額含投入 / 退還(見 server/utils/ledger.ts 開頭),兩條路徑必須給出
- * 同一個數字 —— 這是這套語意的正確性支點,不是巧合。
+ * ⚠️ 它和結算的淨額**完全無關**。公費不出現在 by_currency[].nets 裡
+ * (見 server/utils/ledger.ts:那裡只算人對人那一本),所以剩餘不能從淨額推,
+ * 淨額也不會因為信封裡有多少錢而改變。兩本帳各自獨立。
  */
 export interface PotCurrency {
   currency: string;
@@ -73,7 +73,7 @@ export interface Balance {
     transfers: Transfer[];
     /** 兩端都不是公費 —— 結算回合會真的寫進帳的就是這些 */
     recorded: Transfer[];
-    /** 任一端是公費 —— 唯讀,旅程結束用「退還」處理,不要現在轉 */
+    /** 任一端是公費 —— **恆為空**(公費不在 nets 裡)。留著當防線 */
     deferred: Transfer[];
   }>;
   per_member: Record<string, {
@@ -125,11 +125,11 @@ export interface RoundPreviewBlock {
   seq: number;
   items: Expense[];
   item_count: number;
-  /** 整趟淨額(含公費,公費那一列 = −公費剩餘),加起來必為 0 */
+  /** 整趟的人對人淨額(**不含公費**),加起來必為 0 */
   nets: Net[];
   /** 兩端都不是公費 —— 結算會真的寫下來的 */
   recorded: Transfer[];
-  /** 任一端是公費 —— 唯讀,旅程結束用「退還」處理 */
+  /** 任一端是公費 —— **恆為空**(公費不在 nets 裡)。留著當防線 */
   deferred: Transfer[];
   /** 有值 = 不准結算,而且這就是原因 */
   blocked_reason: string | null;

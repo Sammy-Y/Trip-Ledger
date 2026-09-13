@@ -108,24 +108,37 @@ function splitLegs(transfers: Transfer[], potId: string | null) {
 type Settled = { from: string; to: string; amountMinor: number };
 
 /**
- * tripLedger 算術管線的鏡像:settlements 原封不動全部交給 netBalances。
+ * tripLedger 算術管線的鏡像 —— **人對人那一本**(見 ledger.ts 開頭)。
  *
- * 公費在這一層**完全不是特例** —— 它就是一個普通成員,投入是它收到的錢、
- * 退還是它付出去的錢。特例只發生在輸出那一步(splitLegs 把它的腿挑成 deferred)。
- * 這個函式短到看起來多餘,留著是因為它標記了「這裡不該有 filter」這件事:
- * 曾經有一版在這裡濾掉任一端是公費的 settlement,那正是要防的漂移。
+ * 兩件事要排掉:
+ *   ① 公費付掉的支出:整筆(付款那邊、分攤那邊都排)。呼叫端自己不要把那些
+ *      支出放進 paid / owed —— 真本是靠 SQL 的 `NOT EXISTS (... m.is_pot = 1)` 做的。
+ *   ② 投入 / 退還:任一端是公費的 settlement。這一層在這裡做。
  *
  * 和 splitLegs 一樣是**鏡像**(真本在 tripLedger 裡面,要 D1 才叫得動),
- * 所以下面的防漂移檢查直接讀 ledger.ts 的原始碼比對那幾行。
+ * 所以下面的防漂移檢查直接讀 ledger.ts 的原始碼比對那幾段。
  * 沒有那個檢查的話,這裡改對了、ledger.ts 改錯了,這支測試會全綠。
  */
 function tripNets(input: {
   paid: Array<{ memberId: string; amountMinor: number }>;
   owed: Array<{ memberId: string; amountMinor: number }>;
   settled: Settled[];
-}, _potId: string | null): Net[] {
-  return netBalances(input);
+}, potId: string | null): Net[] {
+  return netBalances({
+    paid: input.paid,
+    owed: input.owed,
+    settled: potId === null
+      ? input.settled
+      : input.settled.filter((x) => x.from !== potId && x.to !== potId),
+  });
 }
+
+/**
+ * 「這一筆是公費付的嗎」—— 呼叫端用它把公費付的支出整筆擋在 paid / owed 之外,
+ * 對應真本那兩段 SQL。抽成具名函式是為了讓「排除是整筆、不是只排付款那一邊」
+ * 這件事在每個呼叫點都看得見。
+ */
+const paidByPot = (e: { payer: string }, potId: string | null) => !!potId && e.payer === potId;
 
 /** 用淨額組出一個 LedgerBlock —— assertZeroSum 只看 nets,其餘欄位照實填。 */
 function blockOf(currency: string, nets: Net[], potId: string | null): LedgerBlock {
@@ -310,16 +323,27 @@ group('[防漂移] 測試裡的鏡像必須和 ledger.ts 一致');
   check('deferred = 碰到公費的腿',
     src.includes('deferred: transfers.filter(touchesPot),'));
 
-  // ── 語意:settlements 全部進淨額 ─────────────────────────────
-  // 這兩條盯的是同一件事的兩個部位。少了它們,ledger.ts 重新加回一道
-  // 「排掉任一端是公費」的 filter 之後,下面那些不變量的斷言仍然是綠的
-  // (它們算的是鏡像)—— 反向驗證確認過。
-  check('netBalances 收到的是未過濾的 settledR',
-    src.includes('settled: settledR.filter((r) => r.currency === cur)'),
-    'ledger.ts 的 settled 來源改了 —— 投入/退還可能又被排出淨額,請同步更新 tripNets');
-  check('沒有任何一道把公費從 settlements 濾掉的邏輯',
-    !/from_member !== potId|to_member !== potId/.test(src),
-    'ledger.ts 又出現排除公費 settlement 的 filter,那會讓投了錢的人被算成欠錢');
+  // ── 語意:人對人那一本(公費完全不進算術)─────────────────────
+  // 這四條盯的是同一件事的四個部位。少了它們,ledger.ts 的排除邏輯被改掉之後,
+  // 下面那些不變量的斷言仍然會是綠的(它們算的是鏡像)—— 反向驗證確認過。
+  const POT_PAID_SQL = `AND NOT EXISTS (
+           SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+           WHERE pp.expense_id = e.id AND m.is_pot = 1
+         )`;
+  // ⚠️ 這段在 ledger.ts 裡**寫了兩份**(paid 一份、owed 一份),因為 SQL 一律靜態字串
+  // (test/sql-safety.test.ts 把任何插值本身當失敗)。只排一邊的話公費付的支出
+  // 會留下沒有對應付款的分攤 → 淨額不是零和 → minCashFlow 靜靜少算一筆錢。
+  eq('「公費付的整筆排除」在 paid 與 owed 各出現一次(兩份必須逐字相同)',
+    src.split(POT_PAID_SQL).length - 1, 2);
+  check('netBalances 收到的是 p2pR(排掉任一端是公費的 settlement)',
+    src.includes('settled: p2pR.filter((r) => r.currency === cur)'),
+    'ledger.ts 的 settled 來源改了 —— 投入/退還可能又被算進淨額,請同步更新 tripNets');
+  check('p2pR 的排除條件兩端都看',
+    src.includes('settledR.filter((r) => r.from_member !== potId && r.to_member !== potId)'),
+    '只排一邊的話,收到退還的人淨額會莫名往下掉一截');
+  check('幣別集合有一份「不管誰付的」的來源(公費付的支出才蓋得到章)',
+    src.includes('SELECT DISTINCT currency FROM expenses'),
+    '少了它,「只有公費付過」的幣別會整個從結算頁消失,那幾筆永遠蓋不到章');
   // 帳本是**只讀**的:它只計算「誰欠誰多少」,寫入一律由 rounds.post / settlements.post 負責。
   // 一旦有人在這裡加寫入 SQL,balance.get(每次開頁都呼叫)就會變成會改資料的端點。
   check('ledger.ts 不含任何寫入 SQL(只讀模組)',
@@ -440,12 +464,12 @@ group('[assertZeroSum] 寫錢之前的最後一道檢查');
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[語意] settlements 全部進淨額 —— 投入 / 退還 / 人對人都算');
+group('[語意] 兩本帳 —— 公費完全不進結算的算術');
 
 {
   const A = 'a', B = 'b', POT = 'pot';
 
-  // 底盤:B 自己墊 10,000 的共同支出,兩人均分 → A 欠 B 5,000。公費還沒經手任何錢。
+  // 底盤:B 自己墊 10,000 的共同支出,兩人均分 → A 欠 B 5,000。
   const base = {
     paid: [{ memberId: B, amountMinor: 10000 }],
     owed: [...splitEqually(10000, [A, B])].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
@@ -457,35 +481,21 @@ group('[語意] settlements 全部進淨額 —— 投入 / 退還 / 人對人�
     { memberId: B, netMinor: 5000 },
   ]);
 
-  // ① 投入(人 → 公費):那是他真的掏出去的錢,淨額必須往上跳一樣多。
-  //    A 原本欠 5,000,投了 20,000 進信封之後他反過來是「別人/信封還他 15,000」。
-  eq('A 投入公費 20,000 → A 從 −5000 變成 +15000,公費 −20000',
-    tripNets({ ...base, settled: [{ from: A, to: POT, amountMinor: 20000 }] }, POT), [
-      { memberId: A, netMinor: 15000 },
-      { memberId: B, netMinor: 5000 },
-      { memberId: POT, netMinor: -20000 },
-    ]);
+  // ① 投入(人 → 公費):把現金放進信封,不是還款 → 淨額一個位元都不能動。
+  //    這是規格那句「A 先墊錢就是 A 墊錢,跟他拿出多少公費沒關係」的直接測法。
+  eq('A 投入公費 999,999 → 淨額逐位元不變',
+    tripNets({ ...base, settled: [{ from: A, to: POT, amountMinor: 999999 }] }, POT), plain);
 
-  // ② 退還(公費 → 人):錢從信封回到他手上,淨額往下掉。
-  //    **只算一邊是最容易犯的錯**,所以兩個方向各測一次。
-  eq('公費退還 B 7,000 → B 從 +5000 變成 −2000,公費 +7000',
-    tripNets({ ...base, settled: [{ from: POT, to: B, amountMinor: 7000 }] }, POT), [
-      { memberId: A, netMinor: -5000 },
-      { memberId: B, netMinor: -2000 },
-      { memberId: POT, netMinor: 7000 },
-    ]);
-  eq('投入與退還混在一起 → 兩個方向各自生效',
+  // ② 退還(公費 → 人):同樣不動。**只排一邊是最容易犯的錯**,兩個方向各測一次。
+  eq('公費退還 B 7,000 → 淨額逐位元不變',
+    tripNets({ ...base, settled: [{ from: POT, to: B, amountMinor: 7000 }] }, POT), plain);
+  eq('投入與退還混在一起 → 淨額還是不變',
     tripNets({ ...base, settled: [
       { from: A, to: POT, amountMinor: 4000 },
       { from: POT, to: B, amountMinor: 1500 },
-    ] }, POT), [
-      { memberId: A, netMinor: -1000 },
-      { memberId: B, netMinor: 3500 },
-      { memberId: POT, netMinor: -2500 },
-    ]);
+    ] }, POT), plain);
 
-  // ③ 人對人的還款:照舊。手動「標記已還款」和回合寫下的轉帳在這一層長得一模一樣
-  //    (source 是資料庫欄位,算術看不到也不該看到)。
+  // ③ 人對人的還款:**一定要算**,那是真實的債務清償。
   eq('A 還了 B 2,000 → A 的債剩 3,000',
     tripNets({ ...base, settled: [{ from: A, to: B, amountMinor: 2000 }] }, POT), [
       { memberId: A, netMinor: -3000 },
@@ -499,174 +509,164 @@ group('[語意] settlements 全部進淨額 —— 投入 / 退還 / 人對人�
       { memberId: B, netMinor: 3000 },
     ]);
 
-  // ④ 三種混在一起,每一筆都要生效。
-  //    A: −5000 +50000(投入) +2000(還B) −30000(收到退還) = +17000
-  eq('投入 + 人對人 + 退還 → 三筆全部生效',
+  // ④ 三種混在一起:只有中間那筆該生效。
+  eq('投入 + 人對人 + 退還 → 只有人對人生效',
     tripNets({ ...base, settled: [
       { from: A, to: POT, amountMinor: 50000 },
       { from: A, to: B, amountMinor: 2000 },
       { from: POT, to: A, amountMinor: 30000 },
     ] }, POT), [
-      { memberId: A, netMinor: 17000 },
+      { memberId: A, netMinor: -3000 },
       { memberId: B, netMinor: 3000 },
-      { memberId: POT, netMinor: -20000 },
     ]);
 }
 
 {
-  // ⑤ 支點不變量:公費淨額 === −剩餘。把三種「少算一邊」的做法寫出來,
-  //    證明不變量真的會破 —— 這是把反向驗證寫進測試。
+  // ⑤ 公費付掉的支出:**整筆**排除,而且付款與分攤兩邊要一起排。
+  //    只排付款那一邊的話會留下一堆沒有對應付款的分攤 → 淨額不是零和
+  //    → minCashFlow 靜靜少算一筆錢(settle.ts 的 break)。
   const A = 'a', B = 'b', POT = 'pot';
-  const potSpent = 8000;
-  const contributed = 30000, refunded = 6000;
-  const settled: Settled[] = [
-    { from: A, to: POT, amountMinor: contributed },   // 投入
-    { from: POT, to: B, amountMinor: refunded },      // 退還
-  ];
-  const paid = [{ memberId: POT, amountMinor: potSpent }];
-  const owed = [...splitEqually(potSpent, [A, B])].map(([memberId, amountMinor]) => ({ memberId, amountMinor }));
-  const remaining = contributed - potSpent - refunded;   // 16,000 還躺在信封裡
+  const potMeal = splitEqually(9000, [A, B]);
 
-  const right = tripNets({ paid, owed, settled }, POT);
-  eq('剩餘是 16,000', remaining, 16000);
-  eq('全部照算 → 公費淨額 === −剩餘', right.find((n) => n.memberId === POT)?.netMinor, -remaining);
+  // 正確的做法:那筆支出從頭到尾不進 paid / owed。
+  const right = tripNets({ paid: [], owed: [], settled: [] }, POT);
+  eq('公費付的支出完全不產生淨額', right, []);
 
-  const dropIn = netBalances({ paid, owed, settled: settled.filter((x) => x.to !== POT) });
-  check('漏算投入 → 公費淨額不再是 −剩餘',
-    dropIn.find((n) => n.memberId === POT)?.netMinor !== -remaining, JSON.stringify(dropIn));
-  const dropOut = netBalances({ paid, owed, settled: settled.filter((x) => x.from !== POT) });
-  check('漏算退還 → 公費淨額不再是 −剩餘',
-    dropOut.find((n) => n.memberId === POT)?.netMinor !== -remaining, JSON.stringify(dropOut));
-  const dropBoth = netBalances({ paid, owed, settled: [] });
-  check('兩邊都漏算 → 公費淨額變成「它花掉的錢」,和剩餘完全無關',
-    dropBoth.find((n) => n.memberId === POT)?.netMinor === potSpent, JSON.stringify(dropBoth));
+  // 只排付款那一邊會長成什麼樣子 —— 把錯的做法寫出來,證明它真的會壞。
+  const halfDone = netBalances({
+    paid: [],
+    owed: [...potMeal].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
+    settled: [],
+  });
+  eq('只排付款那一邊 → 兩個人都憑空欠了錢', halfDone, [
+    { memberId: A, netMinor: -4500 },
+    { memberId: B, netMinor: -4500 },
+  ]);
+  check('而且淨額加起來不是 0(minCashFlow 對這種輸入會靜靜少算)',
+    sumNets(halfDone) !== 0, String(sumNets(halfDone)));
 
-  // 而且漏算投入的那一版會把 A 算成欠錢 —— 這就是這次改動要修掉的症狀。
-  check('漏算投入的話,掏了 30,000 出來的 A 會被算成「應付」',
-    (dropIn.find((n) => n.memberId === A)?.netMinor ?? 0) < 0, JSON.stringify(dropIn));
-  check('全部照算之後 A 是「應收」', (right.find((n) => n.memberId === A)?.netMinor ?? 0) > 0,
-    JSON.stringify(right));
+  // 公費付的那筆和人墊的那筆混在同一趟:只有人墊的那筆進算術。
+  const mixed = tripNets({
+    paid: [{ memberId: A, amountMinor: 3000 }],
+    owed: [...splitEqually(3000, [A, B])].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
+    settled: [],
+  }, POT);
+  eq('人墊的那筆照算,公費付的那筆當作沒發生', mixed, [
+    { memberId: A, netMinor: 1500 },
+    { memberId: B, netMinor: -1500 },
+  ]);
 }
 
 {
-  // ⑥ 大家投了錢、公費一毛都還沒花:整包都是要退回去的。
+  // ⑥ 公費永遠不會出現在 nets 裡 ⇒ deferred 恆為空。
+  // 那兩個欄位留著是**防線**(見 ledger.ts 開頭最後一段),不是功能。
   const A = 'a', B = 'b', POT = 'pot';
   const nets = tripNets({
     paid: [{ memberId: A, amountMinor: 3000 }],
     owed: [...splitEqually(3000, [A, B])].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
     settled: [{ from: A, to: POT, amountMinor: 100000 }, { from: B, to: POT, amountMinor: 100000 }],
   }, POT);
-  eq('公費淨額 = −200,000(= −剩餘)', nets.find((n) => n.memberId === POT)?.netMinor, -200000);
-  eq('A 101,500(投入 + 他墊的一半)/ B 98,500', nets, [
-    { memberId: A, netMinor: 101500 },
-    { memberId: B, netMinor: 98500 },
-    { memberId: POT, netMinor: -200000 },
+  check('公費不在 nets 裡', !nets.some((n) => n.memberId === POT), JSON.stringify(nets));
+  eq('deferred 是空的', splitLegs(minCashFlow(nets), POT).deferred, []);
+  eq('recorded 就是全部的轉帳', splitLegs(minCashFlow(nets), POT).recorded, [
+    { from: B, to: A, amountMinor: 1500 },
   ]);
-  const { recorded, deferred } = splitLegs(minCashFlow(nets), POT);
-  eq('recorded 空的 —— 人跟人之間不必轉帳,錢都在信封裡', recorded, []);
-  eq('deferred:結束時信封各退回去', byId(deferred), [
-    { from: POT, to: A, amountMinor: 101500 },
-    { from: POT, to: B, amountMinor: 98500 },
-  ]);
-  expectAllProps('全部性質成立', nets, POT);
 }
 
 {
-  // ⑦ 只有投入、什麼都還沒花的幣別:淨額不再是空的 ——
-  // 那筆現金真的躺在信封裡,結算頁必須看得到誰放進去的。
+  // ⑦ 只有投入、什麼都還沒花的幣別:人對人那一本是空的。
+  // 那筆現金在信封裡,由 balance.get.ts 的 potSummary 獨立算 —— 不在這個模組。
   const nets = tripNets({
     paid: [], owed: [],
     settled: [{ from: 'a', to: 'pot', amountMinor: 100000 }],
   }, 'pot');
-  eq('a +100,000 / 公費 −100,000', nets, [
-    { memberId: 'a', netMinor: 100000 },
-    { memberId: 'pot', netMinor: -100000 },
-  ]);
-  eq('仍然零和', assertZeroSum(blockOf('KRW', nets, 'pot')), null);
-  eq('唯一的腿是「結束時退還」,而且是 deferred',
-    splitLegs(minCashFlow(nets), 'pot'), {
-      recorded: [],
-      deferred: [{ from: 'pot', to: 'a', amountMinor: 100000 }],
-    });
+  eq('淨額是空陣列', nets, []);
+  eq('空帳本仍然算零和', assertZeroSum(blockOf('KRW', nets, 'pot')), null);
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[實例] 公費模式:各投 10,000,公費付掉 6,000 + 4,000');
+group('[實例] 使用者親口描述的模型');
 
 {
-  // README 的那個範例。兩個人各投 10,000,公費花掉 10,000 兩人均分 ——
-  // 每個人先付了 10,000、消費了 5,000,所以各自還有 5,000 躺在信封裡。
-  const MIN = 'min', HSUAN = 'hsuan', POT = 'pot';
-  const potSpent = 10000, contributed = 20000;
-  const remaining = contributed - potSpent;
-  const input = {
-    paid: [{ memberId: POT, amountMinor: 6000 }, { memberId: POT, amountMinor: 4000 }],
-    owed: [
-      ...[...splitEqually(6000, [MIN, HSUAN])].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
-      ...[...splitEqually(4000, [MIN, HSUAN])].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
-    ],
-    settled: [
-      { from: MIN, to: POT, amountMinor: 10000 },
-      { from: HSUAN, to: POT, amountMinor: 10000 },
-    ],
-  };
-  const nets = tripNets(input, POT);
-  eq('淨額 = 民 +5000 / 喧 +5000 / 公費 −10000', nets, [
-    { memberId: HSUAN, netMinor: 5000 },
-    { memberId: MIN, netMinor: 5000 },
-    { memberId: POT, netMinor: -10000 },
-  ]);
-  eq('公費淨額 === −剩餘', nets.find((n) => n.memberId === POT)?.netMinor, -remaining);
-  eq('Σ(真人淨額) === 剩餘',
-    nets.filter((n) => n.memberId !== POT).reduce((s, n) => s + n.netMinor, 0), remaining);
+  /*
+    「旅遊一開始大家拿了 5,000 當公費。付款拿公費就扣公費餘額。
+      A 先墊錢,但就是 A 墊錢,跟公費沒關係,不會變多也不會變少,
+      也跟 A 拿出多少公費沒關係。」
 
-  const { recorded, deferred } = splitLegs(minCashFlow(nets), POT);
-  eq('recorded 是空的 —— 兩人出得一樣多,彼此不欠', recorded, []);
-  eq('deferred 是兩條「公費 → 人」的退還腿(唯讀,絕不寫入)', byId(deferred), [
-    { from: POT, to: HSUAN, amountMinor: 5000 },
-    { from: POT, to: MIN, amountMinor: 5000 },
-  ]);
-  eq('Σ deferred === 剩餘', totalOf(deferred), remaining);
+    三人各投 5,000(信封 15,000),公費一毛沒花,A 自己墊了 3,000 的飯三人均分。
+  */
+  const A = 'a', B = 'b', C = 'c', POT = 'pot';
+  const P = [A, B, C];
+  const nets = tripNets({
+    paid: [{ memberId: A, amountMinor: 3000 }],
+    owed: [...splitEqually(3000, P)].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
+    settled: P.map((id) => ({ from: id, to: POT, amountMinor: 5000 })),
+  }, POT);
 
+  eq('A +2000 / B −1000 / C −1000 —— 投入完全沒有影響這三個數字', nets, [
+    { memberId: A, netMinor: 2000 },
+    { memberId: B, netMinor: -1000 },
+    { memberId: C, netMinor: -1000 },
+  ]);
+  eq('轉帳就是 B→A、C→A 各 1,000', byId(minCashFlow(nets)), [
+    { from: B, to: A, amountMinor: 1000 },
+    { from: C, to: A, amountMinor: 1000 },
+  ]);
+  eq('沒有任何一條腿碰到公費', splitLegs(minCashFlow(nets), POT).deferred, []);
+
+  // 信封是另一本帳,自己算自己的:投入 15,000 − 公費花 0 − 退還 0。
+  eq('信封餘額 15,000(和上面那三個數字無關)', 3 * 5000 - 0 - 0, 15000);
   expectAllProps('全部性質成立', nets, POT);
 }
 
-group('[實例] 出資不均:民 出 20,000、喧 出 0,公費付掉 10,000');
+{
+  /*
+    同一個模型,但這次公費真的花了錢。
+    三人各投 5,000(信封 15,000),公費付掉 9,000 的門票(三人均分),
+    A 另外自己墊了 3,000 的飯(三人均分)。
+
+    公費那 9,000 直接從餘額扣掉,不追究是誰用的 —— 所以它不產生任何人對人的債。
+    人對人那一本只看 A 墊的那 3,000。
+  */
+  const A = 'a', B = 'b', C = 'c', POT = 'pot';
+  const P = [A, B, C];
+  const nets = tripNets({
+    // 公費付的那 9,000 **不在這裡** —— 整筆排除
+    paid: [{ memberId: A, amountMinor: 3000 }],
+    owed: [...splitEqually(3000, P)].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
+    settled: P.map((id) => ({ from: id, to: POT, amountMinor: 5000 })),
+  }, POT);
+
+  eq('人對人:A +2000 / B −1000 / C −1000(和上一組一模一樣)', nets, [
+    { memberId: A, netMinor: 2000 },
+    { memberId: B, netMinor: -1000 },
+    { memberId: C, netMinor: -1000 },
+  ]);
+  eq('信封餘額 = 15,000 − 9,000 = 6,000', 3 * 5000 - 9000 - 0, 6000);
+  // 「公費花了多少」完全不影響誰欠誰 —— 這就是兩本帳分開的意思。
+  expectAllProps('全部性質成立', nets, POT);
+}
 
 {
-  // 這一組是整套語意的重點:公費花的錢由信封吸收,**但出資不均的債不會被吸收掉**。
-  // 民 一個人把 20,000 放進信封,兩人各消費 5,000 —— 喧 欠的是 民,不是信封。
+  /*
+    上次那個真實的 bug,用新模型再驗一次:
+    MIN 投 20,000、HSUAN 投 15,000,公費付掉 15,000 兩人均分。
+
+    沒有人自己墊過錢 ⇒ 人對人那一本是空的 ⇒ 不用轉帳。
+    信封剩 35,000 − 15,000 = 20,000,結束時退還(分法由使用者決定)。
+    舊的壞版本會說「兩個人都應付 −7,500」—— 對著已經先付過錢的人說他還欠錢。
+  */
   const MIN = 'min', HSUAN = 'hsuan', POT = 'pot';
-  const contributed = 20000, potSpent = 10000;
-  const remaining = contributed - potSpent;
   const nets = tripNets({
-    paid: [{ memberId: POT, amountMinor: potSpent }],
-    owed: [...splitEqually(potSpent, [MIN, HSUAN])].map(([memberId, amountMinor]) => ({ memberId, amountMinor })),
-    settled: [{ from: MIN, to: POT, amountMinor: contributed }],
+    paid: [], owed: [],   // 公費付的那筆整筆排除
+    settled: [
+      { from: MIN, to: POT, amountMinor: 20000 },
+      { from: HSUAN, to: POT, amountMinor: 15000 },
+    ],
   }, POT);
-  eq('淨額 = 民 +15000 / 喧 −5000 / 公費 −10000', nets, [
-    { memberId: HSUAN, netMinor: -5000 },
-    { memberId: MIN, netMinor: 15000 },
-    { memberId: POT, netMinor: -10000 },
-  ]);
-  eq('公費淨額 === −剩餘', nets.find((n) => n.memberId === POT)?.netMinor, -remaining);
-
-  const { recorded, deferred } = splitLegs(minCashFlow(nets), POT);
-  eq('recorded:喧 → 民 5,000 —— 這筆會真的被寫進 settlements', recorded, [
-    { from: HSUAN, to: MIN, amountMinor: 5000 },
-  ]);
-  eq('deferred:結束時信封把剩下的 10,000 退還給民', deferred, [
-    { from: POT, to: MIN, amountMinor: 10000 },
-  ]);
-
-  // ── 把錢走完:每個人最後實際掏出多少 ────────────────────────
-  eq('民 收到 5,000(喧)+ 10,000(退還)= 15,000',
-    5000 + 10000, 15000);
-  eq('民 實際掏出 = 20,000 − 15,000 = 他該分攤的 5,000', contributed - 15000, 5000);
-  eq('喧 實際掏出 = 他該分攤的 5,000', 5000, 5000);
-  eq('兩人實付合計 === 公費花費', (contributed - 15000) + 5000, potSpent);
-
-  expectAllProps('全部性質成立', nets, POT);
+  eq('沒有人欠任何人', nets, []);
+  eq('沒有轉帳建議', minCashFlow(nets), []);
+  eq('信封餘額 20,000', 35000 - 15000 - 0, 20000);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -753,7 +753,8 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
   };
   // 覆蓋率計數器:每個分支都必須真的被走到,否則「全綠」是假的。
   const cov = {
-    potNeg: 0, potPos: 0, potZero: 0, noPot: 0, recEmpty: 0, recSome: 0, defSome: 0,
+    noPot: 0, recEmpty: 0, recSome: 0,
+    potPaidExp: 0, personPaidExp: 0,
     contributed: 0, refunded: 0, p2p: 0,
   };
 
@@ -761,7 +762,6 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
     const nPeople = 2 + ri(5);                       // 2..6 人
     const people = Array.from({ length: nPeople }, (_, i) => `p${i}`);
     const potId = ri(4) === 0 ? null : (ri(2) === 0 ? 'aa-pot' : 'zz-pot');  // 1/4 的旅程沒有公費
-    const payerPool = potId ? [...people, potId] : people;
 
     const paid: Array<{ memberId: string; amountMinor: number }> = [];
     const owed: Array<{ memberId: string; amountMinor: number }> = [];
@@ -770,30 +770,42 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
     const nExp = 1 + ri(4);                          // 1..4 筆共同支出
     for (let e = 0; e < nExp; e++) {
       const amount = 1 + ri(200000);
-      // 分攤的人:人的非空子集。**公費不分攤**(它是出錢的一方,見 previewShares 的規則);
-      // 讓公費分攤自己付的錢會讓「公費淨額 = −剩餘」這個不變量失效。
+      // 分攤的人:人的非空子集。**公費不分攤**(它是出錢的一方,見 previewShares 的規則)。
       const sharers = people.filter(() => ri(2) === 0);
       if (!sharers.length) sharers.push(pick(people));
       const shares = ri(2) === 0
         ? splitEqually(amount, sharers)
         : splitByShares(amount, Object.fromEntries(sharers.map((id) => [id, 1 + ri(20)])));
+
+      /*
+        1/3 的支出是公費付的,而且**一定是整筆** —— 混合付款(公費 + 人一起付)
+        被 expenses.post / expenses[id].patch 擋掉了,所以不生成那種形狀。
+
+        公費付的支出**整筆不進 paid 也不進 owed**:信封在記帳當下就扣掉了,
+        它不產生任何人對人的債(見 ledger.ts 開頭)。只排一邊的話淨額就不是零和。
+      */
+      if (potId && ri(3) === 0) {
+        potSpent += amount;
+        cov.potPaidExp++;
+        continue;
+      }
+      cov.personPaidExp++;
       for (const [memberId, amountMinor] of shares) owed.push({ memberId, amountMinor });
 
-      // 付款人 1..2 位(可以是公費),合計必須等於 amount —— 這是 LEMMA 的前提。
+      // 付款人 1..2 位,**一定是真人**,合計必須等於 amount —— 這是 LEMMA 的前提。
       const nPayers = 1 + ri(2);
       let left = amount;
       for (let i = 0; i < nPayers; i++) {
         const take = i === nPayers - 1 ? left : ri(left + 1);
-        const who = pick(payerPool);
-        paid.push({ memberId: who, amountMinor: take });
-        if (who === potId) potSpent += take;
+        paid.push({ memberId: pick(people), amountMinor: take });
         left -= take;
       }
     }
 
     // 還款:投入公費 / 公費退還 / 人與人手動還款(三種都會真的出現在 settlements 表)
     const settled: Settled[] = [];
-    let potIn = 0, potOut = 0;            // 投入 / 退還的**金額**,用來算剩餘
+    const p2pOnly: Settled[] = [];        // 只有人對人的那些 —— 驗淨額公式要用
+    let potIn = 0, potOut = 0;            // 投入 / 退還的**金額**,用來算信封餘額
     const nSet = ri(5);
     for (let s = 0; s < nSet; s++) {
       const kind = potId ? ri(6) : 5;
@@ -811,7 +823,9 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
         const from = pick(people);
         const to = pick(people.filter((p) => p !== from)) ?? from;
         if (to !== from) {
-          settled.push({ from, to, amountMinor: 1 + ri(80000) });
+          const row = { from, to, amountMinor: 1 + ri(80000) };
+          settled.push(row);
+          p2pOnly.push(row);
           cov.p2p++;
         }
       }
@@ -825,14 +839,15 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
 
     // ── 三條恆等式 ─────────────────────────────────────────────
     //
-    // ① 逐人的淨額公式。這條是**最緊的**一條:它同時抓「算太少」(投入/退還被濾掉)
-    //    和「算太多」(同一筆被算兩次)。少了它,把 settled 整個丟掉
-    //    也能讓下面兩條通過 —— 而那等於把所有已還的款憑空作廢。
+    // ① 逐人的淨額公式。這條是**最緊的**一條:它同時抓「算太少」(人對人的還款
+    //    被一起濾掉)和「算太多」(投入 / 退還混進來、或公費付的支出沒排乾淨)。
+    //    少了它,把 settled 整個丟掉也能讓下面兩條通過 ——
+    //    而那等於把所有已還的款憑空作廢。
     const formula = new Map<string, number>();
     const bumpF = (id: string, v: number) => formula.set(id, (formula.get(id) ?? 0) + v);
-    for (const p of paid) bumpF(p.memberId, p.amountMinor);
-    for (const o of owed) bumpF(o.memberId, -o.amountMinor);
-    for (const x of settled) { bumpF(x.from, x.amountMinor); bumpF(x.to, -x.amountMinor); }
+    for (const p of paid) bumpF(p.memberId, p.amountMinor);        // 只含人付的支出
+    for (const o of owed) bumpF(o.memberId, -o.amountMinor);       // 同上
+    for (const x of p2pOnly) { bumpF(x.from, x.amountMinor); bumpF(x.to, -x.amountMinor); }
     const netOfIter = new Map(nets.map((n) => [n.memberId, n.netMinor]));
     for (const [id, want] of formula) {
       // netBalances 會濾掉 0,所以「不在 nets 裡」等於 0。
@@ -841,32 +856,30 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
       }
     }
 
-    // 剩餘 = 投入 − 公費花掉的 − 已退還。這一行是 balance.get.ts 的 potSummary
-    // 那三個 SUM 的鏡像:下面兩條就是在驗「兩條獨立路徑算出同一個數字」。
-    const remaining = potIn - potSpent - potOut;
-
-    if (potId) {
-      // ② 公費淨額 === −剩餘。支點不變量。
-      if (netPot !== -remaining) {
-        bump('pot-net-is-neg-remaining', `iter=${iter} 公費淨額 ${netPot} 應該是 ${-remaining}`);
-      }
-      // ③ Σ(真人淨額) === 剩餘。零和 + ② 的推論,但它就是規格上那一條,
-      //    所以獨立驗一次 —— 讀測試的人要能直接看到規格本身。
-      const sumPeople = nets.filter((n) => n.memberId !== potId)
-        .reduce((s, n) => s + n.netMinor, 0);
-      if (sumPeople !== remaining) {
-        bump('people-sum-is-remaining', `iter=${iter} Σ真人 ${sumPeople} 應該是 ${remaining}`);
-      }
+    // ② **公費永遠不在 nets 裡。** 這是「兩本帳」最直接的斷言 ——
+    //    只要它出現了,不管值是多少,人對人那一本就已經被信封污染了。
+    if (potId && nets.some((n) => n.memberId === potId)) {
+      bump('pot-not-in-nets', `iter=${iter} 公費出現在淨額裡:${netPot}`);
     }
+    // ③ 因此 deferred 恆為空(minCashFlow 生不出碰到公費的腿)。
+    if (splitLegs(minCashFlow(nets), potId).deferred.length) {
+      bump('deferred-always-empty', `iter=${iter} 冒出了碰到公費的腿`);
+    }
+
+    /*
+      信封餘額 = potIn − potSpent − potOut。它**完全不出現在上面的算術裡** ——
+      那正是「兩本帳」的意思,所以這裡沒有東西可以對照著驗:
+      這個模組根本不知道信封的存在。餘額的正確性由 balance.get.ts 的 potSummary
+      負責,而「改公費金流不會動到人對人的淨額」由 test/api.pot.test.ts [7] 守。
+      這幾個變數留著是為了讓讀的人看到生成器**確實**造出了投入 / 退還 / 公費支出,
+      而它們對 nets 一點影響都沒有(上面 ① 的公式裡一個都沒出現)。
+    */
+    void potIn; void potOut; void potSpent;
 
     // 覆蓋率
     if (!potId) cov.noPot++;
-    else if (netPot < 0) cov.potNeg++;
-    else if (netPot > 0) cov.potPos++;
-    else cov.potZero++;
-    const { recorded, deferred } = splitLegs(minCashFlow(nets), potId);
+    const { recorded } = splitLegs(minCashFlow(nets), potId);
     if (recorded.length) cov.recSome++; else cov.recEmpty++;
-    if (deferred.length) cov.defSome++;
   }
 
   const PROPS = [
@@ -880,9 +893,9 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
     ['thm2-complete', '定理二:recorded 清償 === 淨額 − 殘額'],
     ['thm3-no-overpay', '定理三:方向同號且不超額'],
     ['thm4-idempotent', '定理四:吸收 recorded 後第二輪不再要錢'],
-    ['net-formula', '淨額 = 墊款 − 分攤 + 付出去的 − 收到的(逐人,全部 settlement)'],
-    ['pot-net-is-neg-remaining', '支點:公費淨額 === −公費剩餘'],
-    ['people-sum-is-remaining', '支點:Σ(真人淨額) === 公費剩餘'],
+    ['net-formula', '淨額 = 人付的墊款 − 那些支出的分攤 + 人對人付出的 − 收到的'],
+    ['pot-not-in-nets', '公費永遠不在 nets 裡(兩本帳沒有互相污染)'],
+    ['deferred-always-empty', 'deferred 恆為空'],
   ] as const;
   for (const [key, label] of PROPS) {
     const v = violations.get(key);
@@ -890,17 +903,11 @@ group('[隨機] 由支出/還款產生的完整帳本(固定種子)');
   }
 
   // 沒走到的分支等於沒測到 —— 生成器偏掉的話這裡會紅。
-  //
-  // 公費淨額的兩個方向都必須大量出現。只走到其中一半的話,定理一裡
-  // 「腿的方向和殘額同號」那兩個 if 就有一個從來沒被執行過,
-  // 而那正是「第一晚把信封退光」與「幫人記一筆沒付的投入」的分界。
-  check(`覆蓋:公費淨額為負(信封還有錢,常態)${cov.potNeg} 組`, cov.potNeg > 50, JSON.stringify(cov));
-  check(`覆蓋:公費淨額為正(超支,要有人補)${cov.potPos} 組`, cov.potPos > 50, JSON.stringify(cov));
-  check(`覆蓋:公費淨額為 0(剩餘剛好歸零)${cov.potZero} 組`, cov.potZero > 50, JSON.stringify(cov));
+  check(`覆蓋:公費付掉的支出 ${cov.potPaidExp} 筆`, cov.potPaidExp > 100, JSON.stringify(cov));
+  check(`覆蓋:人墊的支出 ${cov.personPaidExp} 筆`, cov.personPaidExp > 100, JSON.stringify(cov));
   check(`覆蓋:沒有公費的旅程 ${cov.noPot} 組`, cov.noPot > 50, JSON.stringify(cov));
   check(`覆蓋:recorded 非空 ${cov.recSome} 組`, cov.recSome > 50, JSON.stringify(cov));
   check(`覆蓋:recorded 為空 ${cov.recEmpty} 組`, cov.recEmpty > 50, JSON.stringify(cov));
-  check(`覆蓋:deferred 非空 ${cov.defSome} 組`, cov.defSome > 50, JSON.stringify(cov));
   // 三種 settlement 都必須真的被生出來,否則「投入/退還被排掉、人對人照算」
   // 這件事有一半根本沒被測到。
   check(`覆蓋:投入公費 ${cov.contributed} 筆`, cov.contributed > 100, JSON.stringify(cov));

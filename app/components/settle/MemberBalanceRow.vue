@@ -14,13 +14,13 @@ import { formatMoney } from '~~/shared/money';
  * 向右綠 = 應收、向左紅 = 應付,一眼就能看出誰墊得最多。
  *
  * ⚠️ **公費不會用這個元件。** 它不是人,「應收 / 應付」的語意套在它身上是錯的
- * (它的淨額是 −剩餘),所以結算頁把它從淨額列表濾掉、改成卡片上方單獨一行 ——
+ * (它根本不在淨額裡),所以結算頁把它改成卡片上方單獨一行的現況 ——
  * 同一欄擺兩種意義的數字是使用者看不懂的主因。
  *
- * 但公費**會影響這裡的文案**:這趟有公費的話,「還他錢的人」可能是信封而不是人
- * (淨額含投入 / 退還,見 server/utils/ledger.ts)。寫死「別人要還他」在
- * 「大家都投了錢、還沒花完」的常態下是錯的 —— 那時每個人都是正的,
- * 而沒有任何人要還任何人。所以有公費時把信封一起寫進去,由 potLabel 帶入。
+ * 而且公費**不會影響這裡的文案**:它完全不進結算的算術(兩本分開的帳,
+ * 見 server/utils/ledger.ts),所以這一列的對象一定是另一個真人。
+ * 曾經有一版讓投入進淨額,那時「還他錢的人」可能是信封,文案得跟著繞 ——
+ * 現在不必了。
  */
 const props = withDefaults(defineProps<{
   /** 成員名字(頁面用 useTrip 的 memberName 轉好再傳進來) */
@@ -31,14 +31,8 @@ const props = withDefaults(defineProps<{
   currency: string;
   /** 0..1,相對於同幣別最大絕對淨額。0 或不給就不畫 bar */
   ratio?: number;
-  /**
-   * 這個幣別有公費在運作的話,傳它的名字。null / 不給 = 這趟沒公費,
-   * 對象一定是真人。只影響文案,不影響任何金額。
-   */
-  potLabel?: string | null;
 }>(), {
   ratio: 0,
-  potLabel: null,
 });
 
 function initial(name: string): string {
@@ -54,14 +48,11 @@ const state = computed<'credit' | 'debit' | 'zero'>(() => {
   return 'zero';
 });
 
-const stateLabel = computed(() => {
-  const pot = props.potLabel;
-  return {
-    credit: pot ? `應收 · 別人或${pot}要還他` : '應收 · 別人要還他',
-    debit: pot ? `應付 · 他要還別人或補${pot}` : '應付 · 他要還別人',
-    zero: '已結清',
-  }[state.value];
-});
+const stateLabel = computed(() => ({
+  credit: '應收 · 別人要還他',
+  debit: '應付 · 他要還別人',
+  zero: '已結清',
+}[state.value]));
 
 /** bar 的半邊寬度(%)。中線是 0,所以單邊最多 50% */
 const barWidth = computed(() => {

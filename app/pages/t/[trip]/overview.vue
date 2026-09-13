@@ -307,6 +307,64 @@ function splitRemainingEqually() {
   potPicked.value = potPicked.value.filter(id => (shares.get(id) ?? 0) > 0);
 }
 
+// ── 退還:誰只要拿多少,其餘平分 ───────────────────────────────
+/**
+ * 「某幾個人先拿固定金額,剩下的平分給其他人」。
+ *
+ * 為什麼需要這個:投入常常是不均等的(有人多拿一點出來、有人身上剛好沒零錢),
+ * 而退還要怎麼分是**幾個人談出來的結果** —— 某人先走、某人說零頭不用找。
+ *
+ * ⚠️ 不要寫成「沒有一條算得出來的規則」,那句話是錯的:
+ * 公費付的支出仍然記著每個人的分攤,所以「他投入的 − 他從公費用掉的」
+ * 算得出來,而且那是唯一能讓每個人完全扣平的分法。
+ * 這個專案刻意不用它(信封的錢是共有的,花掉不追究是誰用的 —— 那正是
+ * 公費存在的意義),代價是投入不均時有人會默默佔便宜。取捨寫在 README。
+ * 系統不替使用者假設,但要讓他表達得出談好的結果。
+ *
+ * 用法:在逐人欄位填好「已經談好的那幾個人」,其他勾選的人留空,按這顆。
+ * 空著的那幾個人就均分掉剩下的。
+ *
+ * 和上面的 splitRemainingEqually() 是兩顆不同的按鈕,不是同一個的變形:
+ * 那顆會**覆寫**每個人的金額(全部重新平分),這顆刻意只動留空的人 ——
+ * 已經填好的數字是使用者談出來的結果,按錯一顆就得重談一次。
+ */
+/** 扣掉已經填好的之後,還剩多少可以分。 */
+const restToSplitMinor = computed(() => {
+  const filled = potPicked.value.reduce((sum, id) => sum + Math.max(0, toMinorPot(amountOf(id))), 0);
+  return potRemainingMinor.value - filled;
+});
+/** 要分給誰 —— 勾了但還沒填金額的人。 */
+const restReceivers = computed(() =>
+  potPicked.value.filter(id => toMinorPot(amountOf(id)) <= 0));
+
+/** 不能按「其餘平分」的原因。有值就 disabled,而且要把原因講出來。 */
+const splitRestBlockedReason = computed<string>(() => {
+  const label = CURRENCY_LABEL[potCurrency.value] ?? potCurrency.value;
+  // 剩餘 ≤ 0 的理由和「平分剩餘」完全一樣,不要寫第二份說法。
+  if (potRemainingMinor.value <= 0) return splitBlockedReason.value;
+  if (!potPicked.value.length) return '先勾選要退給誰。';
+  if (!potPerPerson.value) return '先打開「自訂金額」,把已經談好的那幾個人填上去。';
+  if (!restReceivers.value.length) return '每個勾選的人都填了金額,沒有人需要分剩下的。';
+  if (restToSplitMinor.value < 0) {
+    return `已經填掉的金額比${label}剩餘還多 ${formatMoney(-restToSplitMinor.value, potCurrency.value)},`
+      + '先把上面的數字改小。';
+  }
+  if (restToSplitMinor.value === 0) return '剩餘已經被填掉的金額分完了,沒有東西可以再分。';
+  return '';
+});
+
+function splitRestEqually() {
+  if (splitRestBlockedReason.value) return;
+  // 一律走 splitEqually:最大餘數法,保證加起來精確等於要分的金額。
+  const shares = splitEqually(restToSplitMinor.value, restReceivers.value);
+  const next = { ...potAmounts.value };
+  for (const [id, minor] of shares) next[id] = fromMinor(minor, potCurrency.value);
+  potAmounts.value = next;
+  // 分不到錢的人取消勾選,理由同 splitRemainingEqually()。
+  potPicked.value = potPicked.value.filter(
+    id => !restReceivers.value.includes(id) || (shares.get(id) ?? 0) > 0);
+}
+
 /** 送給 API 的 entries。只含勾選、且金額 > 0 的人。 */
 const potEntries = computed(() =>
   potPicked.value
@@ -1058,6 +1116,38 @@ async function confirmDeleteMove() {
                 所以加起來精確等於剩餘 —— 不會有 1 塊錢卡在公費裡歸不了零。
               </template>
             </p>
+
+            <!--
+              第二種分法:「誰只要拿多少,其餘平分」。
+              投入常常不均等,而退還怎麼分是幾個人談出來的結果
+              (某人先走、某人說零頭不用找)。系統不替他假設,
+              但要讓他表達得出來。(為什麼不自動算,見上面 splitRestEqually 的說明。)
+            -->
+            <div class="mt-2.5">
+              <UiAppButton
+                variant="ghost" block
+                :disabled="!!splitRestBlockedReason"
+                @click="splitRestEqually"
+              >
+                <Icon name="lucide:users" />
+                其餘平分
+                <template v-if="!splitRestBlockedReason">
+                  {{ formatMoney(restToSplitMinor, potCurrency) }} 給 {{ restReceivers.length }} 人
+                </template>
+              </UiAppButton>
+              <p
+                class="mt-1.5 text-xs leading-relaxed"
+                :style="{ color: splitRestBlockedReason ? 'var(--warn)' : 'var(--text-muted)' }"
+              >
+                <template v-if="splitRestBlockedReason">{{ splitRestBlockedReason }}</template>
+                <template v-else>
+                  已經談好金額的人照你填的,剩下的
+                  {{ formatMoney(restToSplitMinor, potCurrency) }}
+                  平分給還沒填的那 {{ restReceivers.length }} 個人。
+                  <b>已經填好的數字不會被蓋掉。</b>
+                </template>
+              </p>
+            </div>
           </div>
 
           <p v-if="!people.length" class="mt-2 text-xs" style="color: var(--warn)">

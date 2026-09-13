@@ -61,11 +61,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 await post('/api/admin/sync-rates');
 
 /** 開一趟乾淨的旅程。每個案例都要自己一趟,否則互相污染。 */
-async function newTrip(withPot: boolean) {
+async function newTrip(withPot: boolean, names: string[] = ['A', 'B']) {
   const t = await post('/api/trips', {
     name: `併發測試 ${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     base_currency: 'TWD',
-    members: ['A', 'B'],
+    members: names,
     ...(withPot ? { pot: '公費' } : {}),
   });
   const T = t.json.share_token as string;
@@ -159,32 +159,47 @@ group('[競態] 兩支還款同時打向同一個收款人 —— 不能超過�
 // 所以只要 JS 還在,循序打 API 看不出 SQL 那一半有沒有寫(api.rounds 的 [17]
 // 全綠也不代表 SQL 那道存在)。要分開它們就必須讓兩支請求同時通過 JS。
 //
-// 情境:公費付 4,000 元兩人均分、A 墊 10,000 元兩人均分
-//   → 淨額 A +3,000 / B −7,000 / 公費 +4,000,建議只有 B→A 3,000 元
-//   → B 欠 7,000,所以「2,500 + 2,500」兩支在付款人那一側都過得了
-//   → 但 A 只被欠 3,000,第二支必須被收款人那一側擋掉
-// 少了那個前提:兩支都寫進去 → A 的淨額變成 −2,000 元,憑空多出一筆欠款,
-// 而那 5,000 元裡有 2,000 元本來該回到公費信封。
+// ⚠️ 要測「收款人那一側」,就必須讓**債權分散在多個人身上**——
+// 只有一個債權人的時候 min(欠款, 債權) 兩邊一樣大,收款人那個前提測不到。
+//
+// 公費付的支出**不再製造債權**(它整筆被信封吸收了,見 utils/ledger.ts),
+// 所以這一組改用兩個真人各墊一筆:
+//
+//   公費付 4,000 三人均分   → 完全不進算術(留著是為了證明它真的不影響上限)
+//   A 墊 9,000 三人均分     → 每人分攤 3,000
+//   C 墊 6,000 三人均分     → 每人分攤 2,000
+//   → 淨額 A +4,000 / B −5,000 / C +1,000
+//   → B 欠 5,000,「2,500 + 2,500」兩支在付款人那一側都過得了
+//   → 但 A 只被欠 4,000,第二支必須被收款人那一側擋掉
+//
+// 少了那個前提:兩支都寫進去 → A 的淨額變成 −1,000,憑空多出一筆欠款,
+// 而那 5,000 裡有 1,000 本來該流向 C。
 {
   const ROUNDS = 8;
   const AMOUNT = 250000;        // 每支 2,500 元
-  const CREDIT = 300000;        // A 實際被欠 3,000 元
+  const CREDIT = 400000;        // A 實際被欠 4,000 元
   let negative = 0;             // 收款人淨額變負 = 憑空生出假債務(絕對不能發生)
   let overshoot = 0;            // 記進去的還款總額超過收款人的債權
   let sqlBlocked = 0;           // 由資料庫層那道擋下來的次數(= 兩支都通過了 JS)
   const outcomes: Record<string, number> = {};
 
   for (let k = 0; k < ROUNDS; k++) {
-    const { T, id, potId } = await newTrip(true);
+    const { T, id, potId } = await newTrip(true, ['A', 'B', 'C']);
+    const three = [id.A, id.B, id.C];
     await post(`/api/trips/${T}/expenses`, {
       kind: 'shared', description: '公費早餐', currency: 'TWD', amount: 4000, spent_at: '2026-03-08',
       payers: [{ member_id: potId }],
-      split: { mode: 'equal', members: [id.A, id.B] },
+      split: { mode: 'equal', members: three },
     });
     await post(`/api/trips/${T}/expenses`, {
-      kind: 'shared', description: '晚餐', currency: 'TWD', amount: 10000, spent_at: '2026-03-08',
+      kind: 'shared', description: 'A 墊的晚餐', currency: 'TWD', amount: 9000, spent_at: '2026-03-08',
       payers: [{ member_id: id.A }],
-      split: { mode: 'equal', members: [id.A, id.B] },
+      split: { mode: 'equal', members: three },
+    });
+    await post(`/api/trips/${T}/expenses`, {
+      kind: 'shared', description: 'C 墊的計程車', currency: 'TWD', amount: 6000, spent_at: '2026-03-08',
+      payers: [{ member_id: id.C }],
+      split: { mode: 'equal', members: three },
     });
 
     const pair = await Promise.all([
@@ -206,7 +221,7 @@ group('[競態] 兩支還款同時打向同一個收款人 —— 不能超過�
     const bal = (await get(`/api/trips/${T}/balance`)).json;
     const netA = ((bal.by_currency?.TWD?.nets ?? []) as J[])
       .find((n) => n.memberId === id.A)?.netMinor ?? 0;
-    // A 墊了 10,000 元、自己只該分攤 7,000 元,所以 A 永遠是債權人(淨額 ≥ 0)。
+    // A 墊了 9,000、自己只該分攤 5,000,所以 A 永遠是債權人(淨額 ≥ 0)。
     // 變成負的就代表有一筆還款被記到了他沒有的債權上。
     if (netA < 0) negative++;
     if (pair.filter((r) => r.status === 201).length * AMOUNT > CREDIT) overshoot++;
@@ -356,15 +371,15 @@ group('[競態] 公費投入:併發不能少記或多記');
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[不變量] 公費淨額 = −公費剩餘,在併發之後仍然成立');
+group('[不變量] 兩本帳互不污染,在併發之後仍然成立');
 
-// 這條是整個公費功能的正確性支點,而且是**兩條獨立路徑算同一個數字**:
-// 一邊 pot.by_currency 的三個 SUM 相減,一邊 netBalances 的一堆加減
-// (見 server/utils/ledger.ts 開頭)。稽核找到唯一能讓它失效的路徑是
-// 「把已經有帳的成員改標成公費」,那個現在被 409 擋住了。
+// 使用者的模型是兩本分開的帳(見 server/utils/ledger.ts 開頭):
+//   信封    餘額 = 投入 − 公費付掉的 − 已退還
+//   人對人  公費完全不參與 —— 它不出現在 nets 裡
 //
-// 併發是這裡的重點:退還與結算同時發生時,兩條路徑會在不同的時間點讀資料庫。
-// 不管誰贏,回來的那一份快照裡兩邊都必須對得上。
+// 併發是這裡的重點:退還與結算同時發生時,兩件事會在不同的時間點寫資料庫。
+// 不管誰贏,回來的那一份快照裡「公費不在 nets 裡」都必須成立,
+// 而餘額仍然只由那三個量決定。
 {
   const { T, id, potId } = await newTrip(true);
   await post(`/api/trips/${T}/pot/moves`, {
@@ -386,12 +401,14 @@ group('[不變量] 公費淨額 = −公費剩餘,在併發之後仍然成立');
   const bal = await settlementRows(T);
   const row = (bal.pot?.by_currency ?? []).find((c: J) => c.currency === 'TWD');
   const nets = (bal.by_currency?.TWD?.nets ?? []) as J[];
-  const potNet = nets.find((n) => n.memberId === potId)?.netMinor ?? 0;
-  eq('公費淨額 = −剩餘', potNet, -(row?.remainingMinor ?? 0));
-  eq('Σ(真人淨額) = 剩餘',
-    nets.filter((n) => n.memberId !== potId).reduce((s, n) => s + n.netMinor, 0),
-    row?.remainingMinor);
+  check('公費不在 nets 裡', !nets.some((n) => n.memberId === potId),
+    JSON.stringify(nets));
+  eq('deferred 是空的(沒有任何腿碰到公費)',
+    ((bal.by_currency?.TWD?.deferred ?? []) as J[]).length, 0);
   eq('淨額總和仍為 0', nets.reduce((s, n) => s + n.netMinor, 0), 0);
+  // 公費付掉那 6,000 完全不產生人對人的債 —— 這一趟沒有人自己墊過錢,
+  // 所以不管那次併發誰贏,人對人那一本都是空的。
+  eq('人對人那一本是空的(沒有人自己墊過)', nets.length, 0);
   // 投入 1,600,000 − 花掉 600,000 − 退還(成功的話 200,000)。退還可能被回合擠掉,
   // 所以只斷言「剩餘完全由 pot 的三個量決定」,不去猜那一次併發誰贏。
   eq('剩餘 = 投入 − 花費 − 退還',
@@ -401,7 +418,7 @@ group('[不變量] 公費淨額 = −公費剩餘,在併發之後仍然成立');
 
 group('[防護] 個人花費的付款人不能事後被改成公費');
 
-// 這條路徑會讓「公費淨額 = −剩餘」差掉那筆個人花費的金額,
+// 這條路徑會讓信封的餘額差掉那筆個人花費的金額,
 // 而那筆錢會卡在沒有任何畫面能解決的地方(實測 5,000 卡住):
 // 剩餘說公費花掉了,卻沒有任何人的淨額欠著它。
 {

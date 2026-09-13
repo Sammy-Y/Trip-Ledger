@@ -7,20 +7,18 @@ import type { Net, Transfer } from '../../../utils/settle';
 import type { PotCurrency, PotSummary } from '../../../../shared/types';
 
 /**
- * 公費的收支明細,逐幣別分開。**這一段刻意完全不受結算語意的改動影響。**
+ * 公費的收支明細,逐幣別分開 —— **信封那一本帳**(見 utils/ledger.ts 開頭)。
  *
- * 剩餘 = 投入 − 公費付掉的 − 已退還。
+ *   剩餘 = 投入 − 公費付掉的 − 已退還
  *
- * ⚠️ 這裡是「剩餘」的**第一條**計算來源 —— 總覽頁就靠 remainingMinor 顯示。
+ * 這是「剩餘」唯一的計算來源,而且它**完全獨立於結算的算術**:
+ * utils/ledger.ts 只算人對人那一本,公費從頭到尾不出現在它的 nets 裡。
+ * 兩本帳互不影響,正是使用者描述的模型 ——
+ * 「A 先墊錢就是 A 墊錢,跟公費沒關係,不會變多也不會變少」。
  *
- * 第二條在 utils/ledger.ts:淨額含投入 / 退還之後,
- *
- *   公費淨額 === −remainingMinor
- *
- * 一邊是這裡三個 SUM 直接相減,一邊是那裡經過 netBalances 的一堆加減。
- * 兩條路徑互不相干卻必須給出同一個數字,對不上就代表有東西記錯了 ——
- * 最常見的是公費替自己分攤了一份,或有人把已經有帳的成員改標成公費。
- * (test/ledger.test.ts 的定理一把這條當成不變量在守。)
+ * 所以這裡沒有第二條路徑可以交叉對照,那是刻意的取捨:
+ * 換來的是信封變成一個可以獨立對帳的現金餘額(投入多少、花掉多少、退了多少),
+ * 而不是一個要靠淨額反推、會隨著誰欠誰而改變的量。
  */
 async function potSummary(dbh: D1Database, tripId: string): Promise<PotSummary | null> {
   const pot = await dbh.prepare(
@@ -43,10 +41,8 @@ async function potSummary(dbh: D1Database, tripId: string): Promise<PotSummary |
     ).bind(tripId, pot.id).all<{ currency: string; member_id: string; amt: number }>(),
     // 公費付掉的支出。
     //
-    // ⚠️ `kind = 'shared'` 不能省。utils/ledger.ts 的淨額只算 shared,
-    // 這裡如果連 personal 一起算,`公費淨額 = −剩餘` 這條對照就會差掉
-    // 那筆個人花費的金額,而且那筆錢會卡在沒有任何畫面能解決的地方:
-    // 剩餘說公費花掉了 5,000,卻沒有任何人的淨額欠著這 5,000(實測出來的)。
+    // ⚠️ `kind = 'shared'` 不能省。個人花費不該由公費出(expenses.post 擋著),
+    // 這裡連 personal 一起算的話,剩餘會莫名少一截而畫面上找不到出處。
     //
     // expenses.post 會擋「公費當個人花費付款人」,但那只在**寫入當下有公費**才擋得到;
     // 先記帳、之後才把某個成員標成公費的話就繞過去了(見 members/[id].patch.ts)。
@@ -119,11 +115,9 @@ export default defineEventHandler(async (event) => {
 
   const rows = shareRows.results ?? [];
 
-  // 對外的形狀保持不變(nets / transfers),recorded / deferred 額外附上 ——
-  // 結算頁要能把「公費的腿」標成唯讀,不要讓人以為那筆現在就該轉。
-  //
-  // 公費仍然出現在 nets 裡(值 = −公費剩餘),由前端自己決定要不要顯示 ——
-  // 少了它淨額就不是零和,而 minCashFlow 對非零和輸入會靜靜少算一筆錢。
+  // 對外的形狀保持不變(nets / transfers / recorded / deferred)。
+  // 公費**不在 nets 裡**(見 utils/ledger.ts:它那一本帳裡沒有公費),
+  // 所以 deferred 恆為空 —— 那兩個欄位留著當防線,不是功能。
   const byCurrency: Record<string, {
     nets: Net[]; transfers: Transfer[]; recorded: Transfer[]; deferred: Transfer[];
   }> = {};

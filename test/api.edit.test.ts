@@ -583,13 +583,18 @@ group('[8] 公費的三條規則,PATCH 同樣要守');
   const pot = ((bal.json.pot?.by_currency ?? []) as J[]).find((r) => r.currency === 'JPY');
   eq('公費付掉的金額跟著變成 3000', pot?.spentMinor, 3000);
   eq('公費剩餘 = −3000(還沒有人投入)', pot?.remainingMinor, -3000);
-  // 「公費淨額 = −公費剩餘」是這個 App 的核心不變量(見 server/utils/ledger.ts 開頭),
-  // 編輯支出之後也必須成立 —— 編輯改的是 spentMinor,剩餘與淨額要一起跟著動。
-  // ⚠️ 這一組沒有人投入也沒有退還,所以 剩餘 = −花費,兩種寫法在數值上相同。
-  // 盯的是 remainingMinor 那一條:它才是支點,而且它涵蓋投入 / 退還的情況。
-  const potNet = (await netsOf(c.T, 'JPY')).get(potId) ?? 0;
-  eq('公費淨額 = −剩餘,不變量還在', potNet, -(pot?.remainingMinor ?? 0));
-  eq('編輯之後也是 3000', potNet, 3000);
+  /*
+    編輯一筆**公費付的**支出,動到的只有信封那一本:spentMinor 從 5,000 變成 3,000,
+    剩餘跟著從 −5,000 變成 −3,000。人對人那一本**完全不受影響** ——
+    公費付的支出整筆不進算術(見 server/utils/ledger.ts 的兩本帳),
+    所以這一趟到現在沒有任何人欠任何人。
+
+    這一條是「編輯不會把兩本帳攪在一起」的守門:改錯的話會冒出一個
+    莫名其妙的淨額,而畫面上完全找不到它的出處。
+  */
+  const netsAfterEdit = await netsOf(c.T, 'JPY');
+  check('公費不在淨額裡', !netsAfterEdit.has(potId), JSON.stringify([...netsAfterEdit]));
+  eq('人對人那一本是空的(這一趟只有公費付過錢)', netsAfterEdit.size, 0);
   eq('兩人各分攤 1500', lines((await one(c.T, eid))?.shares, c), ['喧 1500', '民 1500']);
 }
 

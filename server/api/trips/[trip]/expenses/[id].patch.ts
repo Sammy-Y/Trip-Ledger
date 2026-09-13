@@ -236,6 +236,25 @@ export default defineEventHandler(async (event) => {
     }
   }
 
+  /*
+    ── 一筆支出不能「公費和人一起付」──────────────────────────
+    公費付掉的支出在結算的算術裡是**整筆排除**的(見 utils/ledger.ts:
+    信封已經吸收了它,不產生任何人對人的債)。所以「公費付 6,000、A 付 4,000」
+    這種混合付款沒有一個說得通的意思:A 那 4,000 到底算不算他墊的?
+    算的話就要把分攤按比例拆開,那是一條沒有人需要、卻會多出一堆四捨五入
+    邊界的路;不算的話 A 就白墊了。
+
+    UI 做不出這種資料(「這筆從公費付」會把付款人整個換成公費),
+    所以擋在這裡只是把既有的事實寫成規則 —— 而不是靠「使用者點不到」。
+  */
+  if (potId && b.payers.length > 1 && b.payers.some((p) => p.member_id === potId)) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: '一筆支出不能由公費和人一起付 —— 要嘛整筆從公費出,'
+        + '要嘛記成人墊的。公費付掉的部分請另外記一筆。',
+    });
+  }
+
   if (potId && b.kind === 'personal' && b.payers.some((p) => p.member_id === potId)) {
     throw createError({
       statusCode: 400,

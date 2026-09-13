@@ -5,8 +5,8 @@
  *   pnpm test:features
  *
  * 涵蓋:
- *   - 公費（is_pot）:唯一性、投入/支出/退還的收支、公費淨額 = −公費剩餘
- *     （淨額含投入/退還 —— 見 server/utils/ledger.ts 開頭）
+ *   - 公費（is_pot）:唯一性、投入/支出/退還的收支、公費完全不進結算的算術
+ *     （兩本分開的帳 —— 見 server/utils/ledger.ts 開頭）
  *   - 成員改名 / 刪除:有帳的人不准刪（否則 CASCADE 會無聲破壞守恆）
  *   - 刷卡手續費 fx_markup_pct:預設值、自訂值、本位幣歸零、範圍驗證
  *   - 預約:訂位時間與開放時間是兩個獨立欄位、PATCH 改訂位、訂位名字/人數
@@ -127,23 +127,22 @@ check('每筆投入都是 ¥10,000',
   (jpyPot?.contributions ?? []).every((c: J) => c.amountMinor === 10000),
   JSON.stringify(jpyPot?.contributions));
 
-// ── 淨額含投入 / 退還(見 server/utils/ledger.ts 開頭)────────────
+// ── 兩本帳:公費完全不進結算的算術(見 server/utils/ledger.ts 開頭)────
 //
-// 支點不變量是「公費淨額 === −剩餘」,而它是**兩條獨立路徑算同一個數字**:
-//   一邊 pot.by_currency 的三個 SUM 相減,一邊 netBalances 的一堆加減。
-// 推論:Σ(真人淨額) === 剩餘 —— 信封裡的現金就是大家還沒拿回去的那筆。
+// 這一趟**沒有人自己墊過錢** —— 兩筆共同支出都是公費付的,而公費付的支出
+// 整筆被信封吸收,不產生任何人對人的債。所以人對人那一本是空的。
+//
+// 投入也不進淨額:「A 先墊錢就是 A 墊錢,跟他拿出多少公費沒關係」。
+// 少了這條,兩個各投 ¥10,000 的人會被算成「應付 −5,000」——
+// 對著已經先付過錢的人說他還欠錢。
 const jpyNets = new Map<string, number>(
   (bal.json.by_currency?.JPY?.nets ?? []).map((n: J) => [n.memberId, n.netMinor]));
-eq('公費淨額 = −剩餘', jpyNets.get(id['公費']), -(jpyPot?.remainingMinor ?? 0));
-eq('Σ(真人淨額) = 剩餘',
-  [...jpyNets].filter(([m]) => m !== id['公費']).reduce((a, [, v]) => a + v, 0),
+check('公費不在淨額裡', !jpyNets.has(id['公費']), JSON.stringify([...jpyNets]));
+eq('人對人那一本是空的 —— 沒有人自己墊過', jpyNets.size, 0);
+eq('deferred 也是空的', (bal.json.by_currency?.JPY?.deferred ?? []).length, 0);
+eq('剩餘 ¥10,000 只由信封那三個量決定,和淨額無關',
+  (jpyPot?.contributedMinor ?? 0) - (jpyPot?.spentMinor ?? 0) - (jpyPot?.refundedMinor ?? 0),
   jpyPot?.remainingMinor);
-eq('日幣淨額總和為 0', [...jpyNets.values()].reduce((a, b) => a + b, 0), 0);
-
-// 各投 ¥10,000、消費 ¥5,000 → 每個人還有 ¥5,000 在信封裡。
-// 少算投入的話這裡會是 −5000/−5000:兩個先付過錢的人被算成欠錢。
-eq('民的淨額 +5000(投入 10,000 − 分攤 5,000)', jpyNets.get(id['民']), 5000);
-eq('喧的淨額 +5000', jpyNets.get(id['喧']), 5000);
 
 group('[公費] 退還');
 const refund = await post(`/api/trips/${T}/settlements`, {
@@ -160,14 +159,14 @@ eq('退還紀錄一筆', jpyPot2?.refunds?.length, 1);
 
 const jpyNets2 = new Map<string, number>(
   (bal2.json.by_currency?.JPY?.nets ?? []).map((n: J) => [n.memberId, n.netMinor]));
-// 退還是公費 → 人:民 把他在信封裡的 5,000 拿回去了,所以他歸零,
-// 而公費欠大家的從 10,000 降到 5,000。**兩邊必須同時動**——
-// 只算一邊的話零和就破了(這一條是「只處理投入、忘了處理退還」的專屬陷阱)。
-eq('退還後 民歸零(他在信封裡的錢拿回來了)', jpyNets2.get(id['民']) ?? 0, 0);
-eq('退還後 喧還是 +5000(他的還在信封裡)', jpyNets2.get(id['喧']), 5000);
-eq('退還後 公費淨額 = −剩餘', jpyNets2.get(id['公費']), -(jpyPot2?.remainingMinor ?? 0));
-eq('退還後淨額總和還是 0', [...jpyNets2.values()].reduce((a, b) => a + b, 0), 0);
-eq('剩餘降到 ¥5,000', jpyPot2?.remainingMinor, 5000);
+// 退還是把現金從信封搬回某個人手上,**不是還款** —— 所以人對人那一本
+// 一個位元都不該動。這一條同時守「只排投入、忘了排退還」那個專屬陷阱:
+// 那種寫法下民的淨額會突然變成 −5,000。
+eq('退還後 人對人那一本還是空的', jpyNets2.size, 0);
+eq('退還後淨額逐位元不變',
+  JSON.stringify(bal2.json.by_currency?.JPY?.nets ?? []),
+  JSON.stringify(bal.json.by_currency?.JPY?.nets ?? []));
+eq('變的只有信封:剩餘降到 ¥5,000', jpyPot2?.remainingMinor, 5000);
 
 group('[公費] 沒設公費的旅程 pot = null');
 const noPotTrip = await post('/api/trips', {

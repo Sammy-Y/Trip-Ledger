@@ -461,20 +461,20 @@ group('[6] 金額不合法 → 400');
 }
 
 // ═══════════════════════════════════════════════════════════════
-group('[7] 改公費金流會等量移動淨額,而且支點不變量一步都不能鬆');
+group('[7] 改公費金流**完全不影響**人對人的淨額');
 // ═══════════════════════════════════════════════════════════════
 //
-// 投入 / 退還進淨額(見 server/utils/ledger.ts 開頭),所以把一筆投入從
-// 30,000 改成 9,000,投的人的淨額必須剛好掉 21,000、公費剛好升 21,000 ——
-// 不多不少。這一組守兩件事:
+// 使用者的模型:「A 先墊錢,但就是 A 墊錢,跟公費沒關係,不會變多,不會變少,
+// 也跟 A 拿出多少公費沒關係。」(見 server/utils/ledger.ts 開頭的兩本帳)
 //
-//   ① 移動量精確:漏掉某條路徑的話,差額會變成某個人莫名多出來的欠款
-//   ② `公費淨額 === −剩餘` 在改動前後都成立 —— 兩條獨立路徑不能在這裡分岔
+// 所以把一筆投入從 30,000 改成 9,000,**結算頁要一動也不動** ——
+// 動了就代表信封那一本污染了人對人那一本,而症狀是某個人的欠款
+// 莫名多出或少掉一截,畫面上完全找不到出處。
 //
-// 順帶守一條:**人對人的債和信封無關**。民 墊的晚餐讓 喧 欠他 13,000,
-// 那筆債不會因為 民 多投或少投公費而改變,所以 recorded 前後必須一模一樣。
+// 這一組同時守另一半:公費**付掉**的支出也不進算術。
+// 下面那筆「公費付早餐 6,000」對三個人的淨額一毛影響都沒有。
 {
-  const c = await mkTrip('P7 淨額隨投入移動', ['民', '喧'], '公費');
+  const c = await mkTrip('P7 淨額不受公費影響', ['民', '喧'], '公費');
   eq('民墊晚餐 ¥20,000 兩人均分 → 201', (await yen(c.T, {
     description: '晚餐', amount: 20000,
     payers: [{ member_id: c.id['民'] }],
@@ -491,38 +491,41 @@ group('[7] 改公費金流會等量移動淨額,而且支點不變量一步都�
   const b0 = await potOf(c.T);
   const n0 = netsOf(b0.bal);
   const t0 = transfersOf(b0.bal, c);
-  // 民:墊 20,000 − 分攤 13,000 + 投入 30,000 = +37,000
-  eq('淨額:民 +37,000 / 喧 −13,000 / 公費 −24,000',
-    [n0.get(c.id['民']), n0.get(c.id['喧']), n0.get(c.id['公費'])], [37000, -13000, -24000]);
-  eq('剩餘 30,000 − 6,000 = 24,000', b0.row.remainingMinor, 24000);
-  eq('公費淨額 = −剩餘', n0.get(c.id['公費']), -b0.row.remainingMinor);
-  eq('recorded:喧→民 ¥13,000(人對人的債)', t0, ['喧→民 13000']);
+  // 民:墊 20,000 − 分攤 10,000 = +10,000。**公費付的 6,000 和投入的 30,000 都不在裡面。**
+  eq('淨額只反映「民墊的那一筆」:民 +10,000 / 喧 −10,000',
+    [n0.get(c.id['民']), n0.get(c.id['喧'])], [10000, -10000]);
+  check('公費不在淨額裡', !n0.has(c.id['公費']), JSON.stringify([...n0]));
+  eq('recorded:喧→民 ¥10,000', t0, ['喧→民 10000']);
+  eq('信封餘額 30,000 − 6,000 = 24,000', b0.row.remainingMinor, 24000);
 
+  // ── 核心:動信封,人對人那一本逐位元不變 ───────────────────────
   const mv = (await listMoves(c.T)).moves[0]!;
   eq('把投入從 30,000 改成 9,000 → 200',
     (await patch(`/api/trips/${c.T}/pot/moves/${mv.id}`, { amount_minor: 9000 })).status, 200);
 
   const b1 = await potOf(c.T);
-  const n1 = netsOf(b1.bal);
-  // 少投 21,000 → 民 −21,000、公費 +21,000,其他人一動也不動。
-  eq('民 掉 21,000、公費 升 21,000、喧 完全不動',
-    [n1.get(c.id['民']), n1.get(c.id['喧']), n1.get(c.id['公費'])], [16000, -13000, -3000]);
-  eq('移動量剛好是 21,000',
-    [(n0.get(c.id['民']) ?? 0) - (n1.get(c.id['民']) ?? 0),
-      (n1.get(c.id['公費']) ?? 0) - (n0.get(c.id['公費']) ?? 0)], [21000, 21000]);
-  eq('淨額總和仍為 0', [...n1.values()].reduce((s, v) => s + v, 0), 0);
-  eq('剩餘:9,000 − 6,000 = 3,000', b1.row.remainingMinor, 3000);
-  eq('公費淨額 = −剩餘(改完之後仍然成立)', n1.get(c.id['公費']), -b1.row.remainingMinor);
-  // 人對人的那筆債和信封無關 —— 民 投多投少都不改變 喧 欠他多少。
-  eq('recorded 一模一樣', transfersOf(b1.bal, c), t0);
+  eq('淨額**逐位元**不變',
+    JSON.stringify(b1.bal.by_currency?.JPY?.nets ?? []),
+    JSON.stringify(b0.bal.by_currency?.JPY?.nets ?? []));
+  eq('轉帳建議一模一樣', transfersOf(b1.bal, c), t0);
+  eq('變的只有信封:9,000 − 6,000 = 3,000', b1.row.remainingMinor, 3000);
 
-  eq('刪掉那筆投入 → 409(剩餘會變 −6,000)',
-    (await del(`/api/trips/${c.T}/pot/moves/${mv.id}`)).status, 409);
+  // 退還同理 —— 「只處理投入、忘了處理退還」是這一類最容易犯的錯。
+  eq('公費退還民 ¥1,000 → 201',
+    (await moveOut(c.T, [{ member_id: c.id['民'], amount_minor: 1000 }])).status, 201);
   const b2 = await potOf(c.T);
-  const n2 = netsOf(b2.bal);
-  eq('被擋下來之後淨額一個字都沒動',
-    [n2.get(c.id['民']), n2.get(c.id['喧']), n2.get(c.id['公費'])], [16000, -13000, -3000]);
-  eq('剩餘也沒動', b2.row.remainingMinor, 3000);
+  eq('退還之後淨額還是逐位元不變',
+    JSON.stringify(b2.bal.by_currency?.JPY?.nets ?? []),
+    JSON.stringify(b0.bal.by_currency?.JPY?.nets ?? []));
+  eq('信封降到 2,000', b2.row.remainingMinor, 2000);
+
+  eq('刪掉那筆投入 → 409(剩餘會變 −7,000)',
+    (await del(`/api/trips/${c.T}/pot/moves/${mv.id}`)).status, 409);
+  const b3 = await potOf(c.T);
+  eq('被擋下來之後淨額也沒動',
+    JSON.stringify(b3.bal.by_currency?.JPY?.nets ?? []),
+    JSON.stringify(b0.bal.by_currency?.JPY?.nets ?? []));
+  eq('剩餘也沒動', b3.row.remainingMinor, 2000);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -688,9 +691,11 @@ group('[9] 公費超支之後,修正帳的那些編輯不可以被鎖死');
 
   const before = await potOf(c.T);
   eq('公費現在超支 ¥10,000', before.row.remainingMinor, -10000);
-  // 超支本身是合法狀態,不是壞掉 —— 支點不變量照樣成立。
-  eq('公費淨額 = −剩餘(超支時也成立)',
-    netsOf(before.bal).get(c.id['公費']), 10000);
+  // 超支是信封那一本的狀態,人對人那一本完全不知道它的存在 ——
+  // 這一趟沒有人自己墊過錢,所以結算頁是空的。
+  check('公費不在淨額裡', !netsOf(before.bal).has(c.id['公費']),
+    JSON.stringify([...netsOf(before.bal)]));
+  eq('人對人那一本是空的(沒有人自己墊過)', netsOf(before.bal).size, 0);
 
   const mv = (await listMoves(c.T)).moves[0]!;
   // 核心斷言:改成事實(10,000)之後剩餘還是負的(−5,000),但它**變好了** → 必須放行。
@@ -699,11 +704,8 @@ group('[9] 公費超支之後,修正帳的那些編輯不可以被鎖死');
   eq('那一列真的改到了', rowAmount(mv.id), 10000);
 
   const after = await potOf(c.T);
-  eq('剩餘從 −10,000 回到 −5,000', after.row.remainingMinor, -5000);
-  // 民 的淨額要跟著事實走:− 分攤 7,500 + 投入 10,000 = +2,500
-  eq('民 +2,500(改動前是 −2,500,差的就是那筆漏記的 5,000)',
-    netsOf(after.bal).get(c.id['民']), 2500);
-  eq('公費淨額 = −剩餘', netsOf(after.bal).get(c.id['公費']), 5000);
+  eq('剩餘從 −10,000 回到 −5,000(缺口變小了)', after.row.remainingMinor, -5000);
+  eq('人對人那一本一個字都沒動', netsOf(after.bal).size, 0);
 
   // 反方向仍然要擋:把投入改小會讓缺口更大。
   const worse = await patch(`/api/trips/${c.T}/pot/moves/${mv.id}`, { amount_minor: 3000 });
@@ -738,9 +740,9 @@ group('[9] 公費超支之後,修正帳的那些編輯不可以被鎖死');
 
   const before = await potOf(c.T);
   eq('公費超支 ¥9,000', before.row.remainingMinor, -9000);
-  // 民:− 分攤 7,500 + 投入 10,000 − 收到退還 4,000 = −1,500。事實應該是 +2,500。
-  eq('民 −1,500 —— 那 ¥4,000 是他從來沒拿到的錢',
-    netsOf(before.bal).get(c.id['民']), -1500);
+  // 那筆從沒發生的退還只弄壞信封的餘額(少了 4,000),人對人那一本不受影響。
+  // 但餘額錯了一樣要命:總覽會據此叫人再投入,而那是他不欠的錢。
+  eq('人對人那一本是空的', netsOf(before.bal).size, 0);
 
   const out = (await listMoves(c.T)).moves.find((m) => m.direction === 'out')!;
   const gone = await del(`/api/trips/${c.T}/pot/moves/${out.id}`);
@@ -748,9 +750,8 @@ group('[9] 公費超支之後,修正帳的那些編輯不可以被鎖死');
   eq('那一列真的不在了', rowAmount(out.id), null);
 
   const after = await potOf(c.T);
-  eq('剩餘從 −9,000 回到 −5,000', after.row.remainingMinor, -5000);
-  eq('民 回到事實的 +2,500', netsOf(after.bal).get(c.id['民']), 2500);
-  eq('公費淨額 = −剩餘', netsOf(after.bal).get(c.id['公費']), 5000);
+  eq('剩餘從 −9,000 回到 −5,000(那 4,000 回到信封裡)', after.row.remainingMinor, -5000);
+  eq('人對人那一本還是空的', netsOf(after.bal).size, 0);
 }
 
 {
@@ -799,24 +800,16 @@ group('[10] 退還走 /settlements 也要有資料庫層的上限');
   eq('settlements 只多一列(投入 + 一筆退還)', countSettlements(c.tripId), 2);
 
   const after = await potOf(c.T);
-  const nets = netsOf(after.bal);
   eq('剩餘歸零,沒有變成負的', after.row.remainingMinor, 0);
-  eq('公費淨額 = −剩餘', nets.get(c.id['公費']) ?? 0, 0);
-
   /*
-    「錢有沒有被憑空生出來」要看**喧被要求吐出多少**,不是看 recorded 是不是空的。
-    喧→民 ¥10,000 本身是**正確**的:民 把 1 萬放進信封,信封把那 1 萬給了喧,
-    喧 當然欠 民 1 萬(這一組完全沒有共同支出)。
-
-    重複寫入的樣子是同一條 recorded **再加上**一條 deferred「喧→公費 ¥10,000」——
-    喧 只從信封拿過一次 1 萬,卻被要求總共吐出 2 萬。所以斷言要下在
-    「喧 的淨額」和「兩堆腿加起來」,那才分得出一次和兩次。
+    重複退還的症狀在**信封**那一本:剩餘會變成 −10,000 —— 信封付出去的
+    比它手上有的多 10,000,而那 10,000 是憑空生出來的現金。
+    (退還不進淨額,所以人對人那一本看不出差別 —— 這也是為什麼上面那兩條
+     `remainingMinor` 的斷言才是這一組真正的守門,而不是看轉帳建議。)
   */
-  eq('民 +10,000 / 喧 −10,000(不是 −20,000)',
-    [nets.get(c.id['民']), nets.get(c.id['喧'])], [10000, -10000]);
-  eq('人對人的建議就是那一筆 ¥10,000', transfersOf(after.bal, c), ['喧→民 10000']);
-  eq('沒有多出一條「喧還要補進信封」的腿',
-    ((after.bal.by_currency?.JPY?.deferred ?? []) as J[]).length, 0);
+  eq('投入合計還是 ¥10,000', after.row.contributedMinor, 10000);
+  eq('退還合計就是那一筆 ¥10,000(不是 20,000)', after.row.refundedMinor, 10000);
+  eq('人對人那一本沒有被波及(這一趟沒有共同支出)', netsOf(after.bal).size, 0);
 }
 
 process.exit(summary() > 0 ? 1 : 0);

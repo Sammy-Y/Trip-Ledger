@@ -34,74 +34,57 @@ import { netBalances, minCashFlow, type Net, type Transfer } from './settle';
  * 所以把舊帳一起算進來是**可證明的無操作**,而且順手讓
  * 「吸收手動還款」「補登過去日期的支出」「非後進先出地撤銷回合」三件事全部免費變安全。
  *
- * ══ 淨額**含**投入公費 / 公費退還 ═══════════════════════════
+ * ══ 兩本帳,公費完全不進結算的算術 ══════════════════════════
  *
- *   淨額 = Σ(這個人為共同花費付掉的) − Σ(這個人該分攤的)
- *          + Σ(他付出去的 settlement) − Σ(他收到的 settlement)
+ * 使用者的心智模型(這是規格,不是實作細節):
  *
- * settlements 一律照算,**包含任一端是公費的那些**:投入(人→公費)算他付出去,
- * 退還(公費→人)算他收到。人對人的還款當然也算。
+ *   信封   大家一開始各拿一筆錢出來放進去。之後**用公費付的**支出就直接
+ *          從餘額扣掉,不追究那一筆是誰用的。
+ *            餘額 = 投入 − 公費付掉的 − 已退還
+ *          旅程結束把餘額分回去(分法由使用者自己決定,見 overview.vue 的退還)。
  *
- * 為什麼要算:公費就是一個信封,大家先把錢放進去,之後直接從裡面付。
- * 投入是這個人真真實實掏出去的錢,和他刷卡墊一頓飯沒有任何差別 ——
- * 少算它,結算就會對著一個已經先付過錢的人說他還欠錢。實測過的例子:
+ *   人對人  「A 先墊了錢」就是 A 和其他人之間的事,**跟公費一點關係都沒有**——
+ *          不會因為 A 投了多少公費而變多或變少。
+ *            淨額 = 他為「人付的」共同花費墊掉的 − 他在那些支出裡的分攤
+ *                   + 他付出去的人對人還款 − 他收到的人對人還款
  *
- *     MIN 投入 ¥20,000、Hsuan 投入 ¥15,000,公費付掉 ¥15,000 兩人均分。
- *     不算投入 →  MIN −7,500   Hsuan −7,500                (兩個人都「應付」)
- *     算投入   →  MIN +12,500  Hsuan +7,500  公費 −20,000
+ * 所以這個模組**只算人對人那一本**,而且公費從頭到尾不會出現在 nets 裡:
  *
- * 上面那排負數是錯的:兩個人各自先掏了 2 萬和 1.5 萬進信封,信封裡還躺著
- * ¥20,000 現金,沒有任何人欠任何人。把投入拿掉之後每個人的淨額就不再是
- * 「他這趟的收支」,而是「他還欠信封多少」—— 那個量在畫面上長得和欠款
- * 一模一樣,卻不能拿去跟人要錢。極端一點更明顯:MIN 一個人投 5 萬、Hsuan 投 0,
- * 不算投入的話畫面會叫**出了全部錢的那個人**再付一次給信封。
+ *   ① 公費付掉的支出:整筆排除(付款那一邊、分攤那一邊都排)。
+ *      它已經被信封吸收了 —— 記一筆的當下就從餘額扣掉,沒有人欠任何人。
+ *   ② 投入 / 退還:排除(任一端是公費的 settlement)。
+ *      投入是「把現金放進信封」,不是還款。
  *
- * 三個不變量:
- *   ① Σ(所有淨額) = 0          settlement 是對稱的兩腿,一加一減
- *   ② 公費淨額 = −公費剩餘      公費淨額 = 花掉 + 退還 − 投入 = −(投入 − 花掉 − 退還)
- *   ③ Σ(真人淨額) = 公費剩餘    由 ① ② 得到
+ * 於是 Σ(淨額) = 0 只涵蓋真人,而且成立得很直接:每一筆進入算術的支出,
+ * 付款合計 == 分攤合計 == 金額,人對人的還款是對稱的兩腿。
  *
- * ② 是這套語意的正確性支點,而且是**兩條完全獨立的路徑算同一個數字**:
- * 一邊是 balance.get.ts 的 potSummary 從三個 SUM 直接減出來,
- * 一邊是這裡經過 netBalances 的一堆加減。對不上就代表有東西記錯了 ——
- * 最常見的是公費替自己分攤了一份,或有人把已經有帳的成員改標成公費。
+ * ── 為什麼不是「把公費當成一個成員一起算」──────────────────
  *
- * ══ 公費有剩餘的時候,那筆錢還沒有要退 ══════════════════════════
+ * 試過那個做法(把投入算進淨額、公費當完整成員、它的腿標成 deferred)。
+ * 算術是對的 —— 每個人最後掏出的錢分毫不差等於他該分攤的。但它**把人對人的債
+ * 偷偷改道走信封**,而那正好違反上面那條規格:
  *
- * ③ 的直接後果:旅程進行到一半,真人的淨額加起來會等於信封裡的現金,
- * 而那筆錢明天還要拿去買車票。看起來像是「大家都有錢可以收」,實際上不能收。
+ *   三人各投 5,000(信封 15,000,一毛沒花),A 自己墊了 3,000 的飯三人均分
+ *     那個做法  人對人「不用轉帳」,改成信封退 A 7,000 / B 4,000 / C 4,000
+ *     這一版    B→A 1,000、C→A 1,000,信封照舊各退 5,000
  *
- * 這個誤會要用**顯示**解決,不能用算術解決:公費的腿一律是 deferred
- * (下一段),畫面上講的是「旅程結束時退還」,永遠不是「現在去把錢要回來」。
- * 曾經試過相反的做法 —— 把投入 / 退還整個從淨額裡拿掉,讓剩餘不進結算算術。
- * 那確實讓剩餘消失了,代價是每個人的淨額同時失去意義(就是上面那排負數),
- * 而那個代價遠大於它想擋的誤會。線劃在「寫不寫進 settlements」,
- * 不是劃在「算不算進淨額」。
+ * 兩種走法最後每個人都掏 1,000,錢沒有算錯。但前者會在畫面上寫
+ * 「人跟人之間不用轉帳」,而事實是 B 和 C 各欠 A 一千 —— 那不是簡化,是說謊。
+ * 而且它讓「信封要退多少給誰」變成取決於誰欠誰,信封就再也不是一個
+ * 可以獨立對帳的現金餘額了。
  *
- * ══ 公費在算術裡是完整成員,只在輸出時被排除 ═══════════════════
+ * ── 那「公費付的支出」的 shares 還有什麼用 ─────────────────
  *
- * 公費(is_pot)必須參與 netBalances,否則淨額加起來不等於 0,
- * 而 minCashFlow 對非零和輸入會**靜靜回傳不完整的轉帳清單**
- * (settle.ts 的 `if (credit <= 0 || debt >= 0) break`)—— 錢就這樣無聲消失。
+ * 純顯示。它讓明細頁答得出「這筆是哪幾個人一起用的」,但**不進任何算術**——
+ * 信封的錢是共有的,花掉就是花掉。這也是為什麼公費付的支出在明細頁
+ * 不列分攤清單(見 ExpenseDetail 的 paidByPot)。
  *
- * 但公費的腿不能寫成真的轉帳,兩個方向都不行:
+ * ══ deferred 永遠是空的(欄位留著,是防線不是功能)═══════════
  *
- *   剩餘 > 0(常態)  公費淨額 < 0 ⇒ 腿是「公費 → 人 X 元」=「結束時退還 X」。
- *                    寫下去等於第一晚就把信封清空退還,而那筆錢明天還要用。
- *   剩餘 < 0(超支)  公費淨額 > 0 ⇒ 腿是「人 → 公費 X 元」=「還要再投入 X」。
- *                    寫下去等於**幫他記了一筆他沒付的投入**:信封裡憑空多出 X 元,
- *                    總覽的剩餘據此叫下一個人少投、或多退還給別人。
- *
- * 方向相反,結論一樣:公費的腿一律不寫。投入與退還都是使用者自己在總覽頁
- * 按下去的動作,那一按代表現金真的換了手,不是系統替他假設的。
- *
- * 所以輸出分兩堆:
- *   recorded  兩端都不是公費 → 這才是回合要寫進 settlements 的
- *   deferred  任一端是公費   → 唯讀顯示,永遠不寫入(投入/退還都在總覽頁處理)
- *
- * 這樣安全的理由是 minCashFlow 的**單邊性**:每個成員只會出現在轉帳的一側
- * (債權人永遠是收款方、債務人永遠是付款方)。所以丟掉公費的腿之後,
- * 剩下的人身上的殘額**同號**,不會有人被多要錢也不會有人被多付錢。
+ * 公費不在 nets 裡 ⇒ minCashFlow 不可能吐出碰到公費的腿 ⇒ deferred 恆為 []。
+ * 那兩個欄位(recorded / deferred)因此留著當**防線**:萬一哪天有人讓公費
+ * 重新進了 nets,它的腿會落進 deferred 而不是被結算回合寫成真的轉帳。
+ * 免費的保險,不要拿掉。
  */
 
 /*
@@ -115,15 +98,15 @@ import { netBalances, minCashFlow, type Net, type Transfer } from './settle';
 export interface LedgerBlock {
   currency: string;
   /**
-   * 含公費的完整淨額(加起來必為 0)。
-   * **含投入公費 / 公費退還** —— 見開頭那段。公費那一列的值 = −公費剩餘。
+   * 人對人的淨額,加起來必為 0。**公費不在裡面**(見開頭那段):
+   * 公費付掉的支出整筆排除、投入 / 退還也排除。
    */
   nets: Net[];
-  /** 含公費腿的完整轉帳建議 */
+  /** 轉帳建議。公費不在 nets 裡,所以這些的兩端一定都是真人 */
   transfers: Transfer[];
-  /** 兩端都不是公費 —— 結算回合只寫這些 */
+  /** 兩端都不是公費 —— 結算回合只寫這些。實務上 === transfers */
   recorded: Transfer[];
-  /** 任一端是公費 —— 只顯示,不寫入 */
+  /** 任一端是公費 —— **恆為空**,留著當防線(見開頭最後一段) */
   deferred: Transfer[];
 }
 
@@ -150,17 +133,39 @@ export async function tripLedger(
   // 不拼接 WHERE(見 test/sql-safety.test.ts)。
   const curArg = currency ?? null;
 
-  const [paid, owed, settled, pot] = await Promise.all([
+  /*
+    ⚠️ 下面 paid 與 owed 兩句各有一段一模一樣的
+    `AND NOT EXISTS (... m.is_pot = 1)` —— 那是「這筆是公費付的就整筆排除」。
+    **兩邊必須逐字相同**:只排付款那一邊的話,公費付的支出會留下一堆沒有
+    對應付款的分攤,淨額就不是零和,而 minCashFlow 對非零和輸入會**靜靜**
+    回傳不完整的清單(settle.ts 的 break),錢就這樣無聲消失。
+
+    抽成常數再插進樣板字串比較不會抄錯,但 SQL 一律靜態字串是這個 repo 的鐵則
+    (test/sql-safety.test.ts 把任何插值本身當失敗,不看插的是不是常數)。
+    所以寫兩份,改由 test/ledger.test.ts 的防漂移檢查比對它們一致。
+
+    用 EXISTS + members.is_pot 而不是帶 potId 參數:potId 是同一批
+    Promise.all 撈回來的,要用它就得先多等一次往返。
+  */
+  const [paid, owed, settled, curs, pot] = await Promise.all([
     dbh.prepare(
       `SELECT e.currency, p.member_id, SUM(p.amount_minor) AS amt
        FROM expense_payers p JOIN expenses e ON e.id = p.expense_id
        WHERE e.trip_id = ?1 AND e.kind = 'shared' AND (?2 IS NULL OR e.currency = ?2)
+         AND NOT EXISTS (
+           SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+           WHERE pp.expense_id = e.id AND m.is_pot = 1
+         )
        GROUP BY e.currency, p.member_id`,
     ).bind(tripId, curArg).all<AmountRow>(),
     dbh.prepare(
       `SELECT e.currency, s.member_id, SUM(s.amount_minor) AS amt
        FROM expense_shares s JOIN expenses e ON e.id = s.expense_id
        WHERE e.trip_id = ?1 AND e.kind = 'shared' AND (?2 IS NULL OR e.currency = ?2)
+         AND NOT EXISTS (
+           SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+           WHERE pp.expense_id = e.id AND m.is_pot = 1
+         )
        GROUP BY e.currency, s.member_id`,
     ).bind(tripId, curArg).all<AmountRow>(),
     dbh.prepare(
@@ -169,6 +174,15 @@ export async function tripLedger(
        WHERE trip_id = ?1 AND (?2 IS NULL OR currency = ?2)
        GROUP BY currency, from_member, to_member`,
     ).bind(tripId, curArg).all<SettledRow>(),
+    /*
+      幣別集合要**不管誰付的**,所以單獨查一次。
+      少了這一句,「這個幣別只有公費付的支出」會整個從 ledger.currencies 消失,
+      於是結算頁沒有那一塊 → 那幾筆永遠蓋不到章 → 未結明細裡卡著永遠清不掉的東西。
+    */
+    dbh.prepare(
+      `SELECT DISTINCT currency FROM expenses
+       WHERE trip_id = ?1 AND kind = 'shared' AND (?2 IS NULL OR currency = ?2)`,
+    ).bind(tripId, curArg).all<{ currency: string }>(),
     dbh.prepare(`SELECT id FROM members WHERE trip_id = ? AND is_pot = 1`)
       .bind(tripId).first<{ id: string }>(),
   ]);
@@ -178,13 +192,24 @@ export async function tripLedger(
   const settledR = settled.results ?? [];
   const potId = pot?.id ?? null;
 
-  // ⚠️ 幣別集合必須把 settlements 也算進來。
-  //
-  // 「有還款卻沒有任何共同支出」的幣別(支出後來被刪掉、或使用者把幣別記錯)
-  // 淨額不是 0,少了它就有一筆債完全沒有畫面可以看到。
-  // 「只有公費投入、還沒開始花」的幣別同理:那筆現金真的躺在信封裡,
-  // 淨額是「投入的人 +X、公費 −X」,結算頁必須看得到。
+  /*
+    投入(人→公費)與退還(公費→人)都不是還款,是把現金搬進/搬出信封 ——
+    人對人那一本不認它們(見開頭)。**只排一邊是沒用的**:排投入不排退還的話,
+    收到退還的人淨額會莫名往下掉一截,看起來就像他突然欠了一筆。
+  */
+  const p2pR = potId === null
+    ? settledR
+    : settledR.filter((r) => r.from_member !== potId && r.to_member !== potId);
+
+  // ⚠️ 幣別集合取聯集,而且每一份來源都不能少:
+  //   curs      所有共同支出的幣別(**不管誰付的**)—— 公費付的那些要蓋得到章
+  //   settledR  全部的 settlements(**含投入 / 退還**,即使它們不進淨額)——
+  //             「只有公費投入、還沒開始花」的幣別總覽有剩餘,結算頁至少要
+  //             存在同一塊才不會讓人以為漏了東西;「有還款卻沒有任何共同支出」
+  //             (支出被刪掉、幣別記錯)也靠它
+  // 多一塊空的無害,少一塊會掉錢。
   const currencies = [...new Set([
+    ...(curs.results ?? []).map((r) => r.currency),
     ...paidR.map((r) => r.currency),
     ...owedR.map((r) => r.currency),
     ...settledR.map((r) => r.currency),
@@ -200,11 +225,8 @@ export async function tripLedger(
         .map((r) => ({ memberId: r.member_id, amountMinor: r.amt })),
       owed: owedR.filter((r) => r.currency === cur)
         .map((r) => ({ memberId: r.member_id, amountMinor: r.amt })),
-      // settlements 全部照算,**包含任一端是公費的**(投入 / 退還)——
-      // 見開頭「淨額含投入公費 / 公費退還」。公費不必特別處理:
-      // 它就是 netBalances 眼中的一個普通成員,腿要不要寫由下面的
-      // recorded / deferred 決定,不是由這裡少算一筆決定。
-      settled: settledR.filter((r) => r.currency === cur)
+      // p2pR,不是 settledR —— 投入 / 退還不是還款(見開頭)。
+      settled: p2pR.filter((r) => r.currency === cur)
         .map((r) => ({ from: r.from_member, to: r.to_member, amountMinor: r.amt })),
     });
     const transfers = minCashFlow(nets);
@@ -244,10 +266,21 @@ export function assertZeroSum(block: LedgerBlock): string | null {
 }
 
 /**
- * 逐筆檢查「付款合計 == 分攤合計」。
+ * 逐筆檢查兩件事,兩件都會讓結算算出錯的金額:
  *
- * expenses.post 寫入時會驗,但資料庫可能被直接改過(匯入腳本、手動 SQL、
- * 未來的編輯功能)。結算是把錯誤變成真實金錢的那一步,所以這裡再驗一次。
+ *   ① 付款合計 != 分攤合計
+ *   ② 一筆支出**公費和人一起付**
+ *
+ * ② 為什麼也算「不平衡」:這個模組把公費付的支出**整筆**排除
+ * (見開頭的兩本帳)。判準是「公費是付款人之一」,所以混合付款的那一筆
+ * 會連同那個人墊的錢一起被丟掉 —— 淨額仍然零和(兩邊一起丟),
+ * 所以 ① 抓不到它,但那個人的墊款就這樣無聲消失了。
+ *
+ * 混合付款在語意上本來就沒有說得通的意思(那個人墊的算不算他墊的?),
+ * 所以 expenses.post / expenses[id].patch 兩支寫入端點都擋掉了。
+ * 這裡是**第二道**:資料庫可能被直接改過(匯入腳本、手動 SQL),
+ * 而這次改動之前建的資料也可能有。結算是把錯誤變成真實金錢的那一步,
+ * 寧可擋住整個回合,也不要靜靜吃掉某個人的錢。
  */
 export async function findUnbalancedExpenses(
   dbh: D1Database,
@@ -262,12 +295,19 @@ export async function findUnbalancedExpenses(
   const rows = await dbh.prepare(
     `SELECT e.id, e.description, e.currency,
             COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p WHERE p.expense_id = e.id), 0) AS paid,
-            COALESCE((SELECT SUM(s.amount_minor) FROM expense_shares s WHERE s.expense_id = e.id), 0) AS owed
+            COALESCE((SELECT SUM(s.amount_minor) FROM expense_shares s WHERE s.expense_id = e.id), 0) AS owed,
+            (SELECT COUNT(*) FROM expense_payers p2 WHERE p2.expense_id = e.id) AS n_payers,
+            (SELECT COUNT(*) FROM expense_payers p3 JOIN members m ON m.id = p3.member_id
+              WHERE p3.expense_id = e.id AND m.is_pot = 1) AS n_pot_payers
      FROM expenses e
      WHERE e.trip_id = ?1 AND e.kind = 'shared' AND (?2 IS NULL OR e.currency = ?2)`,
   ).bind(tripId, currency ?? null).all<{
     id: string; description: string; currency: string; paid: number; owed: number;
+    n_payers: number; n_pot_payers: number;
   }>();
 
-  return (rows.results ?? []).filter((r) => r.paid !== r.owed);
+  return (rows.results ?? [])
+    .filter((r) => r.paid !== r.owed || (r.n_pot_payers > 0 && r.n_payers > 1))
+    .map(({ id, description, currency: cur, paid, owed }) =>
+      ({ id, description, currency: cur, paid, owed }));
 }

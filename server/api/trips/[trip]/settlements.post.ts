@@ -112,9 +112,9 @@ export default defineEventHandler(async (event) => {
   // ⚠️ 上限有**兩側**,只看付款人欠多少是不夠的 ————————————————
   //
   // 欠款只說得出「這個人總共還欠多少」,說不出「這個**收款人**還被欠多少」。
-  // 兩者不一樣的時機是「債權分散在多個人身上」,而只要公費手上還有現金就必然如此
-  // (公費淨額 = −剩餘,剩餘 > 0 時它是債務人之一,見 utils/ledger.ts)。
-  // 實測:公費付 ¥6,000 兩人均分、AA 墊 ¥20,000 兩人均分、沒有人投入過公費
+  // 兩者不一樣的時機是「債權分散在多個人身上」,而只要**有兩個人各自墊過錢**
+  // 就會這樣(公費不進算術,所以它不會是債權人 —— 見 utils/ledger.ts)。
+  // 實測:AA 墊 ¥9,000 三人均分、CC 墊 ¥6,000 三人均分
   //   → 淨額 AA +7,000 / BB −13,000 / 公費 +6,000,建議只有 BB→AA ¥7,000
   //   → 直接 POST { BB→AA 13,000 }(= owes(BB))舊寫法兩道防護都放行 → 201
   //   → 之後淨額變成 AA −6,000 / 公費 +6,000:AA 憑空多出一筆 ¥6,000 的欠款,
@@ -142,13 +142,9 @@ export default defineEventHandler(async (event) => {
    * 事前檢查、兩筆都寫進去 → 公費剩餘變成負的」。這一支以前只有 JS 那道,
    * 換個端點打同一筆錢就繞過去了 —— 正是上面那段註解說要防的事。
    *
-   * 淨額含投入 / 退還之後這個縫從「顯示問題」升級成**算錯錢**:
-   * A 投入 NT$10,000、兩支併發各退還 NT$10,000 給 B(實測 netBalances/minCashFlow):
-   *   nets  A +10,000 / B −20,000 / 公費 +10,000
-   *   recorded **B → A NT$10,000** ← 兩端都是真人,下一次結算回合會把它寫進
-   *                                   settlements,變成 B 真的要付的錢
-   * B 只從信封拿過一次 10,000,卻被要求總共吐出 20,000。
-   * (舊語意下這兩列不進淨額,transfers 是空的 —— 所以是語意改動讓它開始要錢。)
+   * 症狀在**信封**那一本:剩餘會變成負的 —— 信封付出去的比它手上有的多,
+   * 而那筆差額是憑空生出來的現金。總覽會據此叫下一個人少投、或多退還給別人,
+   * 而 pot/moves 的 PATCH / DELETE 也會被那個負餘額一併鎖死。
    */
   const isRefund = !!pot && b.from_member === pot.id;
   if (!involvesPot) {
@@ -211,23 +207,26 @@ export default defineEventHandler(async (event) => {
    *
    *   owes(?3)   = -net(?3) = 分攤 − 墊款 + 收到的 − 付出的
    *   credit(?4) =  net(?4) = 墊款 − 分攤 − 收到的 + 付出的
-   * (「收到的 / 付出的」是 settlements 全部,投入公費與公費退還都算在內。)
+   * (「分攤 / 墊款」只算**人付的**支出;「收到的 / 付出的」只算人對人的還款。)
    *
    * 收款人那一側是付款人那一側的**鏡像**(每一項符號相反,member_id 換成 ?4),
    * 刻意寫成對照得出來的形狀 —— 兩塊長得不一樣的時候就是有人只改了一邊。
    * (net 的定義見 utils/settle.ts 的 netBalances;為什麼上限要看兩側,
    *  以及只看付款人時實測會生出什麼假債務,見上面 JS 那段。)
    *
-   * ⚠️ 四個還款加總**一列都不排**,任一端是公費的那些也照算 ——
-   * 淨額含投入 / 退還(見 utils/ledger.ts 開頭)。這句 SQL 是上面那個 JS 檢查的
-   * 資料庫層雙胞胎,**兩邊算的必須是同一個上限**,否則就是這個 repo 反覆踩到的
-   * 那一類 bug:一邊放行、另一邊擋掉,使用者得到一句「這筆已經結清了」而其實沒有。
+   * ⚠️ 這句 SQL 是上面那個 JS 檢查(走 tripLedger)的資料庫層雙胞胎,
+   * **兩邊算的必須是同一個上限**,否則就是這個 repo 反覆踩到的那一類 bug:
+   * 一邊放行、另一邊擋掉,使用者得到一句「這筆已經結清了」而其實沒有。
    *
-   * 這裡曾經有一組 `(?8 IS NULL OR from_member <> ?8)` 把公費那幾列濾掉,
-   * 那是淨額不含投入 / 退還時的寫法。語意改回去之後它就變成單邊漂移:
-   * A 投入公費 10,000、B 墊了 30,000 兩人均分 → JS 算 owes(A) = 5,000(畫面也這樣建議),
-   * 舊 SQL 算 15,000 —— 送 15,000 進來 JS 擋、SQL 放,只要有人繞過 UI 直接打 API
-   * 就會寫出一筆超過債權的還款,把收款人的淨額打成負的。
+   * 所以 utils/ledger.ts 排掉什麼,這裡就要排掉什麼 —— 兩件事:
+   *
+   *   ① **公費付掉的支出整筆排除**(那段 `AND NOT EXISTS (... m.is_pot = 1)`)。
+   *      它已經被信封吸收了,不產生任何人對人的債。
+   *   ② **任一端是公費的 settlement 排除**(`?8 IS NULL OR ...`)。
+   *      投入 / 退還是搬現金,不是還款。
+   *
+   * (?8 = 公費 id,沒有公費時是 NULL,用 sentinel 寫法 —— 直接寫
+   *  `from_member <> NULL` 會求值成 NULL,把每一列都濾掉。)
    *
    * 寫不進去(changes = 0)就代表在這一瞬間其中一側已經不夠了 → 409。
    */
@@ -262,31 +261,52 @@ export default defineEventHandler(async (event) => {
            COALESCE((SELECT SUM(s.amount_minor) FROM expense_shares s
                       JOIN expenses e ON e.id = s.expense_id
                       WHERE e.trip_id = ?2 AND e.kind = 'shared'
-                        AND e.currency = ?5 AND s.member_id = ?3), 0)
+                        AND e.currency = ?5 AND s.member_id = ?3
+                        AND NOT EXISTS (
+                          SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+                          WHERE pp.expense_id = e.id AND m.is_pot = 1
+                        )), 0)
            - COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p
                         JOIN expenses e ON e.id = p.expense_id
                         WHERE e.trip_id = ?2 AND e.kind = 'shared'
-                          AND e.currency = ?5 AND p.member_id = ?3), 0)
+                          AND e.currency = ?5 AND p.member_id = ?3
+                          AND NOT EXISTS (
+                            SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+                            WHERE pp.expense_id = e.id AND m.is_pot = 1
+                          )), 0)
            + COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?3), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?3
+                          AND (?8 IS NULL OR from_member <> ?8)), 0)
            - COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?3), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?3
+                          AND (?8 IS NULL OR to_member <> ?8)), 0)
          )
          AND ?6 <= (
            COALESCE((SELECT SUM(p.amount_minor) FROM expense_payers p
                       JOIN expenses e ON e.id = p.expense_id
                       WHERE e.trip_id = ?2 AND e.kind = 'shared'
-                        AND e.currency = ?5 AND p.member_id = ?4), 0)
+                        AND e.currency = ?5 AND p.member_id = ?4
+                        AND NOT EXISTS (
+                          SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+                          WHERE pp.expense_id = e.id AND m.is_pot = 1
+                        )), 0)
            - COALESCE((SELECT SUM(s.amount_minor) FROM expense_shares s
                         JOIN expenses e ON e.id = s.expense_id
                         WHERE e.trip_id = ?2 AND e.kind = 'shared'
-                          AND e.currency = ?5 AND s.member_id = ?4), 0)
+                          AND e.currency = ?5 AND s.member_id = ?4
+                          AND NOT EXISTS (
+                            SELECT 1 FROM expense_payers pp JOIN members m ON m.id = pp.member_id
+                            WHERE pp.expense_id = e.id AND m.is_pot = 1
+                          )), 0)
            + COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?4), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND from_member = ?4
+                          AND (?8 IS NULL OR to_member <> ?8)), 0)
            - COALESCE((SELECT SUM(amount_minor) FROM settlements
-                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?4), 0)
+                        WHERE trip_id = ?2 AND currency = ?5 AND to_member = ?4
+                          AND (?8 IS NULL OR from_member <> ?8)), 0)
          )`,
-      ).bind(id, trip.id, b.from_member, b.to_member, b.currency, b.amount_minor, b.note ?? null).run();
+      ).bind(id, trip.id, b.from_member, b.to_member, b.currency, b.amount_minor, b.note ?? null,
+        pot?.id ?? null).run();
 
   if (!res.meta?.changes) {
     // 兩種前提、兩種說法。退還被擋的原因和人對人的還款完全不同,
