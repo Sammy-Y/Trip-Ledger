@@ -3,6 +3,7 @@ import { requireTrip } from '../../../utils/trip';
 import { rateOn } from '../../../utils/fx';
 import { convertToBase } from '../../../utils/money';
 import { tripLedger } from '../../../utils/ledger';
+import { walletSummaries } from '../../../utils/wallet';
 import type { Net, Transfer } from '../../../utils/settle';
 import type { PotCurrency, PotSummary } from '../../../../shared/types';
 
@@ -165,11 +166,28 @@ export default defineEventHandler(async (event) => {
     s.totalBase = s.sharedOwedBase + s.personalBase;
   }
 
+  // 公費剩餘與每人錢包互不相干,一起發出去 —— 手機在國外用行動網路,
+  // 每一次序列化的往返都有感(同 tripLedger / shareRows 的 Promise.all)。
+  const [pot, wallets] = await Promise.all([
+    potSummary(dbh, trip.id),
+    /*
+      每人錢包(換了多少 / 花了多少 / 還剩多少)。issue #6
+
+      ⚠️ 這是**純附加**的一塊:walletSummaries() 只讀資料、不寫,而且
+      上面 by_currency / per_member / pot 的每一行都在它之前就算完了 ——
+      三者一個字都沒有被它影響到。「沒有任何換匯紀錄時所有現有數字完全不變」
+      這條不變量在這裡是結構性的,不是靠小心維護的
+      (沒有換匯紀錄時 walletSummaries 直接回 [],見那個函式的說明)。
+    */
+    walletSummaries(dbh, trip.id, trip.base_currency),
+  ]);
+
   return {
     base_currency: trip.base_currency,
     by_currency: byCurrency,
     per_member: perMember,
-    pot: await potSummary(dbh, trip.id),
+    pot,
+    wallets,
     disclaimer: '本位幣金額為估算值(中價加計價差/手續費假設)。刷卡以店家請款日匯率計價,實際金額以銀行帳單為準。',
     rate_attribution: 'Rates By Exchange Rate API (open.er-api.com)',
   };

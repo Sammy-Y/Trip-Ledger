@@ -49,6 +49,14 @@ const balanceState = useAsyncData<Balance | null>(
 
 const balance = computed(() => balanceState.data.value);
 const potInfo = computed(() => balance.value?.pot ?? null);
+/**
+ * 每人的錢包(換了多少 / 花了多少 / 還剩多少)。issue #6
+ *
+ * **完全沒有換匯紀錄的旅程會拿到空陣列** —— 那是回歸保護:
+ * 這個功能上線前的每一趟,這頁的每一個數字都必須一個字不變
+ * (server 端的結構性保證見 utils/wallet.ts)。
+ */
+const wallets = computed(() => balance.value?.wallets ?? []);
 
 const loading = computed(() =>
   balanceState.status.value === 'pending' && !balance.value);
@@ -905,6 +913,22 @@ async function confirmDeleteMove() {
           <Icon name="lucide:users" /> 去建立公費
         </UiAppButton>
       </section>
+
+      <!--
+        ── 錢包 ──
+        「我手上還剩多少現金」。排在公費之後、總花費之前是刻意的:
+        它和公費一樣是**旅途中**會反覆看的數字(要不要再去換錢),
+        而總花費與每人合計是**回家之後**才看的。整區包成一個元件的
+        理由見 FxWalletSection 自己的說明。
+      -->
+      <FxWalletSection
+        :trip-id="tripId"
+        :wallets="wallets"
+        :people="people"
+        :base-currency="baseCurrency"
+        :pot-name="pot?.name ?? null"
+        @changed="refreshAll"
+      />
 
       <!-- ── 這趟總花費 ── -->
       <section class="card p-4">

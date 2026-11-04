@@ -13,14 +13,15 @@
     "db:migrate:remote": "node scripts/migrate.mjs --remote",
     "test": "node scripts/test-all.mjs",
     "typecheck": "nuxt typecheck",
-    "test:api": "node --experimental-strip-types test/api.test.ts && node --experimental-strip-types test/api.features.test.ts && node --experimental-strip-types test/api.rounds.test.ts && node --experimental-strip-types test/api.concurrency.test.ts && node --experimental-strip-types test/api.access.test.ts && node --experimental-strip-types test/api.edit.test.ts && node --experimental-strip-types test/api.pot.test.ts",
+    "test:api": "node --experimental-strip-types test/api.test.ts && node --experimental-strip-types test/api.features.test.ts && node --experimental-strip-types test/api.rounds.test.ts && node --experimental-strip-types test/api.concurrency.test.ts && node --experimental-strip-types test/api.access.test.ts && node --experimental-strip-types test/api.edit.test.ts && node --experimental-strip-types test/api.pot.test.ts && node --experimental-strip-types test/api.fx.test.ts",
     "test:features": "node --experimental-strip-types test/api.features.test.ts",
     "test:rounds": "node --experimental-strip-types test/api.rounds.test.ts",
     "preview": "nuxt build && wrangler dev",
     "test:concurrency": "node --experimental-strip-types test/api.concurrency.test.ts",
     "test:access": "node --experimental-strip-types test/api.access.test.ts",
     "test:edit": "node --experimental-strip-types test/api.edit.test.ts",
-    "test:pot": "node --experimental-strip-types test/api.pot.test.ts"
+    "test:pot": "node --experimental-strip-types test/api.pot.test.ts",
+    "test:fx": "node --experimental-strip-types test/api.fx.test.ts"
   },
   "dependencies": {
     "nuxt": "^4.5.2",

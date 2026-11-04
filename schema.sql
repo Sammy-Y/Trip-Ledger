@@ -156,6 +156,42 @@ CREATE TABLE IF NOT EXISTS settlements (
 );
 CREATE INDEX IF NOT EXISTS idx_settlements_round ON settlements(round_id);
 
+-- 換匯紀錄。「出發前在台灣分次換好」這件事在資料上就是這張表。issue #6
+--
+-- 沒有這張表的話,三個問題答不出來:這趟換了多少日幣(折合台幣多少)、
+-- 花了多少日幣、**手上還剩多少**。第三個才是旅途中真正想知道的那一個。
+--
+-- ⚠️ **存兩邊的金額,不存匯率。** 匯率是導出值:
+--     有效匯率     = cost_minor / amount_minor
+--     加權平均匯率 = Σcost / Σamount   ← 兩個總和的比值,所以與紀錄順序無關
+-- 存 rate = 0.21 的話,(a) 金額要由浮點數反推,違反這個 schema 的第 2 個設計決定;
+-- (b) 加權平均會變成「把匯率再平均」= 0.2075,而正確答案是 0.2067(差在筆數權重)。
+-- 這個定義在 shared/money.ts 的 exchangeRate() 只有一份,前後端共用。
+--
+-- ⚠️ **這張表不參與任何計價。** 換匯匯率不會被拿去重算支出的台幣金額
+-- (記帳全部用日幣,不需要換算),不進淨額、不進結算回合、不碰公費。
+-- 「錢包剩餘」是唯一讀它的地方(server/utils/wallet.ts)。
+-- 這也是為什麼刪掉一筆換匯是安全的、而且編輯不必像公費金流那樣寫併發前提
+-- (對照 server/utils/pot.ts 的兩道防線)。
+CREATE TABLE IF NOT EXISTS fx_exchanges (
+  id             TEXT PRIMARY KEY,
+  trip_id        TEXT NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+  -- 誰換的。錢包是**每人一個** —— 「我手上還剩多少」問的是我自己的口袋。
+  member_id      TEXT NOT NULL REFERENCES members(id),
+  -- 換到的
+  currency       TEXT NOT NULL REFERENCES currencies(code),
+  amount_minor   INTEGER NOT NULL CHECK (amount_minor > 0),
+  -- 付出的
+  cost_currency  TEXT NOT NULL REFERENCES currencies(code),
+  cost_minor     INTEGER NOT NULL CHECK (cost_minor > 0),
+  exchanged_at   TEXT NOT NULL,
+  note           TEXT,
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  -- 同幣別「換匯」沒有意義(匯率恆為 1),而它會讓錢包的兩邊互相抵銷成 0。
+  CHECK (currency <> cost_currency)
+);
+CREATE INDEX IF NOT EXISTS idx_fx_exchanges_trip ON fx_exchanges(trip_id, member_id, currency);
+
 -- 每日匯率快照(cron 寫入)。有了這張表,補登昨天的支出就能取到昨天的匯率。
 CREATE TABLE IF NOT EXISTS fx_rates (
   rate_date  TEXT NOT NULL,

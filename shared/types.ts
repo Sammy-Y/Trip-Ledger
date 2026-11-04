@@ -30,6 +30,28 @@ export interface Expense {
   shares: Array<{ member_id: string; amount_minor: number }>;
 }
 
+/**
+ * 一筆換匯。「出發前在台灣分次換好」在資料上就是這個。
+ *
+ * ⚠️ **沒有 rate 欄位,那是刻意的。** 資料庫存兩邊的金額,匯率一律由
+ * shared/money.ts 的 exchangeRate() 算出來(理由見 schema.sql 的 fx_exchanges)。
+ * 這裡如果多一個 rate,前端就會有兩個來源可以選,而它們遲早會不一致。
+ *
+ *   currency / amount_minor        換到的(例:JPY 5000)
+ *   cost_currency / cost_minor     付出的(例:TWD 105000 → 有效匯率 0.21)
+ */
+export interface FxExchange {
+  id: string;
+  member_id: string;
+  currency: string;
+  amount_minor: number;
+  cost_currency: string;
+  cost_minor: number;
+  exchanged_at: string;
+  note: string | null;
+  created_at: string;
+}
+
 export interface Net { memberId: string; netMinor: number; }
 export interface Transfer { from: string; to: string; amountMinor: number; }
 
@@ -65,6 +87,64 @@ export interface PotSummary {
   by_currency: PotCurrency[];
 }
 
+/**
+ * 一個人在某一個幣別的**錢包**。issue #6
+ *
+ *   剩餘 = 換到的 − 所有從這個人手上離手的 + 收到的
+ *
+ * 「離手」是四種:自己付現的支出、投入公費的、付出去的還款、
+ * 以及用這個幣別的現金再去換別的幣別(換回台幣、當地 ATM 提款都是這種)。
+ * 「收到的」是別人還他的錢和公費退還 —— 那些錢真的進了他口袋。
+ *
+ * ── 為什麼四個流向要分開列,而不是只給一個剩餘 ──────────────
+ *
+ * 「我口袋剩多少」和「我花在自己身上多少」是**兩種讀法**,而且兩個都要:
+ * 前者決定要不要再去換錢,後者是這趟的個人花費。合成一個數字之後
+ * 兩個問題都答不出來(投入公費的錢確實離手了,但那不是「我花的」)。
+ *
+ * ⚠️ 這裡**完全不參與計價**:不進淨額、不進轉帳、不進結算回合。
+ * 「沒有任何換匯紀錄時所有現有數字完全不變」是這個功能最重要的不變量,
+ * 而它成立的原因就是這個型別只被 Balance.wallets 用到,沒有第二個出口。
+ */
+export interface WalletCurrency {
+  currency: string;
+  /** 換到多少(fx_exchanges.amount_minor 的加總) */
+  exchangedInMinor: number;
+  /**
+   * 換這些錢付出去多少,**逐付出幣別分開**。
+   *
+   * 幾乎總是只有一種(台幣),但資料模型允許多種,所以這裡不假設。
+   * 加權平均匯率 = costs[0].amountMinor / exchangedInMinor,由前端用
+   * exchangeRate() 算 —— 只有一種付出幣別時才有意義(見上面的說明)。
+   */
+  costs: Array<{ currency: string; amountMinor: number }>;
+  /** 自己付現花掉的(expense_payers 且 payment_method = 'cash',共同與個人都算) */
+  cashSpentMinor: number;
+  /** 投入公費的。這也是離手 —— 錢確實離開了他的口袋 */
+  potContributedMinor: number;
+  /** 付出去的還款(不含投入公費,那一項單獨列) */
+  repaidOutMinor: number;
+  /** 收到的還款 / 公費退還 */
+  receivedInMinor: number;
+  /** 拿這個幣別的現金再去換別的幣別,付出去的(換回台幣 / ATM 提款) */
+  exchangedOutMinor: number;
+  /** 還剩多少。負數只是**警告**,不是錯誤(代表在當地提過款沒記) */
+  remainingMinor: number;
+}
+
+/**
+ * 一個人的錢包,逐幣別分開(和結算一樣,絕不跨幣別相加)。
+ *
+ * ⚠️ `by_currency` **不會有本位幣那一格**。錢包問的是「口袋裡的外幣現金」,
+ * 而本位幣在銀行帳戶裡 —— 這個 app 看不到帳戶餘額,所以硬給它一格的話
+ * 離手那一邊會變成胡說(完整推導見 server/utils/wallet.ts 的 walletSummaries)。
+ */
+export interface WalletSummary {
+  memberId: string;
+  name: string;
+  by_currency: WalletCurrency[];
+}
+
 export interface Balance {
   base_currency: string;
   by_currency: Record<string, {
@@ -81,6 +161,13 @@ export interface Balance {
   }>;
   /** 這趟沒有設公費時是 null */
   pot: PotSummary | null;
+  /**
+   * 每人一塊錢包(換了多少 / 花了多少 / 還剩多少)。issue #6
+   *
+   * **完全沒有換匯紀錄的旅程回空陣列** —— 那是回歸保護:
+   * 這個功能上線前的每一趟旅程,畫面與數字都必須一個字都不變。
+   */
+  wallets: WalletSummary[];
   disclaimer: string;
   rate_attribution: string;
 }
